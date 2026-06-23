@@ -81,12 +81,20 @@ wget -qO- https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/do
 
 This downloads the latest `.ipk` and installs it directly (`opkg install <file>`),
 which works with the default `option check_signature` **on** — no feed signing,
-no security changes. Re-run the same line any time to **upgrade**.
+no security changes. Re-run the same line any time to **upgrade**. It pulls from
+the **GitHub Release** (`releases/latest/download/luci-app-xray-monitor.ipk` — a
+single stable URL, robust on flaky links) and falls back to the raw feed.
 
 Dependencies (`luci-base, xray-core, curl, ucode-mod-fs, ucode-mod-uci`) come from
 your normal OpenWrt feeds, so run `opkg update` once first if any are missing
-(`ucode` does the JSON work — no `jq` needed). Or install a downloaded file
-manually: `opkg install ./luci-app-xray-monitor_*.ipk`.
+(`ucode` does the JSON work — no `jq` needed).
+
+Fully manual fallback (e.g. if `raw.githubusercontent` is blocked but releases
+aren't): download once and install the file —
+```sh
+wget -O /tmp/x.ipk https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.ipk
+opkg install /tmp/x.ipk
+```
 
 ## Native opkg feed (optional, advanced)
 
