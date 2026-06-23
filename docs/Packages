@@ -1,16 +1,16 @@
 Package: luci-app-xray-monitor
-Version: 1.14-0
+Version: 1.14-1
 Depends: luci-base, xray-core, curl, ucode-mod-fs, ucode-mod-uci
 Section: luci
 Architecture: all
-Installed-Size: 79698
+Installed-Size: 79937
 Maintainer: vinli
 Description:  LuCI app to monitor and manage Xray: service status, live per-inbound
   and per-outbound traffic + rates (Stats API), per-outbound connectivity, rolling
   throughput graphs, a Remnawave subscription parser that auto-stages outbound
   updates, and exit-routing controls. Pages under Services -> Xray Monitor.
-Filename: luci-app-xray-monitor_1.14-0_all.ipk
-Size: 23679
-SHA256sum: 41a12f42d5ce7fc51459e84b0ad7c622f3da555185108432ac39fe0be1944729
-MD5Sum: 8d949755a7edf672627e150b86fab59d
+Filename: luci-app-xray-monitor_1.14-1_all.ipk
+Size: 24045
+SHA256sum: 16eb470c40db4a5930011f7e94bb80b0c000bb2f1f9d22309fbe8a8e311b4360
+MD5Sum: c9b7239da3438450e16a5f3e019a7927
 

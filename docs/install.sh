@@ -14,7 +14,13 @@ ipk=$(wget -qO- "$BASE/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail 
 
 tmp="/tmp/$ipk"
 echo "Downloading $ipk ..."
-wget -qO "$tmp" "$BASE/$ipk" || { echo "Download failed"; exit 1; }
+wget -qO "$tmp" "$BASE/$ipk" || { rm -f "$tmp"; echo "Download failed"; exit 1; }
+if ! tar -tzf "$tmp" >/dev/null 2>&1; then
+	rm -f "$tmp"
+	echo "Downloaded file is not a valid package (the feed may be updating right now)."
+	echo "Wait a minute and run this again."
+	exit 1
+fi
 
 echo "Installing (deps come from your normal feeds) ..."
 opkg install --force-reinstall "$tmp"

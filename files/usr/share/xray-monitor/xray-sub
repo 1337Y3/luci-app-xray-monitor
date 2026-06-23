@@ -180,7 +180,11 @@ case "$1" in
 		ipk=$(curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
 		[ -n "$ipk" ] || { echo "cannot read package list"; exit 1; }
 		tmp="/tmp/$ipk"
-		curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { echo "download failed"; exit 1; }
+		curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { rm -f "$tmp"; echo "download failed"; exit 1; }
+		# guard against a stale-cache 404 page being handed to opkg
+		if ! tar -tzf "$tmp" >/dev/null 2>&1; then
+			rm -f "$tmp"; echo "downloaded file is not a valid package (feed may be updating; try again shortly)"; exit 1
+		fi
 		opkg install --force-reinstall "$tmp"; rc=$?
 		rm -f "$tmp"
 		[ "$rc" -eq 0 ] && echo "updated to $ipk" || { echo "opkg install failed"; exit 1; }
