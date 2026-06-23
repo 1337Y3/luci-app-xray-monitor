@@ -8,7 +8,7 @@
 		},
 		"write": {
 			"ubus": {
-				"xray-monitor": [ "reset", "sub_fetch", "sub_apply", "sub_seturl", "sub_setcfg", "routing_set", "balancers_set", "enable_api", "config_save" ]
+				"xray-monitor": [ "reset", "sub_fetch", "sub_apply", "sub_setcfg", "sub_add", "sub_del", "sub_edit", "routing_set", "balancers_set", "enable_api", "config_save" ]
 			},
 			"uci": [ "xray-monitor" ]
 		}

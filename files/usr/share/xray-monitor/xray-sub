@@ -1,53 +1,77 @@
 #!/bin/sh
-# Remnawave subscription / config helper for luci-app-xray-monitor.
-# Commands: fetch | apply | status | set-url <url> | routing-get | routing-set <f>
-#         | balancers-get | balancers-set <f> | enable-api
+# Remnawave multi-subscription / config helper for luci-app-xray-monitor.
+# Commands: fetch | apply | status | set-cfg ... | cron-sync
+#         | sub-add <prefix> <url> | sub-del <id> | sub-edit <id> <prefix> <url> <enabled>
+#         | routing-get | routing-set <f> | balancers-get | balancers-set <f>
+#         | config-save <f> | enable-api
 SHARE=/usr/share/xray-monitor
-PERSIST=/etc/xray-monitor
-STATE=/etc/xray-monitor   # persist fetch state across reboot/upgrade (written hourly at most)
+STATE=/etc/xray-monitor
 XRAY=/usr/bin/xray
 
-# Resolve the active xray config file from UCI (falls back to the default path)
 config_file() {
-	local f
-	f=$(uci -q get xray.config.conffiles 2>/dev/null | awk '{print $1}')
+	local f; f=$(uci -q get xray.config.conffiles 2>/dev/null | awk '{print $1}')
 	[ -f "$f" ] && { echo "$f"; return; }
 	echo "/etc/xray/config.json"
 }
 CFG=$(config_file)
+mkdir -p "$STATE"
 
-mkdir -p "$STATE" "$PERSIST"
-
-url=$(uci -q get xray-monitor.sub.url)
-ua=$(uci -q get xray-monitor.sub.user_agent); [ -n "$ua" ] || ua="v2rayNG/1.8.0"
+ua_default=$(uci -q get xray-monitor.sub.user_agent); [ -n "$ua_default" ] || ua_default="v2rayNG/1.8.0"
 cron=$(uci -q get xray-monitor.sub.cron); [ -n "$cron" ] || cron=1
 cron_schedule=$(uci -q get xray-monitor.sub.cron_schedule); [ -n "$cron_schedule" ] || cron_schedule="0 * * * *"
 auto_apply=$(uci -q get xray-monitor.sub.auto_apply); [ -n "$auto_apply" ] || auto_apply=0
 
+fetch_url() {  # <url> <user-agent>
+	if command -v curl >/dev/null 2>&1; then curl -s -A "$2" --max-time 25 "$1"
+	else uclient-fetch -q -O - -U "$2" -T 25 "$1"; fi
+}
+
+sub_ids() { uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=subscription$/\1/p'; }
+valid_prefix() { echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'; }
+prefix_in_use() {  # <prefix> <exclude-id>
+	local id; for id in $(sub_ids); do
+		[ "$id" = "$2" ] && continue
+		[ "$(uci -q get "xray-monitor.$id.prefix")" = "$1" ] && return 0
+	done; return 1
+}
+
 case "$1" in
 	fetch)
-		[ -n "$url" ] || { echo "no-url" > "$STATE/status"; date +%s > "$STATE/last_fetch"; echo "no url set"; exit 1; }
-		if curl -s -A "$ua" --max-time 25 "$url" > "$STATE/sub.json.tmp" && [ -s "$STATE/sub.json.tmp" ]; then
-			if "$SHARE/parse.uc" "$STATE/sub.json.tmp" "$PERSIST/tagmap.json" "$PERSIST/overrides.json" \
-				> "$STATE/staged.json.tmp" 2>/dev/null && [ -s "$STATE/staged.json.tmp" ]; then
-				mv "$STATE/staged.json.tmp" "$STATE/staged.json"
-				"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" > "$STATE/diff.json" 2>/dev/null
-				cnt=$(jsonfilter -i "$STATE/diff.json" -e '@.total' 2>/dev/null)
-				[ "${cnt:-0}" -gt 0 ] && echo 1 > "$STATE/pending" || echo 0 > "$STATE/pending"
-				echo "ok" > "$STATE/status"
-			else
-				echo "parse-error" > "$STATE/status"
+		tmpd=$(mktemp -d); staged="$tmpd/staged.json"
+		printf '{"groups":[' > "$staged"
+		first=1; nsub=0; nok=0
+		for id in $(sub_ids); do
+			[ "$(uci -q get "xray-monitor.$id.enabled")" = "0" ] && continue
+			url=$(uci -q get "xray-monitor.$id.url"); [ -n "$url" ] || continue
+			prefix=$(uci -q get "xray-monitor.$id.prefix"); [ -n "$prefix" ] || prefix="proxy"
+			ua=$(uci -q get "xray-monitor.$id.user_agent"); [ -n "$ua" ] || ua="$ua_default"
+			nsub=$((nsub + 1))
+			raw="$tmpd/$id.raw"; obs="$tmpd/$id.obs"
+			if fetch_url "$url" "$ua" > "$raw" 2>/dev/null && [ -s "$raw" ] \
+			   && "$SHARE/parse.uc" "$raw" "$STATE/tagmap-$prefix.json" "$STATE/overrides.json" "$prefix" > "$obs" 2>/dev/null && [ -s "$obs" ]; then
+				[ "$first" = 1 ] || printf ',' >> "$staged"
+				printf '{"label":"%s","outbounds":' "$prefix" >> "$staged"
+				cat "$obs" >> "$staged"
+				printf '}' >> "$staged"
+				first=0; nok=$((nok + 1))
 			fi
+		done
+		printf ']}' >> "$staged"
+		if [ "$nsub" -eq 0 ]; then
+			echo "no-subs" > "$STATE/status"
+		elif [ "$nok" -gt 0 ]; then
+			mv "$staged" "$STATE/staged.json"
+			"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" > "$STATE/diff.json" 2>/dev/null
+			cnt=$(jsonfilter -i "$STATE/diff.json" -e '@.total' 2>/dev/null)
+			[ "${cnt:-0}" -gt 0 ] && echo 1 > "$STATE/pending" || echo 0 > "$STATE/pending"
+			[ "$nok" -eq "$nsub" ] && echo "ok" > "$STATE/status" || echo "partial" > "$STATE/status"
 		else
 			echo "fetch-error" > "$STATE/status"
 		fi
-		rm -f "$STATE/sub.json.tmp" "$STATE/staged.json.tmp"
 		date +%s > "$STATE/last_fetch"
-		# auto-apply if enabled and there are pending changes
-		if [ "$auto_apply" = "1" ] && [ "$(cat "$STATE/pending" 2>/dev/null)" = "1" ]; then
-			"$0" apply >/dev/null 2>&1
-		fi
-		[ "$(cat "$STATE/status" 2>/dev/null)" = "ok" ]
+		rm -rf "$tmpd"
+		if [ "$auto_apply" = "1" ] && [ "$(cat "$STATE/pending" 2>/dev/null)" = "1" ]; then "$0" apply >/dev/null 2>&1; fi
+		case "$(cat "$STATE/status" 2>/dev/null)" in ok|partial) exit 0 ;; *) exit 1 ;; esac
 		;;
 
 	apply)
@@ -55,108 +79,94 @@ case "$1" in
 		cp -a "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"
 		if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$CFG.new" >/dev/null 2>&1 \
 			&& "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
-			mv "$CFG.new" "$CFG"
-			/etc/init.d/xray restart >/dev/null 2>&1
-			cp -a "$STATE/staged.json" "$STATE/applied.json"
-			echo 0 > "$STATE/pending"
-			echo "applied" > "$STATE/status"
-			echo ok
+			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
+			echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
 		else
-			rm -f "$CFG.new"
-			echo "test-failed" > "$STATE/status"
-			echo "config test failed - not applied"
-			exit 1
+			rm -f "$CFG.new"; echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; exit 1
 		fi
 		;;
 
 	status)
-		lf=$(cat "$STATE/last_fetch" 2>/dev/null)
-		st=$(cat "$STATE/status" 2>/dev/null)
-		pending=$(cat "$STATE/pending" 2>/dev/null)
-		# server list comes from the LIVE config (installed servers), diff from last fetch
-		"$SHARE/status.uc" "$url" "${lf:-0}" "${st:-never}" "${pending:-0}" \
-			"$CFG" "$STATE/diff.json" "$cron" "$cron_schedule" "$auto_apply" "$ua"
+		lf=$(cat "$STATE/last_fetch" 2>/dev/null); st=$(cat "$STATE/status" 2>/dev/null); pending=$(cat "$STATE/pending" 2>/dev/null)
+		"$SHARE/status.uc" "${lf:-0}" "${st:-never}" "${pending:-0}" "$CFG" "$STATE/diff.json"
 		;;
 
-	set-url)
-		case "$2" in
-			http://*|https://*) ;;
-			*) echo "invalid url"; exit 1 ;;
-		esac
-		uci set xray-monitor.sub=xray-monitor 2>/dev/null
-		uci set xray-monitor.sub.url="$2"
+	sub-add)
+		valid_prefix "$2" || { echo "invalid prefix"; exit 1; }
+		case "$3" in http://*|https://*) ;; *) echo "invalid url"; exit 1 ;; esac
+		prefix_in_use "$2" "" && { echo "prefix already used"; exit 1; }
+		sec=$(uci add xray-monitor subscription 2>/dev/null)
+		uci set "xray-monitor.$sec.prefix"="$2"
+		uci set "xray-monitor.$sec.url"="$3"
+		uci set "xray-monitor.$sec.enabled"='1'
 		uci commit xray-monitor
 		echo ok
 		;;
 
-	# set-cfg <url> <cron> <cron_schedule> <auto_apply> <user_agent>  (empty = leave unchanged)
-	set-cfg)
-		u="$2"; c="$3"; s="$4"; a="$5"; ug="$6"
+	sub-del)
+		uci -q delete "xray-monitor.$2" && uci commit xray-monitor && echo ok || { echo "delete failed"; exit 1; }
+		;;
+
+	sub-edit)  # <id> <prefix> <url> <enabled>  (empty = keep)
+		uci -q get "xray-monitor.$2" >/dev/null 2>&1 || { echo "no such subscription"; exit 1; }
+		if [ -n "$3" ]; then
+			valid_prefix "$3" || { echo "invalid prefix"; exit 1; }
+			prefix_in_use "$3" "$2" && { echo "prefix already used"; exit 1; }
+			uci set "xray-monitor.$2.prefix"="$3"
+		fi
+		if [ -n "$4" ]; then
+			case "$4" in http://*|https://*) uci set "xray-monitor.$2.url"="$4" ;; *) echo "invalid url"; exit 1 ;; esac
+		fi
+		[ -n "$5" ] && uci set "xray-monitor.$2.enabled"="$5"
+		uci commit xray-monitor
+		echo ok
+		;;
+
+	set-cfg)  # <cron> <cron_schedule> <auto_apply> <user_agent>  (empty = keep)
 		uci set xray-monitor.sub=xray-monitor 2>/dev/null
-		if [ -n "$u" ]; then
-			case "$u" in http://*|https://*) uci set xray-monitor.sub.url="$u" ;; *) echo "invalid url"; exit 1 ;; esac
+		[ -n "$2" ] && uci set xray-monitor.sub.cron="$2"
+		if [ -n "$3" ]; then
+			[ "$(echo "$3" | wc -w)" -eq 5 ] || { echo "invalid cron schedule (need 5 fields)"; exit 1; }
+			uci set xray-monitor.sub.cron_schedule="$3"
 		fi
-		if [ -n "$s" ]; then
-			[ "$(echo "$s" | wc -w)" -eq 5 ] || { echo "invalid cron schedule (need 5 fields)"; exit 1; }
-			uci set xray-monitor.sub.cron_schedule="$s"
-		fi
-		[ -n "$c" ]  && uci set xray-monitor.sub.cron="$c"
-		[ -n "$a" ]  && uci set xray-monitor.sub.auto_apply="$a"
-		[ -n "$ug" ] && uci set xray-monitor.sub.user_agent="$ug"
+		[ -n "$4" ] && uci set xray-monitor.sub.auto_apply="$4"
+		[ -n "$5" ] && uci set xray-monitor.sub.user_agent="$5"
 		uci commit xray-monitor
 		"$0" cron-sync >/dev/null 2>&1
 		echo ok
 		;;
 
-	# rewrite the crontab line from UCI (cron enable + cron_schedule)
 	cron-sync)
 		CRON=/etc/crontabs/root
 		mkdir -p /etc/crontabs; touch "$CRON"
 		sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
-		if [ "$cron" != "0" ]; then
-			echo "$cron_schedule /usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1" >> "$CRON"
-		fi
-		/etc/init.d/cron enable 2>/dev/null
-		/etc/init.d/cron restart 2>/dev/null
+		[ "$cron" != "0" ] && echo "$cron_schedule /usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1" >> "$CRON"
+		/etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart 2>/dev/null
 		echo ok
 		;;
 
-	routing-get)
-		"$SHARE/routing.uc" get "$CFG"
-		;;
+	routing-get)   "$SHARE/routing.uc" get "$CFG" ;;
+	balancers-get) "$SHARE/balancers.uc" get "$CFG" ;;
 
 	routing-set|balancers-set)
-		# $2 = path to desired JSON array; uses the matching transform
 		[ -s "$2" ] || { echo "no input"; exit 1; }
-		case "$1" in routing-set) uc="$SHARE/routing.uc";; *) uc="$SHARE/balancers.uc";; esac
+		case "$1" in routing-set) uc="$SHARE/routing.uc" ;; *) uc="$SHARE/balancers.uc" ;; esac
 		cp -a "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"
-		if "$uc" set "$CFG" "$2" "$CFG.new" >/dev/null 2>&1 \
-			&& "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
-			mv "$CFG.new" "$CFG"
-			/etc/init.d/xray restart >/dev/null 2>&1
-			echo ok
+		if "$uc" set "$CFG" "$2" "$CFG.new" >/dev/null 2>&1 && "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
+			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1; echo ok
 		else
-			rm -f "$CFG.new"
-			echo "config test failed - not applied"
-			exit 1
+			rm -f "$CFG.new"; echo "config test failed - not applied"; exit 1
 		fi
 		;;
 
-	balancers-get)
-		"$SHARE/balancers.uc" get "$CFG"
-		;;
-
 	config-save)
-		# $2 = path to a candidate config; validate, back up, install, restart
 		[ -s "$2" ] || { echo "empty config"; exit 1; }
 		if "$XRAY" -test -format json -config "$2" >/dev/null 2>&1; then
 			cp -a "$CFG" "$CFG.bak.manual.$(date +%Y%m%d-%H%M%S)"
-			cat "$2" > "$CFG"
-			/etc/init.d/xray restart >/dev/null 2>&1
+			cat "$2" > "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
 			echo "saved and restarted xray"
 		else
-			echo "xray -test failed; not saved"
-			exit 1
+			echo "xray -test failed; not saved"; exit 1
 		fi
 		;;
 
@@ -173,16 +183,13 @@ case "$1" in
 		esac
 		if "$XRAY" -test -format json -config "$new" >/dev/null 2>&1; then
 			cp -a "$CFG" "$CFG.bak.preapi.$(date +%Y%m%d-%H%M%S)"
-			mv "$new" "$CFG"
-			/etc/init.d/xray restart >/dev/null 2>&1
+			mv "$new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
 			echo "enabled and restarted xray ($CFG)"
 		else
-			rm -f "$new"
-			echo "xray -test failed on merged config; not applied"
-			exit 1
+			rm -f "$new"; echo "xray -test failed on merged config; not applied"; exit 1
 		fi
 		;;
 
 	*)
-		echo "usage: xray-sub fetch|apply|status|set-url <url>|set-cfg ...|cron-sync|routing-get|routing-set <f>|balancers-get|balancers-set <f>|enable-api"; exit 1 ;;
+		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api"; exit 1 ;;
 esac

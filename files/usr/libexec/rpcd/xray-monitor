@@ -164,11 +164,15 @@ case "$1" in
 		json_add_object "sub_get";    json_close_object
 		json_add_object "sub_fetch";  json_close_object
 		json_add_object "sub_apply";  json_close_object
-		json_add_object "sub_seturl"; json_add_string "url" ""; json_close_object
 		json_add_object "sub_setcfg"
-			json_add_string "url" ""; json_add_string "cron" ""
-			json_add_string "cron_schedule" ""; json_add_string "auto_apply" ""
-			json_add_string "user_agent" ""
+			json_add_string "cron" ""; json_add_string "cron_schedule" ""
+			json_add_string "auto_apply" ""; json_add_string "user_agent" ""
+		json_close_object
+		json_add_object "sub_add"; json_add_string "prefix" ""; json_add_string "url" ""; json_close_object
+		json_add_object "sub_del"; json_add_string "id" ""; json_close_object
+		json_add_object "sub_edit"
+			json_add_string "id" ""; json_add_string "prefix" ""
+			json_add_string "url" ""; json_add_string "enabled" ""
 		json_close_object
 		json_add_object "routing_get"; json_close_object
 		json_add_object "routing_set"; json_add_array "inbounds"; json_close_array; json_close_object
@@ -221,23 +225,36 @@ case "$1" in
 			sub_get)   "$SUB" status ;;
 			sub_fetch) run_ok "$SUB" fetch ;;
 			sub_apply) run_ok "$SUB" apply ;;
-			sub_seturl)
-				input=$(cat)
-				url=$(echo "$input" | jsonfilter -e '@.url' 2>/dev/null)
-				run_ok "$SUB" set-url "$url"
-			;;
 			sub_setcfg)
 				input=$(cat)
-				u=$(echo "$input"  | jsonfilter -e '@.url' 2>/dev/null)
 				c=$(echo "$input"  | jsonfilter -e '@.cron' 2>/dev/null)
 				s=$(echo "$input"  | jsonfilter -e '@.cron_schedule' 2>/dev/null)
 				a=$(echo "$input"  | jsonfilter -e '@.auto_apply' 2>/dev/null)
 				ug=$(echo "$input" | jsonfilter -e '@.user_agent' 2>/dev/null)
-				msg=$("$SUB" set-cfg "$u" "$c" "$s" "$a" "$ug" 2>&1); rc=$?
-				json_init
-				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-				json_add_string msg "$msg"
-				json_dump
+				msg=$("$SUB" set-cfg "$c" "$s" "$a" "$ug" 2>&1); rc=$?
+				json_init; json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"; json_add_string msg "$msg"; json_dump
+			;;
+			sub_add)
+				input=$(cat)
+				p=$(echo "$input" | jsonfilter -e '@.prefix' 2>/dev/null)
+				u=$(echo "$input" | jsonfilter -e '@.url' 2>/dev/null)
+				msg=$("$SUB" sub-add "$p" "$u" 2>&1); rc=$?
+				json_init; json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"; json_add_string msg "$msg"; json_dump
+			;;
+			sub_del)
+				input=$(cat)
+				id=$(echo "$input" | jsonfilter -e '@.id' 2>/dev/null)
+				msg=$("$SUB" sub-del "$id" 2>&1); rc=$?
+				json_init; json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"; json_add_string msg "$msg"; json_dump
+			;;
+			sub_edit)
+				input=$(cat)
+				id=$(echo "$input" | jsonfilter -e '@.id' 2>/dev/null)
+				p=$(echo "$input"  | jsonfilter -e '@.prefix' 2>/dev/null)
+				u=$(echo "$input"  | jsonfilter -e '@.url' 2>/dev/null)
+				en=$(echo "$input" | jsonfilter -e '@.enabled' 2>/dev/null)
+				msg=$("$SUB" sub-edit "$id" "$p" "$u" "$en" 2>&1); rc=$?
+				json_init; json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"; json_add_string msg "$msg"; json_dump
 			;;
 			routing_get) "$SUB" routing-get ;;
 			routing_set)

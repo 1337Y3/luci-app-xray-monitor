@@ -5,7 +5,7 @@
 set -e
 
 PKG="luci-app-xray-monitor"
-VER="1.12-0"
+VER="1.13-0"
 ARCH="all"
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -28,7 +28,7 @@ SIZE=$(find "$WORK/data" -type f -print0 2>/dev/null | xargs -0 wc -c 2>/dev/nul
 cat > "$WORK/control/control" <<CONTROL_EOF
 Package: ${PKG}
 Version: ${VER}
-Depends: luci-base, xray-core, curl, ucode-mod-fs
+Depends: luci-base, xray-core, curl, ucode-mod-fs, ucode-mod-uci
 Section: luci
 Architecture: ${ARCH}
 Installed-Size: ${SIZE}

@@ -17,8 +17,15 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 - Rolling per-outbound throughput charts (down/up), ~10 min window, 5 s
   resolution, drawn client-side (no collectd/RRD, no extra packages)
 
-**Subscription** (Remnawave)
-- Parses a Remnawave subscription (Xray-JSON format) into proxy outbounds with
+**Subscriptions** (Remnawave) — supports **several** subscriptions
+- Add multiple subscriptions, each with a **prefix** and enable toggle. Every
+  enabled subscription's servers are **combined** into the outbounds, written as
+  its own block with a `// === subscription: <prefix> ===` header (a final
+  `// === local ===` block holds `direct`/freedom). Tags are `<prefix>-<location>`
+  (e.g. `proxy-de-1`, `work-fi`); keep prefix `proxy` for your original sub so
+  existing routing/balancers keep working. (xray and ucode both tolerate the
+  `//` comments.)
+- Parses each Remnawave subscription (Xray-JSON format) into outbounds with
   **stable, location-derived tags** (so routing keeps working across updates)
 - A **scheduled fetch** (configurable cron — presets or a custom expression,
   toggle on/off) stages the latest servers. The tab shows what's pending
@@ -68,10 +75,10 @@ still work).
 
 ```sh
 # copy the .ipk to the router, then:
-opkg install ./luci-app-xray-monitor_1.12-0_all.ipk
+opkg install ./luci-app-xray-monitor_1.13-0_all.ipk
 ```
 
-Depends: `luci-base, xray-core, curl, ucode-mod-fs` (all present on a stock
+Depends: `luci-base, xray-core, curl, ucode-mod-fs, ucode-mod-uci` (all present on a stock
 OpenWrt 24.10 with xray-core). The Subscription tab uses `curl` to fetch and
 `ucode` to transform JSON — no `jq` needed.
 

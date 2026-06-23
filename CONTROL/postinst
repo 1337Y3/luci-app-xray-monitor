@@ -8,6 +8,21 @@ chmod 0755 /usr/share/xray-monitor/*.uc /usr/share/xray-monitor/xray-sub 2>/dev/
 rm -f /tmp/luci-indexcache* 2>/dev/null
 rm -rf /tmp/luci-modulecache 2>/dev/null
 
+# Migrate a pre-multi-sub single URL (xray-monitor.sub.url) into a 'subscription'
+# section with prefix 'proxy' (keeps existing tags/routing). Runs once.
+if [ -z "$(uci show xray-monitor 2>/dev/null | grep '=subscription')" ]; then
+	oldurl=$(uci -q get xray-monitor.sub.url)
+	if [ -n "$oldurl" ]; then
+		sec=$(uci add xray-monitor subscription 2>/dev/null)
+		uci set "xray-monitor.$sec.prefix"='proxy'
+		uci set "xray-monitor.$sec.url"="$oldurl"
+		uci set "xray-monitor.$sec.enabled"='1'
+		uci -q delete xray-monitor.sub.url
+		uci commit xray-monitor
+		logger -t xray-monitor "migrated single subscription URL to a 'subscription' section (prefix proxy)"
+	fi
+fi
+
 # install/refresh the subscription fetch cron from UCI (schedule + enable)
 /usr/share/xray-monitor/xray-sub cron-sync >/dev/null 2>&1
 
