@@ -8,6 +8,7 @@
 #   wget -qO- https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs/install.sh | sh
 
 BASE="https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs"
+REL="https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.ipk"
 
 # fetch <url> -> stdout, trying curl/wget/uclient-fetch with retries
 fetch() {
@@ -34,17 +35,18 @@ fetch_file() {
 	return 1
 }
 
-pkgs=$(fetch "$BASE/Packages") || { echo "Could not reach $BASE (GitHub may be blocked/flaky on this network) — try again in a minute."; exit 1; }
-ipk=$(printf '%s\n' "$pkgs" | sed -n 's/^Filename: //p' | tail -n1)
-[ -n "$ipk" ] || { echo "Package list had no entries (feed may be updating) — try again shortly."; exit 1; }
+tmp="/tmp/luci-app-xray-monitor.ipk"
 
-tmp="/tmp/$ipk"
-echo "Downloading $ipk ..."
-fetch_file "$BASE/$ipk" "$tmp" || { rm -f "$tmp"; echo "Download failed — try again in a minute."; exit 1; }
-if ! tar -tzf "$tmp" >/dev/null 2>&1; then
-	rm -f "$tmp"
-	echo "Downloaded file is not a valid package (the feed may be updating right now) — try again shortly."
-	exit 1
+# 1) preferred: the stable GitHub Release asset (single redirect, robust)
+echo "Downloading latest package (GitHub Releases) ..."
+if ! { fetch_file "$REL" "$tmp" && tar -tzf "$tmp" >/dev/null 2>&1; }; then
+	# 2) fallback: the opkg feed (raw)
+	echo "Releases unavailable — trying the feed ..."
+	pkgs=$(fetch "$BASE/Packages") || { echo "Could not reach GitHub (Releases or feed) — it may be blocked/flaky here; try again in a minute."; exit 1; }
+	ipk=$(printf '%s\n' "$pkgs" | sed -n 's/^Filename: //p' | tail -n1)
+	[ -n "$ipk" ] || { echo "Package list had no entries (feed may be updating) — try again shortly."; exit 1; }
+	fetch_file "$BASE/$ipk" "$tmp" || { rm -f "$tmp"; echo "Download failed — try again in a minute."; exit 1; }
+	tar -tzf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "Downloaded file is not a valid package — try again shortly."; exit 1; }
 fi
 
 echo "Installing (deps come from your normal feeds) ..."

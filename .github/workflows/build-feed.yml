@@ -37,3 +37,19 @@ jobs:
             git commit -m "feed: rebuild ${ver} [skip ci]"
             git push
           fi
+
+      - name: Publish GitHub Release (stable-named asset)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ver=$(sed -n 's/^VER="\(.*\)"/\1/p' build-ipk.sh)
+          tag="v${ver}"
+          # stable asset name so /releases/latest/download/<name> is constant
+          cp "docs/luci-app-xray-monitor_${ver}_all.ipk" luci-app-xray-monitor.ipk
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" luci-app-xray-monitor.ipk --clobber
+            gh release edit "$tag" --latest
+          else
+            gh release create "$tag" luci-app-xray-monitor.ipk \
+              --title "$tag" --notes "Automated build of ${ver}. Install/upgrade: see README." --latest
+          fi

@@ -8,6 +8,7 @@ SHARE=/usr/share/xray-monitor
 STATE=/etc/xray-monitor
 XRAY=/usr/bin/xray
 FEED="https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs"
+REL="https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.ipk"
 PKG=luci-app-xray-monitor
 
 config_file() {
@@ -177,17 +178,18 @@ case "$1" in
 		;;
 
 	self-update)
-		ipk=$(curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
-		[ -n "$ipk" ] || { echo "cannot read package list"; exit 1; }
-		tmp="/tmp/$ipk"
-		curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { rm -f "$tmp"; echo "download failed"; exit 1; }
-		# guard against a stale-cache 404 page being handed to opkg
-		if ! tar -tzf "$tmp" >/dev/null 2>&1; then
-			rm -f "$tmp"; echo "downloaded file is not a valid package (feed may be updating; try again shortly)"; exit 1
+		tmp="/tmp/luci-app-xray-monitor.ipk"
+		# 1) preferred: stable GitHub Release asset (single redirect, robust)
+		if ! { curl -fsSL --max-time 60 -o "$tmp" "$REL" 2>/dev/null && tar -tzf "$tmp" >/dev/null 2>&1; }; then
+			# 2) fallback: the opkg feed
+			ipk=$(curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
+			[ -n "$ipk" ] || { rm -f "$tmp"; echo "cannot reach Releases or feed"; exit 1; }
+			curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { rm -f "$tmp"; echo "download failed"; exit 1; }
+			tar -tzf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "downloaded file is not a valid package (feed may be updating)"; exit 1; }
 		fi
 		opkg install --force-reinstall "$tmp"; rc=$?
 		rm -f "$tmp"
-		[ "$rc" -eq 0 ] && echo "updated to $ipk" || { echo "opkg install failed"; exit 1; }
+		[ "$rc" -eq 0 ] && echo "updated" || { echo "opkg install failed"; exit 1; }
 		;;
 
 	enable-api)
