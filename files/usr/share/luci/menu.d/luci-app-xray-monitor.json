@@ -1,0 +1,78 @@
+{
+	"admin/services/xray-monitor": {
+		"title": "Xray Monitor",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-xray-monitor" ]
+		}
+	},
+	"admin/services/xray-monitor/overview": {
+		"title": "Overview",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "xray/monitor"
+		},
+		"depends": {
+			"acl": [ "luci-app-xray-monitor" ]
+		}
+	},
+	"admin/services/xray-monitor/graphs": {
+		"title": "Graphs",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "xray/graphs"
+		},
+		"depends": {
+			"acl": [ "luci-app-xray-monitor" ]
+		}
+	},
+	"admin/services/xray-monitor/subscription": {
+		"title": "Subscription",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "xray/subscription"
+		},
+		"depends": {
+			"acl": [ "luci-app-xray-monitor" ]
+		}
+	},
+	"admin/services/xray-monitor/routing": {
+		"title": "Routing",
+		"order": 4,
+		"action": {
+			"type": "view",
+			"path": "xray/routing"
+		},
+		"depends": {
+			"acl": [ "luci-app-xray-monitor" ]
+		}
+	},
+	"admin/services/xray-monitor/balancers": {
+		"title": "Balancers",
+		"order": 5,
+		"action": {
+			"type": "view",
+			"path": "xray/balancers"
+		},
+		"depends": {
+			"acl": [ "luci-app-xray-monitor" ]
+		}
+	},
+	"admin/services/xray-monitor/config": {
+		"title": "Config",
+		"order": 6,
+		"action": {
+			"type": "view",
+			"path": "xray/config"
+		},
+		"depends": {
+			"acl": [ "luci-app-xray-monitor" ]
+		}
+	}
+}

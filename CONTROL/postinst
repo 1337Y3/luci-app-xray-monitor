@@ -1,0 +1,22 @@
+#!/bin/sh
+# Skip runtime actions during image build / offline install
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+
+chmod 0755 /usr/libexec/rpcd/xray-monitor 2>/dev/null
+chmod 0755 /usr/share/xray-monitor/*.uc /usr/share/xray-monitor/xray-sub 2>/dev/null
+/etc/init.d/rpcd restart 2>/dev/null
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+
+# install/refresh the subscription fetch cron from UCI (schedule + enable)
+/usr/share/xray-monitor/xray-sub cron-sync >/dev/null 2>&1
+
+# Auto-enable the Xray Stats API (idempotent, path-aware, logged).
+# Result also visible later via:  logread | grep xray-monitor
+# or run by hand:                 /usr/share/xray-monitor/xray-sub enable-api
+if [ "$(uci -q get xray-monitor.sub.auto_enable_api)" != "0" ]; then
+	out=$(/usr/share/xray-monitor/xray-sub enable-api 2>&1)
+	logger -t xray-monitor "stats-api enable: $out"
+	echo "luci-app-xray-monitor: Stats API -> $out"
+fi
+exit 0

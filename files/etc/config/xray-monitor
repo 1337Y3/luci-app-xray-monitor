@@ -1,0 +1,10 @@
+config xray-monitor 'sub'
+	option url ''
+	option user_agent 'v2rayNG/1.8.0'
+	# scheduled fetch: enable + cron expression
+	option cron '1'
+	option cron_schedule '0 * * * *'
+	# auto-apply (splice + restart xray) when a scheduled/manual fetch finds changes
+	option auto_apply '0'
+	# auto-enable the Xray Stats API in config.json on package install (1=yes)
+	option auto_enable_api '1'

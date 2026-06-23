@@ -1,0 +1,16 @@
+{
+	"luci-app-xray-monitor": {
+		"description": "Grant access to Xray monitor status and stats",
+		"read": {
+			"ubus": {
+				"xray-monitor": [ "status", "stats", "outbounds", "sub_get", "routing_get", "balancers_get", "validate", "config_get", "config_test" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"xray-monitor": [ "reset", "sub_fetch", "sub_apply", "sub_seturl", "sub_setcfg", "routing_set", "balancers_set", "enable_api", "config_save" ]
+			},
+			"uci": [ "xray-monitor" ]
+		}
+	}
+}

@@ -1,0 +1,12 @@
+#!/bin/sh
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+
+# On real removal (not upgrade): drop the cron line and persisted state.
+# Upgrades pass "upgrade" here, so state/cron survive package updates.
+if [ "$1" = "remove" ]; then
+	CRON=/etc/crontabs/root
+	[ -f "$CRON" ] && sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
+	/etc/init.d/cron restart 2>/dev/null
+	rm -rf /etc/xray-monitor 2>/dev/null
+fi
+exit 0
