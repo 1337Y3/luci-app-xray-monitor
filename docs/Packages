@@ -10,7 +10,7 @@ Description:  LuCI app to monitor and manage Xray: service status, live per-inbo
   throughput graphs, a Remnawave subscription parser that auto-stages outbound
   updates, and exit-routing controls. Pages under Services -> Xray Monitor.
 Filename: luci-app-xray-monitor_1.12-0_all.ipk
-Size: 21510
-SHA256sum: 4d927df00f4c412fb56a47474d5850b1b81b04726ed35173096fcbdad9d00c69
-MD5Sum: 8f013af0f5dddcab44ff9ea9acd5b605
+Size: 21442
+SHA256sum: 779fcac28f28edcd18fe7819c24cbbffec39176a7cb29d4b62b403cbc967ad4c
+MD5Sum: eb366287842b973fe66239924109362f
 

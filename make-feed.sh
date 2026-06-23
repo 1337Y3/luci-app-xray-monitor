@@ -1,7 +1,7 @@
 #!/bin/sh
 # Generate an opkg feed index (Packages + Packages.gz) from the .ipk files in docs/.
-# The .ipk should be built on a router with build-ipk.sh (for correct root ownership)
-# and copied into docs/. Run this on macOS or Linux; it only reads the .ipk files.
+# Build first with:  sh build-ipk.sh docs   (forces root ownership on any host).
+# Run on macOS/Linux/CI; this only reads the .ipk files.
 #   sh make-feed.sh
 set -e
 

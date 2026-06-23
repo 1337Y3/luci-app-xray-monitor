@@ -97,11 +97,13 @@ echo 'src/gz xraymon https://raw.githubusercontent.com/1337Y3/luci-app-xray-moni
 (The router needs HTTPS support — `libustream-mbedtls` + `ca-bundle`, present on
 stock images. Custom feeds aren't signature-checked.)
 
-### Maintaining the feed
-1. Build the `.ipk` on a router (root ownership): `sh build-ipk.sh /tmp` then
-   copy it into `docs/` — or just bump `VER` in `build-ipk.sh` and rebuild.
-2. Regenerate the index: `sh make-feed.sh` (writes `docs/Packages[.gz]`).
-3. `git commit` + `git push`. Routers pick it up on `opkg update`.
+### Maintaining the feed (all local — no SDK, no router)
+1. Bump `VER` in `build-ipk.sh`.
+2. `rm -f docs/*.ipk && sh build-ipk.sh docs` — builds straight into the feed.
+   `build-ipk.sh` forces uid/gid 0 in the archive (GNU tar / bsdtar / BusyBox),
+   so the package installs as root regardless of build host.
+3. `sh make-feed.sh` — regenerates `docs/Packages[.gz]`.
+4. `git commit` + `git push`. Routers pick it up on `opkg update && opkg upgrade`.
 
 Then open LuCI → **Services → Xray Monitor** (hard-refresh the browser if the
 menu doesn't appear immediately).
