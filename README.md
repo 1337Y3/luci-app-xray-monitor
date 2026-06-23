@@ -74,7 +74,7 @@ still work).
 ## Install / upgrade (recommended — one line)
 
 ```sh
-wget -qO- https://1337y3.github.io/luci-app-xray-monitor/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs/install.sh | sh
 ```
 
 This downloads the latest `.ipk` and installs it directly (`opkg install <file>`),

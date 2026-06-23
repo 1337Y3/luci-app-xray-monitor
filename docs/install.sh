@@ -5,10 +5,10 @@
 # Deps (curl, ucode-mod-fs, ucode-mod-uci, luci-base, xray-core) are pulled from
 # your normal OpenWrt feeds, so run `opkg update` once first if needed.
 #
-#   wget -qO- https://1337y3.github.io/luci-app-xray-monitor/install.sh | sh
+#   wget -qO- https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs/install.sh | sh
 set -e
 
-BASE="https://1337y3.github.io/luci-app-xray-monitor"
+BASE="https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs"
 ipk=$(wget -qO- "$BASE/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
 [ -n "$ipk" ] || { echo "Could not read the package list from $BASE/Packages"; exit 1; }
 
