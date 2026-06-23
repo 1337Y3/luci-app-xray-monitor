@@ -11,6 +11,6 @@ Description:  LuCI app to monitor and manage Xray: service status, live per-inbo
   updates, and exit-routing controls. Pages under Services -> Xray Monitor.
 Filename: luci-app-xray-monitor_1.13-0_all.ipk
 Size: 22862
-SHA256sum: 6d115991ae9492d15a9e29b50fcbfa7559a7d18b34c337b83b512c4a061769fe
-MD5Sum: 915cc4b6b0e3c13b446a8cd04ffd7df6
+SHA256sum: 2c4513848ff2e7dd002b31a53d9bbd8f134b8552bc553458e0e9e05369edc120
+MD5Sum: 970efd689fa43cae8f091ab1c42a84b4
 
