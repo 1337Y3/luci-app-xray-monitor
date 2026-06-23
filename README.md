@@ -71,41 +71,36 @@ Tested on OpenWrt 24.10 with `xray-core` 25.x. The connectivity column needs
 `curl` or `ncat` present; without either it shows "unknown" (traffic/graphs
 still work).
 
-## Install
+## Install / upgrade (recommended — one line)
 
 ```sh
-# copy the .ipk to the router, then:
-opkg install ./luci-app-xray-monitor_1.13-0_all.ipk
+wget -qO- https://1337y3.github.io/luci-app-xray-monitor/install.sh | sh
 ```
 
-Depends: `luci-base, xray-core, curl, ucode-mod-fs, ucode-mod-uci` (all present on a stock
-OpenWrt 24.10 with xray-core). The Subscription tab uses `curl` to fetch and
-`ucode` to transform JSON — no `jq` needed.
+This downloads the latest `.ipk` and installs it directly (`opkg install <file>`),
+which works with the default `option check_signature` **on** — no feed signing,
+no security changes. Re-run the same line any time to **upgrade**.
 
-## Install via opkg feed (recommended — gives `opkg upgrade`)
+Dependencies (`luci-base, xray-core, curl, ucode-mod-fs, ucode-mod-uci`) come from
+your normal OpenWrt feeds, so run `opkg update` once first if any are missing
+(`ucode` does the JSON work — no `jq` needed). Or install a downloaded file
+manually: `opkg install ./luci-app-xray-monitor_*.ipk`.
 
-This repo publishes an opkg feed under `docs/` (served by GitHub Pages or
-raw.githubusercontent). On each router add **one** feed line (not both — two
-lines with the same `xraymon` tag cause a "Duplicate src declaration"):
+## Native opkg feed (optional, advanced)
+
+You can add the repo as an opkg feed for native `opkg upgrade`, **but** OpenWrt's
+default `option check_signature` refuses unsigned feeds — `opkg install` from the
+feed then fails with *"not available from any configured src"*. This feed is
+unsigned, so to use it you must turn off signature checking (affects **all**
+feeds; HTTPS still protects transport integrity):
 
 ```sh
-# GitHub Pages (recommended):
+sed -i '/option check_signature/d' /etc/opkg.conf
 echo 'src/gz xraymon https://1337y3.github.io/luci-app-xray-monitor' >> /etc/opkg/customfeeds.conf
-# ...OR raw GitHub (use instead of, not in addition to):
-# echo 'src/gz xraymon https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs' >> /etc/opkg/customfeeds.conf
-
-opkg update
-opkg install luci-app-xray-monitor
-# later, to upgrade:
-opkg update && opkg upgrade luci-app-xray-monitor
+opkg update && opkg install luci-app-xray-monitor
 ```
 
-The router needs HTTPS support (`libustream-mbedtls` + `ca-bundle`, present on
-stock images). The feed is **unsigned**, so `opkg update` prints a harmless
-`Failed to download .../Packages.sig, wget returned 8` — the package still
-installs/upgrades. To silence it, remove the `option check_signature` line from
-`/etc/opkg.conf` (disables signature checks for **all** feeds; HTTPS still
-protects integrity).
+Most people should just use the one-line installer above instead.
 
 ### Maintaining the feed (all local — no SDK, no router)
 1. Bump `VER` in `build-ipk.sh`.
