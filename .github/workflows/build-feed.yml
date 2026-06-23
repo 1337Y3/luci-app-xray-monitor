@@ -1,0 +1,39 @@
+name: build-feed
+
+# Rebuild the .ipk + opkg index whenever the package source changes.
+# Skips when only the generated feed (docs/) changes, so the auto-commit
+# below can't trigger an infinite loop.
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .ipk and regenerate feed index
+        run: |
+          rm -f docs/*.ipk
+          sh build-ipk.sh docs
+          sh make-feed.sh
+
+      - name: Commit updated feed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then
+            echo "feed unchanged"
+          else
+            ver=$(sed -n 's/^VER="\(.*\)"/\1/p' build-ipk.sh)
+            git commit -m "feed: rebuild ${ver} [skip ci]"
+            git push
+          fi
