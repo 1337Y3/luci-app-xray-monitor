@@ -7,6 +7,8 @@
 SHARE=/usr/share/xray-monitor
 STATE=/etc/xray-monitor
 XRAY=/usr/bin/xray
+FEED="https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs"
+PKG=luci-app-xray-monitor
 
 config_file() {
 	local f; f=$(uci -q get xray.config.conffiles 2>/dev/null | awk '{print $1}')
@@ -168,6 +170,20 @@ case "$1" in
 		else
 			echo "xray -test failed; not saved"; exit 1
 		fi
+		;;
+
+	latest-version)
+		curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Version: //p' | tail -n1
+		;;
+
+	self-update)
+		ipk=$(curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
+		[ -n "$ipk" ] || { echo "cannot read package list"; exit 1; }
+		tmp="/tmp/$ipk"
+		curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { echo "download failed"; exit 1; }
+		opkg install --force-reinstall "$tmp"; rc=$?
+		rm -f "$tmp"
+		[ "$rc" -eq 0 ] && echo "updated to $ipk" || { echo "opkg install failed"; exit 1; }
 		;;
 
 	enable-api)

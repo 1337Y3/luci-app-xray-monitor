@@ -10,6 +10,8 @@ var callOutbounds = rpc.declare({ object: 'xray-monitor', method: 'outbounds' })
 var callReset     = rpc.declare({ object: 'xray-monitor', method: 'reset' });
 var callEnableApi = rpc.declare({ object: 'xray-monitor', method: 'enable_api' });
 var callValidate  = rpc.declare({ object: 'xray-monitor', method: 'validate' });
+var callUpdChk    = rpc.declare({ object: 'xray-monitor', method: 'update_check' });
+var callUpdApply  = rpc.declare({ object: 'xray-monitor', method: 'update_apply' });
 
 var prev = null;  /* { ts, flat } for rate calculation */
 var root = null;  /* container element to redraw into */
@@ -238,7 +240,29 @@ return view.extend({
 			}, function() { validateBtn.disabled = false; ui.addNotification(null, E('p', _('Validate call failed.')), 'error'); });
 		});
 
-		var bar = E('div', { 'style': 'margin:.5em 0;display:flex;gap:8px;' }, [ validateBtn, resetBtn ]);
+		var updBtn = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Check for updates'));
+		updBtn.addEventListener('click', function() {
+			updBtn.disabled = true;
+			callUpdChk().then(function(res) {
+				updBtn.disabled = false;
+				if (!res || !res.latest) {
+					ui.addNotification(null, E('p', _('Could not reach the update feed (installed: ') + ((res && res.installed) || '?') + ').'), 'warning');
+					return;
+				}
+				if (!res.update_available) {
+					ui.addNotification(null, E('p', _('Up to date (') + res.installed + ').'), 'info');
+					return;
+				}
+				if (!confirm(_('Update available: ') + res.installed + ' → ' + res.latest + _('.\nDownload and install now? xray will restart.'))) return;
+				callUpdApply().then(function(r) {
+					ui.addNotification(null, E('p', (r && r.msg) || _('Update started.')), 'info');
+					// recheck after the detached update + rpcd restart settle
+					window.setTimeout(function() { location.reload(); }, 15000);
+				}, function() { ui.addNotification(null, E('p', _('Update call failed.')), 'error'); });
+			}, function() { updBtn.disabled = false; ui.addNotification(null, E('p', _('Update check failed.')), 'error'); });
+		});
+
+		var bar = E('div', { 'style': 'margin:.5em 0;display:flex;gap:8px;flex-wrap:wrap;' }, [ updBtn, validateBtn, resetBtn ]);
 		return E('div', {}, [ E('h2', {}, _('Xray Monitor')), bar, root ]);
 	},
 

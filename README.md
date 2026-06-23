@@ -10,6 +10,8 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 - Per-**inbound** (tproxy) upload/download totals + live ↑/↓ rates
 - A **Reset counters** button (zeroes xray's cumulative totals via the Stats API)
 - A **Validate config** button (runs `xray -test` and shows the result)
+- A **Check for updates** button (compares the installed version to the feed and
+  can download + install the latest `.ipk` in place)
 - An **Enable Stats API** banner/button if the API isn't detected
 - Traffic refreshes every 5 s, connectivity every 30 s
 

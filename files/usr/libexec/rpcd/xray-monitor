@@ -183,6 +183,8 @@ case "$1" in
 		json_add_object "config_get"; json_close_object
 		json_add_object "config_test"; json_add_string "config" ""; json_close_object
 		json_add_object "config_save"; json_add_string "config" ""; json_close_object
+		json_add_object "update_check"; json_close_object
+		json_add_object "update_apply"; json_close_object
 		json_dump
 	;;
 	call)
@@ -273,6 +275,23 @@ case "$1" in
 				json_init
 				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
 				json_add_string msg "$msg"
+				json_dump
+			;;
+			update_check)
+				installed=$(opkg status luci-app-xray-monitor 2>/dev/null | sed -n 's/^Version: //p' | head -n1)
+				latest=$("$SUB" latest-version 2>/dev/null)
+				json_init
+				json_add_string installed "${installed:-unknown}"
+				json_add_string latest "${latest:-}"
+				json_add_boolean update_available "$([ -n "$latest" ] && [ "$latest" != "$installed" ] && echo 1 || echo 0)"
+				json_dump
+			;;
+			update_apply)
+				# detach so the rpcd restart during opkg install can't kill the update
+				setsid sh -c 'sleep 2; /usr/share/xray-monitor/xray-sub self-update > /tmp/xraymon-update.log 2>&1' >/dev/null 2>&1 &
+				json_init
+				json_add_boolean ok 1
+				json_add_string msg "Update started; the page will reconnect in a few seconds."
 				json_dump
 			;;
 			balancers_get) "$SUB" balancers-get ;;
