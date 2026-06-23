@@ -85,24 +85,27 @@ OpenWrt 24.10 with xray-core). The Subscription tab uses `curl` to fetch and
 ## Install via opkg feed (recommended — gives `opkg upgrade`)
 
 This repo publishes an opkg feed under `docs/` (served by GitHub Pages or
-raw.githubusercontent). On each router, add the feed once:
+raw.githubusercontent). On each router add **one** feed line (not both — two
+lines with the same `xraymon` tag cause a "Duplicate src declaration"):
 
 ```sh
+# GitHub Pages (recommended):
 echo 'src/gz xraymon https://1337y3.github.io/luci-app-xray-monitor' >> /etc/opkg/customfeeds.conf
+# ...OR raw GitHub (use instead of, not in addition to):
+# echo 'src/gz xraymon https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs' >> /etc/opkg/customfeeds.conf
+
 opkg update
 opkg install luci-app-xray-monitor
 # later, to upgrade:
 opkg update && opkg upgrade luci-app-xray-monitor
 ```
 
-Using raw GitHub instead of Pages? Use this feed line:
-
-```sh
-echo 'src/gz xraymon https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs' >> /etc/opkg/customfeeds.conf
-```
-
-(The router needs HTTPS support — `libustream-mbedtls` + `ca-bundle`, present on
-stock images. Custom feeds aren't signature-checked.)
+The router needs HTTPS support (`libustream-mbedtls` + `ca-bundle`, present on
+stock images). The feed is **unsigned**, so `opkg update` prints a harmless
+`Failed to download .../Packages.sig, wget returned 8` — the package still
+installs/upgrades. To silence it, remove the `option check_signature` line from
+`/etc/opkg.conf` (disables signature checks for **all** feeds; HTTPS still
+protects integrity).
 
 ### Maintaining the feed (all local — no SDK, no router)
 1. Bump `VER` in `build-ipk.sh`.
