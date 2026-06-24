@@ -11,8 +11,16 @@ let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
 function key_of(o) {
 	let s = o.settings ?? {};
 	let v = (s.vnext && s.vnext[0]) ? s.vnext[0] : ((s.servers && s.servers[0]) ? s.servers[0] : {});
+	let u = (v.users && v.users[0]) ? v.users[0] : {};
 	let ss = o.streamSettings ?? {}, rs = ss.realitySettings ?? {}, xs = ss.xhttpSettings ?? {};
-	return sprintf('%s|%s|%s|%s|%s', v.address, v.port, ss.network, rs.serverName, xs.mode);
+	// Identity = endpoint + transport + CREDENTIALS. Without the credential
+	// fields, switching to a different account on the SAME node (new UUID/
+	// password, same address/port) reads as "no change" and never applies.
+	return sprintf('%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
+		o.protocol, v.address, v.port, ss.network,
+		u.id, u.flow, u.encryption, u.security,   // vless / vmess
+		v.password, v.method,                     // trojan / shadowsocks
+		rs.serverName, rs.publicKey);             // reality
 }
 
 let cur = {}, obs = cfg.outbounds ?? [];

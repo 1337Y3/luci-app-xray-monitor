@@ -38,6 +38,38 @@ prefix_in_use() {  # <prefix> <exclude-id>
 	done; return 1
 }
 
+# Keep the newest $1 (default 3) "$CFG.bak.*" backups, delete the rest.
+# Only ever runs after a config change verified working (xray -test + restart).
+prune_backups() {
+	local keep="${1:-3}" f n=0
+	for f in $(ls -t "$CFG".bak.* 2>/dev/null); do
+		n=$((n + 1))
+		[ "$n" -le "$keep" ] && continue
+		[ "$f" = "$CFG" ] && continue   # never the live config
+		rm -f "$f"
+	done
+}
+
+# Stats API reachability probe (rc 0 = answering on 127.0.0.1:10085).
+APISRV="127.0.0.1:10085"
+api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
+
+# After a config change + restart, confirm xray came back healthy; if not,
+# restore the pre-change backup and restart. $1 = backup file to restore,
+# $2 = 1 to also require the stats API to answer (else only require xray up).
+verify_or_rollback() {
+	local bak="$1" need_api="$2" i
+	for i in 1 2 3 4 5; do
+		if pgrep -f "$XRAY run" >/dev/null 2>&1 && { [ "$need_api" != 1 ] || api_up; }; then
+			return 0
+		fi
+		sleep 1
+	done
+	[ -f "$bak" ] && cp -a "$bak" "$CFG"
+	/etc/init.d/xray restart >/dev/null 2>&1
+	return 1
+}
+
 case "$1" in
 	fetch)
 		tmpd=$(mktemp -d); staged="$tmpd/staged.json"
@@ -79,11 +111,17 @@ case "$1" in
 
 	apply)
 		[ -s "$STATE/staged.json" ] || { echo "nothing staged"; exit 1; }
-		cp -a "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"
+		api_before=0; api_up && api_before=1
+		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 		if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$CFG.new" >/dev/null 2>&1 \
 			&& "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
 			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
-			echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
+			if verify_or_rollback "$bak" "$api_before"; then
+				prune_backups
+				echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
+			else
+				echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; exit 1
+			fi
 		else
 			rm -f "$CFG.new"; echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; exit 1
 		fi
@@ -154,9 +192,12 @@ case "$1" in
 	routing-set|balancers-set)
 		[ -s "$2" ] || { echo "no input"; exit 1; }
 		case "$1" in routing-set) uc="$SHARE/routing.uc" ;; *) uc="$SHARE/balancers.uc" ;; esac
-		cp -a "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"
+		api_before=0; api_up && api_before=1
+		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 		if "$uc" set "$CFG" "$2" "$CFG.new" >/dev/null 2>&1 && "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
-			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1; echo ok
+			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
+			if verify_or_rollback "$bak" "$api_before"; then prune_backups; echo ok
+			else echo "xray/api failed health check - rolled back"; exit 1; fi
 		else
 			rm -f "$CFG.new"; echo "config test failed - not applied"; exit 1
 		fi
@@ -165,9 +206,15 @@ case "$1" in
 	config-save)
 		[ -s "$2" ] || { echo "empty config"; exit 1; }
 		if "$XRAY" -test -format json -config "$2" >/dev/null 2>&1; then
-			cp -a "$CFG" "$CFG.bak.manual.$(date +%Y%m%d-%H%M%S)"
+			api_before=0; api_up && api_before=1
+			bak="$CFG.bak.manual.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 			cat "$2" > "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
-			echo "saved and restarted xray"
+			if verify_or_rollback "$bak" 0; then
+				prune_backups
+				echo "saved and restarted xray"
+			else
+				echo "saved but xray failed to start - rolled back"; exit 1
+			fi
 		else
 			echo "xray -test failed; not saved"; exit 1
 		fi
@@ -204,9 +251,14 @@ case "$1" in
 			*)         rm -f "$new"; echo "merge failed: $res"; exit 1 ;;
 		esac
 		if "$XRAY" -test -format json -config "$new" >/dev/null 2>&1; then
-			cp -a "$CFG" "$CFG.bak.preapi.$(date +%Y%m%d-%H%M%S)"
+			bak="$CFG.bak.preapi.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 			mv "$new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
-			echo "enabled and restarted xray ($CFG)"
+			if verify_or_rollback "$bak" 1; then
+				prune_backups
+				echo "enabled and restarted xray ($CFG)"
+			else
+				rm -f "$new" 2>/dev/null; echo "enabled but stats API did not come up - rolled back"; exit 1
+			fi
 		else
 			rm -f "$new"; echo "xray -test failed on merged config; not applied"; exit 1
 		fi

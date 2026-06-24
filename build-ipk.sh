@@ -5,7 +5,7 @@
 set -e
 
 PKG="luci-app-xray-monitor"
-VER="1.14-2"
+VER="1.15-0"
 ARCH="all"
 
 HERE=$(cd "$(dirname "$0")" && pwd)

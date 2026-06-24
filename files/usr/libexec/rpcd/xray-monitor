@@ -14,6 +14,35 @@ config_file() {
 	echo "/etc/xray/config.json"
 }
 
+# Detect the config double-load footgun: xray launched with -confdir D *and*
+# -config F where F lives inside D, so D/*.json loads F a second time. Harmless
+# until it isn't (inbounds, incl. the api on 10085, can fail to bind).
+confdir_dup() {
+	local pid="$1" tok prev confdirs="" configs="" d f
+	[ -n "$pid" ] && [ -r "/proc/$pid/cmdline" ] || return 1
+	prev=""
+	while IFS= read -r tok; do
+		case "$prev" in
+			-confdir|--confdir) confdirs="$confdirs $tok" ;;
+			-config|--config)   configs="$configs $tok" ;;
+		esac
+		case "$tok" in
+			-confdir=*|--confdir=*) confdirs="$confdirs ${tok#*=}" ;;
+			-config=*|--config=*)   configs="$configs ${tok#*=}" ;;
+		esac
+		prev="$tok"
+	done <<EOF
+$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null)
+EOF
+	[ -n "$confdirs" ] && [ -n "$configs" ] || return 1
+	for f in $configs; do
+		for d in $confdirs; do
+			[ "$(dirname "$f")" = "${d%/}" ] && return 0
+		done
+	done
+	return 1
+}
+
 get_status() {
 	local pid hz starttime sysuptime up=0 running=0 version
 	pid=$(pgrep -f "$XRAY run" | head -n1)
@@ -34,6 +63,7 @@ get_status() {
 	json_add_int pid "${pid:-0}"
 	json_add_int uptime "$up"
 	json_add_string version "${version:-unknown}"
+	json_add_boolean confdir_dup "$(confdir_dup "$pid" && echo 1 || echo 0)"
 	json_dump
 }
 

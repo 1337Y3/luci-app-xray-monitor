@@ -41,8 +41,11 @@ cfg.policy.system.statsOutboundDownlink = true;
 if (type(cfg.inbounds) != 'array') cfg.inbounds = [];
 let has_in = false;
 for (let i = 0; i < length(cfg.inbounds); i++) if (cfg.inbounds[i].tag == apitag) has_in = true;
+// Insert the api inbound FIRST so it binds ahead of the tproxy inbounds. On
+// boxes that double-load config (e.g. `-confdir` + `-config`) a trailing
+// inbound can fail to come up while earlier ones bind, silently killing the API.
 if (!has_in)
-	push(cfg.inbounds, {
+	unshift(cfg.inbounds, {
 		tag: apitag, protocol: 'dokodemo-door', listen: '127.0.0.1',
 		port: port, settings: { address: '127.0.0.1' }
 	});

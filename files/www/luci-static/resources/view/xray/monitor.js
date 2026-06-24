@@ -160,9 +160,21 @@ function apiBanner() {
 	]);
 }
 
+function confdirBanner() {
+	var s = state.status || {};
+	if (!s.confdir_dup) return null;
+	return E('div', {
+		'style': 'margin:.5em 0;padding:10px;border-radius:6px;background:#fdecea;border:1px solid #d09999;color:#222;'
+	}, [
+		E('strong', {}, _('Config double-load detected. ')),
+		E('span', {}, _('xray is started with both -confdir and -config pointing at the same file, so config.json is loaded twice. Usually harmless (xray merges by tag), but it can make inbounds — including the stats API on 10085 — intermittently fail to bind. Prefer a single -config, or move config.json out of the -confdir directory.'))
+	]);
+}
+
 function redraw() {
 	if (!root) return;
 	var content = [
+		confdirBanner(),
 		apiBanner(),
 		buildStatusCard(),
 		buildTable(_('Outbounds (VPS exits)'), 'outbound', true),
