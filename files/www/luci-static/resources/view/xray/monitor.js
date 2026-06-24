@@ -160,14 +160,45 @@ function apiBanner() {
 	]);
 }
 
+var CONFDIR_DISMISS_KEY = 'luci-app-xray-monitor.confdir-dismissed';
+
 function confdirBanner() {
 	var s = state.status || {};
 	if (!s.confdir_dup) return null;
+	try { if (localStorage.getItem(CONFDIR_DISMISS_KEY)) return null; } catch (e) {}
+
+	var dismiss = E('button', {
+		'class': 'cbi-button',
+		'style': 'margin-left:auto;align-self:flex-start;line-height:1;',
+		'title': _('Dismiss this warning')
+	}, '✕');
+	dismiss.addEventListener('click', function() {
+		try { localStorage.setItem(CONFDIR_DISMISS_KEY, '1'); } catch (e) {}
+		redraw();
+	});
+
 	return E('div', {
-		'style': 'margin:.5em 0;padding:10px;border-radius:6px;background:#fdecea;border:1px solid #d09999;color:#222;'
+		'style': 'margin:.5em 0;padding:10px;border-radius:6px;background:#fdecea;border:1px solid #d09999;color:#222;' +
+		         'display:flex;gap:12px;align-items:flex-start;'
 	}, [
-		E('strong', {}, _('Config double-load detected. ')),
-		E('span', {}, _('xray is started with both -confdir and -config pointing at the same file, so config.json is loaded twice. Usually harmless (xray merges by tag), but it can make inbounds — including the stats API on 10085 — intermittently fail to bind. Prefer a single -config, or move config.json out of the -confdir directory.'))
+		E('div', {}, [
+			E('strong', {}, _('Config double-load detected. ')),
+			E('span', {}, _('xray is started with both -confdir and -config pointing at the same file, so config.json is loaded twice. Usually harmless (xray merges by tag), but it can make inbounds — including the stats API on 10085 — intermittently fail to bind.')),
+			E('p', { 'style': 'margin:.6em 0 .2em;' }, E('strong', {}, _('To fix it (make the config load once):'))),
+			E('ol', { 'style': 'margin:.2em 0 0 1.2em;padding:0;line-height:1.5;' }, [
+				E('li', {}, [ _('See how xray is launched: '),
+					E('code', {}, 'uci show xray; grep -nE "confdir|config" /etc/init.d/xray') ]),
+				E('li', {}, [ _('Remove one flag so '), E('code', {}, '/etc/xray/config.json'),
+					_(' loads once — usually drop '), E('code', {}, '-confdir'), _(' and keep '),
+					E('code', {}, '-config'), _('; on a real multi-file confdir setup, drop the redundant '),
+					E('code', {}, '-config'), _(' instead.') ]),
+				E('li', {}, [ _('Apply and verify: '),
+					E('code', {}, 'uci commit xray && /etc/init.d/xray restart'),
+					_(', then '), E('code', {}, 'xray api statsquery --server=127.0.0.1:10085'),
+					_(' should dial.') ])
+			])
+		]),
+		dismiss
 	]);
 }
 
