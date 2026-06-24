@@ -63,6 +63,7 @@ get_status() {
 	json_add_int pid "${pid:-0}"
 	json_add_int uptime "$up"
 	json_add_string version "${version:-unknown}"
+	json_add_string app_version "$(opkg status luci-app-xray-monitor 2>/dev/null | sed -n 's/^Version: //p' | head -n1)"
 	json_add_boolean confdir_dup "$(confdir_dup "$pid" && echo 1 || echo 0)"
 	json_dump
 }

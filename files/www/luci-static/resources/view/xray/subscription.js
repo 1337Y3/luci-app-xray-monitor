@@ -31,6 +31,23 @@ function fmtAgo(e) {
 	if (s < 86400) return Math.floor(s / 3600) + 'h ' + _('ago');
 	return Math.floor(s / 86400) + 'd ' + _('ago');
 }
+function fmtBytes(n) {
+	n = Number(n) || 0;
+	var u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'], i = 0;
+	while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+	return (i ? n.toFixed(2) : n.toFixed(0)) + ' ' + u[i];
+}
+function fmtExpire(ts) {
+	ts = Number(ts) || 0;
+	if (!ts) return { text: _('never'), color: '#888' };
+	var date = new Date(ts * 1000).toISOString().slice(0, 10);
+	var left = ts - Math.floor(Date.now() / 1000);
+	if (left <= 0) return { text: _('expired') + ' · ' + date, color: '#cc3300' };
+	var days = Math.floor(left / 86400);
+	var when = days >= 1 ? (days + 'd') : (Math.floor(left / 3600) + 'h');
+	return { text: date + ' · ' + when + ' ' + _('left'),
+	         color: days <= 3 ? '#cc3300' : (days <= 7 ? '#cc7a00' : '#46a546') };
+}
 function statusBadge(st) {
 	var m = ({ ok: ['#46a546', _('fetched OK')], applied: ['#46a546', _('applied')],
 		partial: ['#cc7a00', _('partial — some failed')], never: ['#888', _('never fetched')],
@@ -100,6 +117,39 @@ function buildSubsTable() {
 	return E('table', { 'class': 'table' }, rows);
 }
 
+function buildUsage() {
+	var subs = (state.subscriptions || []).filter(function(s) { return s.usage; });
+	if (!subs.length) return null;
+	var rows = [ E('tr', { 'class': 'tr table-titles' }, [
+		E('th', { 'class': 'th' }, _('Prefix')), E('th', { 'class': 'th right' }, _('Used')),
+		E('th', { 'class': 'th right' }, _('Total')), E('th', { 'class': 'th', 'style': 'width:40%' }, _('Usage')),
+		E('th', { 'class': 'th' }, _('Expires'))
+	]) ];
+	subs.forEach(function(s) {
+		var u = s.usage;
+		var used = (Number(u.upload) || 0) + (Number(u.download) || 0), total = Number(u.total) || 0;
+		var pct = total > 0 ? Math.min(100, Math.round(used / total * 100)) : 0;
+		var bcol = pct >= 90 ? '#cc3300' : (pct >= 75 ? '#cc7a00' : '#46a546');
+		var meter = total > 0
+			? E('div', { 'style': 'display:flex;gap:8px;align-items:center;' }, [
+				E('div', { 'style': 'flex:1;background:rgba(128,128,128,.2);border-radius:4px;height:14px;overflow:hidden;' },
+					E('div', { 'style': 'background:' + bcol + ';height:100%;width:' + pct + '%;' }, '')),
+				E('span', { 'style': 'font-size:90%;white-space:nowrap;' }, pct + '%') ])
+			: E('span', { 'style': 'color:#888;' }, _('unlimited'));
+		var exp = fmtExpire(u.expire);
+		var pcell = [ E('strong', {}, s.prefix) ];
+		if (u.title) pcell.push(E('div', { 'style': 'color:#888;font-size:90%;' }, u.title));
+		rows.push(E('tr', { 'class': 'tr' }, [
+			E('td', { 'class': 'td' }, E('div', {}, pcell)),
+			E('td', { 'class': 'td right' }, fmtBytes(used)),
+			E('td', { 'class': 'td right' }, total > 0 ? fmtBytes(total) : '∞'),
+			E('td', { 'class': 'td' }, meter),
+			E('td', { 'class': 'td', 'style': 'color:' + exp.color + ';white-space:nowrap;' }, exp.text)
+		]));
+	});
+	return E('div', {}, [ E('h3', {}, _('Usage & expiry')), E('table', { 'class': 'table' }, rows) ]);
+}
+
 function buildSettings() {
 	var schedInput = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:160px', 'value': state.cron_schedule });
 	var opts = [ E('option', { 'value': '' }, _('Custom…')) ], matched = false;
@@ -155,6 +205,7 @@ function redraw() {
 		E('h3', {}, _('Subscriptions')),
 		E('p', { 'style': 'color:#888;font-size:90%;margin:.2em 0 .6em;' }, _('Each subscription\'s servers become outbounds tagged "<prefix>-<location>" and are written as their own block in config.json. Use a unique prefix per subscription (keep "proxy" for your existing one to preserve routing).')),
 		buildSubsTable(),
+		(buildUsage() || E('div', {})),
 		E('h3', {}, _('Schedule & auto-apply')),
 		buildSettings(),
 		E('h3', {}, _('Status')),

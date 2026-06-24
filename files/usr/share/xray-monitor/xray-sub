@@ -24,9 +24,32 @@ cron=$(uci -q get xray-monitor.sub.cron); [ -n "$cron" ] || cron=1
 cron_schedule=$(uci -q get xray-monitor.sub.cron_schedule); [ -n "$cron_schedule" ] || cron_schedule="0 * * * *"
 auto_apply=$(uci -q get xray-monitor.sub.auto_apply); [ -n "$auto_apply" ] || auto_apply=0
 
-fetch_url() {  # <url> <user-agent>
-	if command -v curl >/dev/null 2>&1; then curl -s -A "$2" --max-time 25 "$1"
+fetch_url() {  # <url> <user-agent> [header-dump-file]
+	local hdr="${3:-/dev/null}"
+	if command -v curl >/dev/null 2>&1; then curl -s -D "$hdr" -A "$2" --max-time 25 "$1"
 	else uclient-fetch -q -O - -U "$2" -T 25 "$1"; fi
+}
+
+# Parse the standard `subscription-userinfo` response header into usage state:
+#   subscription-userinfo: upload=0; download=123; total=456; expire=1735689600
+# (bytes; total=0 = unlimited, expire=0 = never). Writes $STATE/usage-<id>.json,
+# or removes it when the header is absent.
+store_usage() {  # <id> <header-file>
+	local id="$1" hf="$2" line up dn tot exp title
+	[ -f "$hf" ] || return 0
+	# profile-title (plan name) — may be plain text or "base64:" prefixed (unicode/emoji).
+	# Stored as raw text in a separate file so status.uc can JSON-escape it safely.
+	title=$(grep -i '^profile-title:' "$hf" 2>/dev/null | tail -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
+	case "$title" in base64:*) title=$(printf '%s' "${title#base64:}" | base64 -d 2>/dev/null) ;; esac
+	if [ -n "$title" ]; then printf '%s' "$title" > "$STATE/title-$id.txt"; else rm -f "$STATE/title-$id.txt"; fi
+	line=$(grep -i '^subscription-userinfo:' "$hf" 2>/dev/null | tail -n1)
+	[ -n "$line" ] || { rm -f "$STATE/usage-$id.json"; return 0; }
+	up=$(echo  "$line" | sed -n 's/.*upload=\([0-9][0-9]*\).*/\1/p')
+	dn=$(echo  "$line" | sed -n 's/.*download=\([0-9][0-9]*\).*/\1/p')
+	tot=$(echo "$line" | sed -n 's/.*total=\([0-9][0-9]*\).*/\1/p')
+	exp=$(echo "$line" | sed -n 's/.*expire=\([0-9][0-9]*\).*/\1/p')
+	printf '{"upload":%s,"download":%s,"total":%s,"expire":%s,"ts":%s}\n' \
+		"${up:-0}" "${dn:-0}" "${tot:-0}" "${exp:-0}" "$(date +%s)" > "$STATE/usage-$id.json"
 }
 
 sub_ids() { uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=subscription$/\1/p'; }
@@ -81,14 +104,16 @@ case "$1" in
 			prefix=$(uci -q get "xray-monitor.$id.prefix"); [ -n "$prefix" ] || prefix="proxy"
 			ua=$(uci -q get "xray-monitor.$id.user_agent"); [ -n "$ua" ] || ua="$ua_default"
 			nsub=$((nsub + 1))
-			raw="$tmpd/$id.raw"; obs="$tmpd/$id.obs"
-			if fetch_url "$url" "$ua" > "$raw" 2>/dev/null && [ -s "$raw" ] \
-			   && "$SHARE/parse.uc" "$raw" "$STATE/tagmap-$prefix.json" "$STATE/overrides.json" "$prefix" > "$obs" 2>/dev/null && [ -s "$obs" ]; then
-				[ "$first" = 1 ] || printf ',' >> "$staged"
-				printf '{"label":"%s","outbounds":' "$prefix" >> "$staged"
-				cat "$obs" >> "$staged"
-				printf '}' >> "$staged"
-				first=0; nok=$((nok + 1))
+			raw="$tmpd/$id.raw"; obs="$tmpd/$id.obs"; hdrf="$tmpd/$id.hdr"
+			if fetch_url "$url" "$ua" "$hdrf" > "$raw" 2>/dev/null && [ -s "$raw" ]; then
+				store_usage "$id" "$hdrf"
+				if "$SHARE/parse.uc" "$raw" "$STATE/tagmap-$prefix.json" "$STATE/overrides.json" "$prefix" > "$obs" 2>/dev/null && [ -s "$obs" ]; then
+					[ "$first" = 1 ] || printf ',' >> "$staged"
+					printf '{"label":"%s","outbounds":' "$prefix" >> "$staged"
+					cat "$obs" >> "$staged"
+					printf '}' >> "$staged"
+					first=0; nok=$((nok + 1))
+				fi
 			fi
 		done
 		printf ']}' >> "$staged"
@@ -129,7 +154,7 @@ case "$1" in
 
 	status)
 		lf=$(cat "$STATE/last_fetch" 2>/dev/null); st=$(cat "$STATE/status" 2>/dev/null); pending=$(cat "$STATE/pending" 2>/dev/null)
-		"$SHARE/status.uc" "${lf:-0}" "${st:-never}" "${pending:-0}" "$CFG" "$STATE/diff.json"
+		"$SHARE/status.uc" "${lf:-0}" "${st:-never}" "${pending:-0}" "$CFG" "$STATE/diff.json" "$STATE"
 		;;
 
 	sub-add)
@@ -145,7 +170,8 @@ case "$1" in
 		;;
 
 	sub-del)
-		uci -q delete "xray-monitor.$2" && uci commit xray-monitor && echo ok || { echo "delete failed"; exit 1; }
+		uci -q delete "xray-monitor.$2" && uci commit xray-monitor \
+			&& { rm -f "$STATE/usage-$2.json" "$STATE/title-$2.txt"; echo ok; } || { echo "delete failed"; exit 1; }
 		;;
 
 	sub-edit)  # <id> <prefix> <url> <enabled>  (empty = keep)

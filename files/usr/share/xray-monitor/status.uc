@@ -6,7 +6,7 @@
 import { readfile } from 'fs';
 import { cursor } from 'uci';
 
-let lf = ARGV[0], st = ARGV[1], pending = ARGV[2], cfg_path = ARGV[3], diff_path = ARGV[4];
+let lf = ARGV[0], st = ARGV[1], pending = ARGV[2], cfg_path = ARGV[3], diff_path = ARGV[4], state_dir = ARGV[5];
 
 function load(p, dflt) { let s = p ? readfile(p) : null; return s ? json(s) : dflt; }
 function mask(u) { if (!u || !length(u)) return ''; let p = split(u, '/'); return (length(p) >= 3) ? (p[0] + '//' + p[2] + '/****') : '****'; }
@@ -16,12 +16,19 @@ let g = function(o) { return uci.get('xray-monitor', 'sub', o); };
 
 let subs = [];
 uci.foreach('xray-monitor', 'subscription', function(s) {
+	let id = s['.name'];
+	let usage = state_dir ? load(state_dir + '/usage-' + id + '.json', null) : null;
+	if (usage && state_dir) {
+		let t = readfile(state_dir + '/title-' + id + '.txt');
+		if (t) usage.title = trim(t);
+	}
 	push(subs, {
-		id: s['.name'],
+		id: id,
 		prefix: s.prefix ?? 'proxy',
 		url_masked: mask(s.url),
 		has_url: (s.url && length(s.url)) ? true : false,
-		enabled: (s.enabled == '0') ? false : true
+		enabled: (s.enabled == '0') ? false : true,
+		usage: usage
 	});
 });
 

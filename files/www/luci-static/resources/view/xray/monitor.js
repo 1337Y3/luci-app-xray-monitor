@@ -133,7 +133,8 @@ function buildStatusCard() {
 			row(_('Status'), badge),
 			row(_('PID'), s.pid ? String(s.pid) : '–'),
 			row(_('Uptime'), running ? fmtUptime(s.uptime) : '–'),
-			row(_('Version'), s.version || '–')
+			row(_('Xray version'), s.version || '–'),
+			row(_('Add-on version'), s.app_version || '–')
 		])
 	]);
 }
