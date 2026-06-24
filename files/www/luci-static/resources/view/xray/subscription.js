@@ -48,6 +48,15 @@ function fmtExpire(ts) {
 	return { text: date + ' · ' + when + ' ' + _('left'),
 	         color: days <= 3 ? '#cc3300' : (days <= 7 ? '#cc7a00' : '#46a546') };
 }
+function decodeTitle(t) {
+	if (!t) return '';
+	if (t.indexOf('base64:') !== 0) return t;
+	try {
+		return decodeURIComponent(Array.prototype.map.call(atob(t.slice(7)), function(c) {
+			return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+		}).join(''));
+	} catch (e) { return ''; }
+}
 function statusBadge(st) {
 	var m = ({ ok: ['#46a546', _('fetched OK')], applied: ['#46a546', _('applied')],
 		partial: ['#cc7a00', _('partial — some failed')], never: ['#888', _('never fetched')],
@@ -138,7 +147,8 @@ function buildUsage() {
 			: E('span', { 'style': 'color:#888;' }, _('unlimited'));
 		var exp = fmtExpire(u.expire);
 		var pcell = [ E('strong', {}, s.prefix) ];
-		if (u.title) pcell.push(E('div', { 'style': 'color:#888;font-size:90%;' }, u.title));
+		var title = decodeTitle(u.title);
+		if (title) pcell.push(E('div', { 'style': 'color:#888;font-size:90%;' }, title));
 		rows.push(E('tr', { 'class': 'tr' }, [
 			E('td', { 'class': 'td' }, E('div', {}, pcell)),
 			E('td', { 'class': 'td right' }, fmtBytes(used)),

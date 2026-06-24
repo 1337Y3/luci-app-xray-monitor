@@ -16,10 +16,10 @@ let g = function(o) { return uci.get('xray-monitor', 'sub', o); };
 
 let subs = [];
 uci.foreach('xray-monitor', 'subscription', function(s) {
-	let id = s['.name'];
-	let usage = state_dir ? load(state_dir + '/usage-' + id + '.json', null) : null;
+	let id = s['.name'], pfx = s.prefix ?? 'proxy';
+	let usage = state_dir ? load(state_dir + '/usage-' + pfx + '.json', null) : null;
 	if (usage && state_dir) {
-		let t = readfile(state_dir + '/title-' + id + '.txt');
+		let t = readfile(state_dir + '/title-' + pfx + '.txt');
 		if (t) usage.title = trim(t);
 	}
 	push(subs, {

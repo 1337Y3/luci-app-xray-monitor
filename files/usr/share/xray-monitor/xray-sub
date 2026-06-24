@@ -34,22 +34,22 @@ fetch_url() {  # <url> <user-agent> [header-dump-file]
 #   subscription-userinfo: upload=0; download=123; total=456; expire=1735689600
 # (bytes; total=0 = unlimited, expire=0 = never). Writes $STATE/usage-<id>.json,
 # or removes it when the header is absent.
-store_usage() {  # <id> <header-file>
-	local id="$1" hf="$2" line up dn tot exp title
+store_usage() {  # <key> <header-file>   key = subscription prefix (stable in both shell & ucode)
+	local key="$1" hf="$2" line up dn tot exp title
 	[ -f "$hf" ] || return 0
-	# profile-title (plan name) — may be plain text or "base64:" prefixed (unicode/emoji).
-	# Stored as raw text in a separate file so status.uc can JSON-escape it safely.
+	# profile-title (plan name) — plain or "base64:" prefixed. Stored raw (the browser
+	# decodes base64 via atob; BusyBox has no base64 applet); a separate file lets
+	# status.uc JSON-escape it safely.
 	title=$(grep -i '^profile-title:' "$hf" 2>/dev/null | tail -n1 | sed 's/^[^:]*:[[:space:]]*//' | tr -d '\r')
-	case "$title" in base64:*) title=$(printf '%s' "${title#base64:}" | base64 -d 2>/dev/null) ;; esac
-	if [ -n "$title" ]; then printf '%s' "$title" > "$STATE/title-$id.txt"; else rm -f "$STATE/title-$id.txt"; fi
+	if [ -n "$title" ]; then printf '%s' "$title" > "$STATE/title-$key.txt"; else rm -f "$STATE/title-$key.txt"; fi
 	line=$(grep -i '^subscription-userinfo:' "$hf" 2>/dev/null | tail -n1)
-	[ -n "$line" ] || { rm -f "$STATE/usage-$id.json"; return 0; }
+	[ -n "$line" ] || { rm -f "$STATE/usage-$key.json"; return 0; }
 	up=$(echo  "$line" | sed -n 's/.*upload=\([0-9][0-9]*\).*/\1/p')
 	dn=$(echo  "$line" | sed -n 's/.*download=\([0-9][0-9]*\).*/\1/p')
 	tot=$(echo "$line" | sed -n 's/.*total=\([0-9][0-9]*\).*/\1/p')
 	exp=$(echo "$line" | sed -n 's/.*expire=\([0-9][0-9]*\).*/\1/p')
 	printf '{"upload":%s,"download":%s,"total":%s,"expire":%s,"ts":%s}\n' \
-		"${up:-0}" "${dn:-0}" "${tot:-0}" "${exp:-0}" "$(date +%s)" > "$STATE/usage-$id.json"
+		"${up:-0}" "${dn:-0}" "${tot:-0}" "${exp:-0}" "$(date +%s)" > "$STATE/usage-$key.json"
 }
 
 sub_ids() { uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=subscription$/\1/p'; }
@@ -106,7 +106,7 @@ case "$1" in
 			nsub=$((nsub + 1))
 			raw="$tmpd/$id.raw"; obs="$tmpd/$id.obs"; hdrf="$tmpd/$id.hdr"
 			if fetch_url "$url" "$ua" "$hdrf" > "$raw" 2>/dev/null && [ -s "$raw" ]; then
-				store_usage "$id" "$hdrf"
+				store_usage "$prefix" "$hdrf"
 				if "$SHARE/parse.uc" "$raw" "$STATE/tagmap-$prefix.json" "$STATE/overrides.json" "$prefix" > "$obs" 2>/dev/null && [ -s "$obs" ]; then
 					[ "$first" = 1 ] || printf ',' >> "$staged"
 					printf '{"label":"%s","outbounds":' "$prefix" >> "$staged"
@@ -170,8 +170,9 @@ case "$1" in
 		;;
 
 	sub-del)
+		dpfx=$(uci -q get "xray-monitor.$2.prefix")
 		uci -q delete "xray-monitor.$2" && uci commit xray-monitor \
-			&& { rm -f "$STATE/usage-$2.json" "$STATE/title-$2.txt"; echo ok; } || { echo "delete failed"; exit 1; }
+			&& { [ -n "$dpfx" ] && rm -f "$STATE/usage-$dpfx.json" "$STATE/title-$dpfx.txt"; echo ok; } || { echo "delete failed"; exit 1; }
 		;;
 
 	sub-edit)  # <id> <prefix> <url> <enabled>  (empty = keep)
