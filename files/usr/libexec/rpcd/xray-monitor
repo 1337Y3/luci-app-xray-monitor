@@ -109,9 +109,17 @@ is_active() {
 	return 1
 }
 
+# Tags the user has turned off from the active TCP probe ("ping check"), so a
+# blown/blocked endpoint isn't poked (its handshake can trigger an ISP reset).
+# Stored as a UCI list; matched with surrounding spaces so substrings don't hit.
+probe_disabled_list() {
+	printf ' %s ' "$(uci -q get xray-monitor.sub.probe_disabled 2>/dev/null)"
+}
+
 get_outbounds() {
-	local cfg n i tag addr port up ms active tmp f
+	local cfg n i tag addr port up ms active dis dlist tmp f
 	cfg=$(config_file)
+	dlist=$(probe_disabled_list)
 	n=$(jsonfilter -i "$cfg" -e '@.outbounds[*].tag' 2>/dev/null | wc -l)
 	tmp=$(mktemp -d)
 	i=0
@@ -121,11 +129,18 @@ get_outbounds() {
 		port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.vnext[0].port" 2>/dev/null)
 		[ -n "$addr" ] || addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].address" 2>/dev/null)
 		[ -n "$port" ] || port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].port" 2>/dev/null)
+		case "$dlist" in *" $tag "*) dis=1 ;; *) dis=0 ;; esac
 		if [ -n "$addr" ] && [ -n "$port" ]; then
 			(
-				set -- $(probe "$addr" "$port"); up="$1"; ms="$2"
+				if [ "$dis" = 1 ]; then
+					up=-2; ms=0   # -2 = probe disabled by user
+				else
+					set -- $(probe "$addr" "$port"); up="$1"; ms="$2"
+				fi
+				# is_active only reads /proc/net/nf_conntrack (passive), so it's
+				# safe to keep even for a disabled endpoint — no packet is sent.
 				active=0; is_active "$addr" "$port" && active=1
-				printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$addr" "$port" "$up" "$ms" "$active" \
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$tag" "$addr" "$port" "$up" "$ms" "$active" "$dis" \
 					> "$tmp/$(printf '%03d' "$i")"
 			) &
 		fi
@@ -137,7 +152,7 @@ get_outbounds() {
 	json_add_array "outbounds"
 	for f in "$tmp"/*; do
 		[ -f "$f" ] || continue
-		IFS='	' read -r tag addr port up ms active < "$f"
+		IFS='	' read -r tag addr port up ms active dis < "$f"
 		json_add_object
 		json_add_string tag "$tag"
 		json_add_string addr "$addr"
@@ -145,11 +160,33 @@ get_outbounds() {
 		json_add_int up "$up"
 		json_add_int ms "$ms"
 		json_add_boolean active "$active"
+		json_add_boolean disabled "$dis"
 		json_close_object
 	done
 	json_close_array
 	json_dump
 	rm -rf "$tmp"
+}
+
+# Turn the active probe on/off for one outbound tag. Idempotent + dedupes.
+do_probe_set() {
+	local input tag dis cur t
+	input=$(cat)
+	tag=$(echo "$input" | jsonfilter -e '@.tag' 2>/dev/null)
+	dis=$(echo "$input" | jsonfilter -e '@.disabled' 2>/dev/null)
+	if [ -z "$tag" ]; then
+		json_init; json_add_boolean ok 0; json_add_string msg "missing tag"; json_dump; return
+	fi
+	uci -q get xray-monitor.sub >/dev/null 2>&1 || uci set xray-monitor.sub=xray-monitor
+	cur=$(uci -q get xray-monitor.sub.probe_disabled 2>/dev/null)
+	uci -q delete xray-monitor.sub.probe_disabled 2>/dev/null
+	for t in $cur; do
+		[ "$t" = "$tag" ] && continue
+		uci add_list xray-monitor.sub.probe_disabled="$t"
+	done
+	[ "$dis" = 1 ] && uci add_list xray-monitor.sub.probe_disabled="$tag"
+	uci commit xray-monitor
+	json_init; json_add_boolean ok 1; json_dump
 }
 
 # Reset all traffic counters to zero (reads+resets via the Stats API)
@@ -191,6 +228,7 @@ case "$1" in
 		json_add_object "status";     json_close_object
 		json_add_object "stats";      json_close_object
 		json_add_object "outbounds";  json_close_object
+		json_add_object "probe_set"; json_add_string "tag" ""; json_add_string "disabled" ""; json_close_object
 		json_add_object "reset";      json_close_object
 		json_add_object "sub_get";    json_close_object
 		json_add_object "sub_fetch";  json_close_object
@@ -223,6 +261,7 @@ case "$1" in
 			status)    get_status ;;
 			stats)     get_stats ;;
 			outbounds) get_outbounds ;;
+			probe_set) do_probe_set ;;
 			reset)     do_reset ;;
 			validate)  do_validate ;;
 			config_get)

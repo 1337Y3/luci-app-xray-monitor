@@ -7,6 +7,7 @@
 var callStatus    = rpc.declare({ object: 'xray-monitor', method: 'status' });
 var callStats     = rpc.declare({ object: 'xray-monitor', method: 'stats' });
 var callOutbounds = rpc.declare({ object: 'xray-monitor', method: 'outbounds' });
+var callProbeSet  = rpc.declare({ object: 'xray-monitor', method: 'probe_set', params: [ 'tag', 'disabled' ] });
 var callReset     = rpc.declare({ object: 'xray-monitor', method: 'reset' });
 var callEnableApi = rpc.declare({ object: 'xray-monitor', method: 'enable_api' });
 var callValidate  = rpc.declare({ object: 'xray-monitor', method: 'validate' });
@@ -68,11 +69,12 @@ function statusCell(tag) {
 	var h = state.health[tag];
 	if (!h) return E('span', { 'style': 'color:#888' }, '–');
 	var color, label;
-	if (h.up === 1)      { color = '#46a546'; label = 'connected' + (h.ms > 0 ? ' · ' + h.ms + ' ms' : ''); }
+	if (h.disabled)      { color = '#888';    label = 'ping off'; }
+	else if (h.up === 1) { color = '#46a546'; label = 'connected' + (h.ms > 0 ? ' · ' + h.ms + ' ms' : ''); }
 	else if (h.up === 0) { color = '#cc3300'; label = 'down'; }
 	else                 { color = '#888';    label = 'unknown'; }
 	var els = [
-		E('span', { 'style': 'color:' + color + ';font-weight:bold;' }, '● '),
+		E('span', { 'style': 'color:' + color + ';font-weight:bold;' }, h.disabled ? '○ ' : '● '),
 		E('span', {}, label)
 	];
 	if (h.active)
@@ -80,9 +82,42 @@ function statusCell(tag) {
 	return E('span', {}, els);
 }
 
+/* Per-outbound toggle for the active TCP probe. Off = the endpoint is never
+   dialled (use for a "blown" exit whose handshake draws an ISP reset). */
+function pingToggle(tag) {
+	var h = state.health[tag];
+	if (!h) return E('span', { 'style': 'color:#888' }, '–');  /* no probeable endpoint (e.g. direct) */
+	var enabled = !h.disabled;
+	var cb = E('input', { 'type': 'checkbox' });
+	cb.checked = enabled;
+	cb.addEventListener('change', function() {
+		var wantDisabled = cb.checked ? '0' : '1';
+		cb.disabled = true;
+		callProbeSet(tag, wantDisabled).then(function(res) {
+			if (!res || !res.ok) throw new Error((res && res.msg) || 'failed');
+			if (state.health[tag]) state.health[tag].disabled = (wantDisabled === '1');
+			return refreshHealth();
+		}).then(function() {
+			cb.disabled = false;
+		}, function() {
+			cb.disabled = false;
+			cb.checked = enabled;  /* revert on failure */
+			ui.addNotification(null, E('p', _('Could not change ping check for ') + tag + '.'), 'error');
+		});
+	});
+	return E('label', { 'style': 'display:flex;align-items:center;gap:6px;cursor:pointer;' }, [
+		cb, E('span', { 'style': 'font-size:90%;color:#666;' }, enabled ? _('on') : _('off'))
+	]);
+}
+
 function buildTable(title, kind, withStatus) {
 	var group = state.parsed.data[kind] || {};
-	var names = Object.keys(group).sort();
+	var names = Object.keys(group);
+	/* Outbounds: also list probed exits with no traffic counters yet, so every
+	   configured exit (incl. a disabled-from-ping one) still gets a toggle. */
+	if (kind === 'outbound')
+		Object.keys(state.health).forEach(function(t) { if (names.indexOf(t) < 0) names.push(t); });
+	names.sort();
 
 	var head = [
 		E('th', { 'class': 'th' }, _('Tag')),
@@ -91,23 +126,30 @@ function buildTable(title, kind, withStatus) {
 		E('th', { 'class': 'th right' }, '↑ ' + _('rate')),
 		E('th', { 'class': 'th right' }, '↓ ' + _('rate'))
 	];
-	if (withStatus) head.push(E('th', { 'class': 'th' }, _('Status')));
+	if (withStatus) {
+		head.push(E('th', { 'class': 'th' }, _('Status')));
+		head.push(E('th', { 'class': 'th' }, _('Ping check')));
+	}
 	var rows = [ E('tr', { 'class': 'tr table-titles' }, head) ];
 
 	if (!names.length)
 		rows.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': withStatus ? 6 : 5 }, E('em', {}, _('No data')))
+			E('td', { 'class': 'td', 'colspan': withStatus ? 7 : 5 }, E('em', {}, _('No data')))
 		]));
 
 	names.forEach(function(name) {
+		var g = group[name] || { up: 0, down: 0 };
 		var cells = [
 			E('td', { 'class': 'td' }, E('strong', {}, name)),
-			E('td', { 'class': 'td right' }, fmtBytes(group[name].up)),
-			E('td', { 'class': 'td right' }, fmtBytes(group[name].down)),
+			E('td', { 'class': 'td right' }, fmtBytes(g.up)),
+			E('td', { 'class': 'td right' }, fmtBytes(g.down)),
 			E('td', { 'class': 'td right' }, fmtRate(kind, name, 'uplink')),
 			E('td', { 'class': 'td right' }, fmtRate(kind, name, 'downlink'))
 		];
-		if (withStatus) cells.push(E('td', { 'class': 'td' }, statusCell(name)));
+		if (withStatus) {
+			cells.push(E('td', { 'class': 'td' }, statusCell(name)));
+			cells.push(E('td', { 'class': 'td' }, pingToggle(name)));
+		}
 		rows.push(E('tr', { 'class': 'tr' }, cells));
 	});
 
@@ -212,7 +254,8 @@ function redraw() {
 		buildTable(_('Outbounds (VPS exits)'), 'outbound', true),
 		buildTable(_('Inbounds (tproxy)'), 'inbound', false),
 		E('div', { 'style': 'margin-top:1em;color:#888;font-size:90%;' },
-			_('Traffic auto-refreshes every 5s; connectivity every 30s. Counters are cumulative since the last xray restart.'))
+			_('Traffic auto-refreshes every 5s; connectivity every 30s. Counters are cumulative since the last xray restart. ' +
+			  'Turn off an exit\'s Ping check to stop dialling it — useful for a blown server whose handshake draws an ISP reset.'))
 	];
 	while (root.firstChild) root.removeChild(root.firstChild);
 	content.forEach(function(n) { if (n) root.appendChild(n); });

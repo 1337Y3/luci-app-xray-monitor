@@ -7,6 +7,12 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 - Service status: running/stopped, PID, uptime, version
 - Per-**outbound** (VPS exits) upload/download totals + live ↑/↓ rates +
   a **connectivity status** column (reachable + latency / down / live)
+- A per-outbound **Ping check** toggle: turn off the active TCP probe for an
+  exit so it's never dialled. Use it for a "blown"/blocked server whose
+  handshake draws a connection reset from your ISP — flip it off to stop poking
+  that IP until your next config update. The status shows `○ ping off`; the
+  passive live-connection check still runs (it only reads conntrack). The
+  disabled set persists in UCI (`xray-monitor.sub.probe_disabled`).
 - Per-**inbound** (tproxy) upload/download totals + live ↑/↓ rates
 - A **Reset counters** button (zeroes xray's cumulative totals via the Stats API)
 - A **Validate config** button (runs `xray -test` and shows the result)
