@@ -189,6 +189,36 @@ do_probe_set() {
 	json_init; json_add_boolean ok 1; json_dump
 }
 
+# Cheap metadata for the UI's first paint and for toggling without probing:
+# every probeable outbound tag + whether it's disabled. No network probe, so it
+# returns instantly (the slow per-exit connectivity comes from `outbounds`).
+get_outmeta() {
+	local cfg n i tag addr port dis dlist
+	cfg=$(config_file)
+	dlist=$(probe_disabled_list)
+	n=$(jsonfilter -i "$cfg" -e '@.outbounds[*].tag' 2>/dev/null | wc -l)
+	json_init
+	json_add_array "outbounds"
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		tag=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].tag" 2>/dev/null)
+		addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.vnext[0].address" 2>/dev/null)
+		port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.vnext[0].port" 2>/dev/null)
+		[ -n "$addr" ] || addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].address" 2>/dev/null)
+		[ -n "$port" ] || port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].port" 2>/dev/null)
+		if [ -n "$addr" ] && [ -n "$port" ]; then
+			case "$dlist" in *" $tag "*) dis=1 ;; *) dis=0 ;; esac
+			json_add_object
+			json_add_string tag "$tag"
+			json_add_boolean disabled "$dis"
+			json_close_object
+		fi
+		i=$((i + 1))
+	done
+	json_close_array
+	json_dump
+}
+
 # Reset all traffic counters to zero (reads+resets via the Stats API)
 do_reset() {
 	local rc
@@ -228,6 +258,7 @@ case "$1" in
 		json_add_object "status";     json_close_object
 		json_add_object "stats";      json_close_object
 		json_add_object "outbounds";  json_close_object
+		json_add_object "out_meta";   json_close_object
 		json_add_object "probe_set"; json_add_string "tag" ""; json_add_string "disabled" ""; json_close_object
 		json_add_object "reset";      json_close_object
 		json_add_object "sub_get";    json_close_object
@@ -261,6 +292,7 @@ case "$1" in
 			status)    get_status ;;
 			stats)     get_stats ;;
 			outbounds) get_outbounds ;;
+			out_meta)  get_outmeta ;;
 			probe_set) do_probe_set ;;
 			reset)     do_reset ;;
 			validate)  do_validate ;;

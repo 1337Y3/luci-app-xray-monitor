@@ -7,6 +7,7 @@
 var callStatus    = rpc.declare({ object: 'xray-monitor', method: 'status' });
 var callStats     = rpc.declare({ object: 'xray-monitor', method: 'stats' });
 var callOutbounds = rpc.declare({ object: 'xray-monitor', method: 'outbounds' });
+var callOutMeta   = rpc.declare({ object: 'xray-monitor', method: 'out_meta' });
 var callProbeSet  = rpc.declare({ object: 'xray-monitor', method: 'probe_set', params: [ 'tag', 'disabled' ] });
 var callReset     = rpc.declare({ object: 'xray-monitor', method: 'reset' });
 var callEnableApi = rpc.declare({ object: 'xray-monitor', method: 'enable_api' });
@@ -96,7 +97,7 @@ function pingToggle(tag) {
 		callProbeSet(tag, wantDisabled).then(function(res) {
 			if (!res || !res.ok) throw new Error((res && res.msg) || 'failed');
 			if (state.health[tag]) state.health[tag].disabled = (wantDisabled === '1');
-			return refreshHealth();
+			return refreshMeta();   /* confirm cheaply; never triggers a probe */
 		}).then(function() {
 			cb.disabled = false;
 		}, function() {
@@ -254,7 +255,8 @@ function redraw() {
 		buildTable(_('Outbounds (VPS exits)'), 'outbound', true),
 		buildTable(_('Inbounds (tproxy)'), 'inbound', false),
 		E('div', { 'style': 'margin-top:1em;color:#888;font-size:90%;' },
-			_('Traffic auto-refreshes every 5s; connectivity every 30s. Counters are cumulative since the last xray restart. ' +
+			_('Traffic auto-refreshes every 5s; connectivity every 30s while “Auto-refresh ping” is on. ' +
+			  'Counters are cumulative since the last xray restart. ' +
 			  'Turn off an exit\'s Ping check to stop dialling it — useful for a blown server whose handshake draws an ISP reset.'))
 	];
 	while (root.firstChild) root.removeChild(root.firstChild);
@@ -290,17 +292,50 @@ function refreshHealth() {
 	});
 }
 
+/* Cheap, probe-free refresh: every exit's tag + disabled flag. Used on first
+   paint (so toggles + 'ping off' show instantly) and after a toggle, so the
+   Ping check control never has to wait on — or trigger — an active probe. */
+function refreshMeta() {
+	return callOutMeta().then(function(r) {
+		((r && r.outbounds) || []).forEach(function(o) {
+			var h = state.health[o.tag] || (state.health[o.tag] = { tag: o.tag });
+			h.disabled = !!o.disabled;   /* leave up/ms/active untouched (unknown until probed) */
+		});
+		redraw();
+	});
+}
+
+/* Auto-refresh of the active connectivity probe (per-browser, like the confdir
+   dismissal). Off = the page never probes on its own — handy while a suspect
+   "blown" exit is under investigation; one-shot checks stay available. */
+var PING_AUTO_KEY = 'luci-app-xray-monitor.ping-autorefresh';
+var healthPolling = false;
+function pingAutoEnabled() {
+	try { return localStorage.getItem(PING_AUTO_KEY) !== '0'; } catch (e) { return true; }
+}
+function startHealthPoll() {
+	if (healthPolling) return;
+	poll.add(refreshHealth, 30);
+	healthPolling = true;
+}
+function stopHealthPoll() {
+	if (!healthPolling) return;
+	poll.remove(refreshHealth);
+	healthPolling = false;
+}
+
 return view.extend({
 	load: function() {
-		return refreshStats().catch(function() {});
+		// refreshMeta is probe-free, so toggles + disabled state are ready on first paint
+		return Promise.all([ refreshStats(), refreshMeta() ]).catch(function() {});
 	},
 
 	render: function() {
 		root = E('div', { 'class': 'cbi-section' });
 		redraw();
 		poll.add(refreshStats, 5);
-		poll.add(refreshHealth, 30);
-		refreshHealth();   // populate connectivity async; never blocks first paint
+		// Connectivity probing only runs when auto-refresh is on (off = don't poke exits)
+		if (pingAutoEnabled()) { startHealthPoll(); refreshHealth(); }
 
 		var resetBtn = E('button', {
 			'class': 'cbi-button cbi-button-negative',
@@ -349,7 +384,27 @@ return view.extend({
 			}, function() { updBtn.disabled = false; ui.addNotification(null, E('p', _('Update check failed.')), 'error'); });
 		});
 
-		var bar = E('div', { 'style': 'margin:.5em 0;display:flex;gap:8px;flex-wrap:wrap;' }, [ updBtn, validateBtn, resetBtn ]);
+		var pingNowBtn = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Refresh ping now'));
+		pingNowBtn.addEventListener('click', function() {
+			pingNowBtn.disabled = true;
+			refreshHealth().then(function() { pingNowBtn.disabled = false; },
+			                     function() { pingNowBtn.disabled = false; });
+		});
+
+		var autoCb = E('input', { 'type': 'checkbox' });
+		autoCb.checked = pingAutoEnabled();
+		autoCb.addEventListener('change', function() {
+			try { localStorage.setItem(PING_AUTO_KEY, autoCb.checked ? '1' : '0'); } catch (e) {}
+			if (autoCb.checked) { startHealthPoll(); refreshHealth(); }
+			else                { stopHealthPoll(); }
+		});
+		var autoToggle = E('label', {
+			'style': 'display:flex;align-items:center;gap:6px;cursor:pointer;margin-left:auto;',
+			'title': _('When off, the page never probes exits on its own — use “Refresh ping now” for a one-shot check.')
+		}, [ autoCb, E('span', {}, _('Auto-refresh ping (30s)')) ]);
+
+		var bar = E('div', { 'style': 'margin:.5em 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center;' },
+			[ updBtn, validateBtn, resetBtn, pingNowBtn, autoToggle ]);
 		return E('div', {}, [ E('h2', {}, _('Xray Monitor')), bar, root ]);
 	},
 

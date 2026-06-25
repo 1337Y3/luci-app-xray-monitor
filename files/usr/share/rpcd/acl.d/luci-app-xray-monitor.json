@@ -3,7 +3,7 @@
 		"description": "Grant access to Xray monitor status and stats",
 		"read": {
 			"ubus": {
-				"xray-monitor": [ "status", "stats", "outbounds", "sub_get", "routing_get", "balancers_get", "validate", "config_get", "config_test", "update_check" ]
+				"xray-monitor": [ "status", "stats", "outbounds", "out_meta", "sub_get", "routing_get", "balancers_get", "validate", "config_get", "config_test", "update_check" ]
 			}
 		},
 		"write": {

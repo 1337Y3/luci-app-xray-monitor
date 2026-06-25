@@ -12,14 +12,20 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
   handshake draws a connection reset from your ISP — flip it off to stop poking
   that IP until your next config update. The status shows `○ ping off`; the
   passive live-connection check still runs (it only reads conntrack). The
-  disabled set persists in UCI (`xray-monitor.sub.probe_disabled`).
+  disabled set persists in UCI (`xray-monitor.sub.probe_disabled`). The toggles
+  render on first paint (a probe-free `out_meta` call), so you can flip one
+  before connectivity finishes loading.
+- An **Auto-refresh ping** switch + **Refresh ping now** button: turn off
+  auto-refresh and the page never probes exits on its own (one-shot checks stay
+  on the button) — useful while investigating a suspect exit. Preference is
+  per-browser (localStorage).
 - Per-**inbound** (tproxy) upload/download totals + live ↑/↓ rates
 - A **Reset counters** button (zeroes xray's cumulative totals via the Stats API)
 - A **Validate config** button (runs `xray -test` and shows the result)
 - A **Check for updates** button (compares the installed version to the feed and
   can download + install the latest `.ipk` in place)
 - An **Enable Stats API** banner/button if the API isn't detected
-- Traffic refreshes every 5 s, connectivity every 30 s
+- Traffic refreshes every 5 s; connectivity every 30 s while Auto-refresh ping is on
 
 **Graphs**
 - Rolling per-outbound throughput charts (down/up), ~10 min window, 5 s
