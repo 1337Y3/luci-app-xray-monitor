@@ -61,7 +61,8 @@ let lists = [];
 ctx.foreach('xray-monitor', 'list', function(s) {
 	push(lists, {
 		name: s.name ?? '', exit: s.exit ?? 'direct', dns: s.dns ?? '',
-		enabled: (s.enabled ?? '1') == '1', order: int(s.order ?? 100)
+		enabled: (s.enabled ?? '1') == '1', order: int(s.order ?? 100),
+		_sid: s['.name']
 	});
 });
 sort(lists, by_order);
@@ -252,10 +253,14 @@ let known = exit_map();
 
 // Dangling exits (e.g. a subscription refresh dropped the tag) degrade to the
 // registry exit — degraded-but-proxied beats silently-direct on this network.
-function resolve_exit(tag, what) {
+let remaps = [];
+function resolve_exit(tag, what, persist) {
 	if (known[tag]) return tag;
 	let fb = known[globals.registry_exit] ? globals.registry_exit : 'direct';
 	push(warnings, sprintf("%s: exit '%s' missing — using '%s'", what, tag, fb));
+	// caller may ask to persist the fallback to UCI (xray-rules apply commits it)
+	if (persist && persist.section)
+		push(remaps, { section: persist.section, option: persist.option, from: tag, to: fb });
 	return fb;
 }
 
@@ -316,7 +321,7 @@ for (let l in lists) {
 	if (!l.enabled) continue;
 	let e = entries[l.name];
 	scan_geo(e.domains, e.ips);
-	let ex = resolve_exit(l.exit, "list '" + l.name + "'");
+	let ex = resolve_exit(l.exit, "list '" + l.name + "'", { section: l._sid, option: 'exit' });
 	if (length(e.domains))
 		push(managed, mk_rule('xm:list:' + l.name + ':domain', ex, { domain: e.domains }));
 	if (length(e.ips))
@@ -363,7 +368,7 @@ for (let r in managed) push(kept, r);
 cfg.routing.rules = kept;
 
 writefile(out_path, sprintf('%.2J', cfg));
-printf('%J\n', { ok: true, warnings: warnings });
+printf('%J\n', { ok: true, warnings: warnings, remaps: remaps });
 
 }
 else {

@@ -12,7 +12,7 @@ DNSFILE="$STATE/dnsmasq.servers"
 gen_apply() {
 	rules_managed || { echo "managed routing is off (xray-monitor.rules.managed=0)"; return 1; }
 	lock_acquire
-	local api_before=0 bak out rc warn
+	local api_before=0 bak out rc warn sec opt to frm i
 	api_up && api_before=1
 	bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 	out=$("$SHARE/genrules.uc" set "$CFG" "$CFG.new" 2>&1); rc=$?
@@ -28,6 +28,22 @@ gen_apply() {
 		prune_backups
 		[ -x "$SHARE/xray-fw" ] && "$SHARE/xray-fw" sync >/dev/null 2>&1
 		"$0" dns-sync >/dev/null 2>&1
+		# persist exit remaps: genrules fell a list back to the default balancer/
+		# direct because its exit tag is not in config.json — rewrite UCI so the
+		# stored list matches what's actually routed (Lists page stops flagging
+		# "(missing!)"). config.json already carries the fallback.
+		i=0
+		while :; do
+			sec=$(echo "$out" | jsonfilter -e "@.remaps[$i].section" 2>/dev/null)
+			[ -n "$sec" ] || break
+			opt=$(echo "$out" | jsonfilter -e "@.remaps[$i].option" 2>/dev/null)
+			to=$(echo "$out"  | jsonfilter -e "@.remaps[$i].to"     2>/dev/null)
+			frm=$(echo "$out" | jsonfilter -e "@.remaps[$i].from"   2>/dev/null)
+			[ -n "$opt" ] && [ -n "$to" ] && uci set "xray-monitor.$sec.$opt=$to" \
+				&& echo "remapped list exit: ${frm:-?} -> $to (exit was missing from config)"
+			i=$((i + 1))
+		done
+		[ "$i" -gt 0 ] && uci commit xray-monitor
 		warn=$(echo "$out" | jsonfilter -e '@.warnings[*]' 2>/dev/null | sed 's/^/warning: /')
 		[ -n "$warn" ] && echo "$warn"
 		echo ok
