@@ -67,12 +67,22 @@ if (action == 'lists') {
 		ctx.set(XM, sid, 'dns', s(l.dns));
 		ctx.set(XM, sid, 'enabled', b(l.enabled));
 		ctx.set(XM, sid, 'order', s(int(l.order ?? 100)));
+		let dst = LISTDIR + '/' + l.name + '.lst';
+		let orig = s(l.orig);
+		// preserve entries across a rename when the UI didn't resend them
+		if (l.entries == null && length(orig) && orig != l.name) {
+			let src = LISTDIR + '/' + orig + '.lst';
+			if (stat(src) != null && stat(dst) == null) {
+				writefile(dst, readfile(src) ?? '');
+				unlink(src);
+			}
+		}
 		if (l.entries != null) {
 			let text = replace('' + l.entries, "\r\n", "\n");
 			if (length(text) && substr(text, -1) != "\n") text += "\n";
-			writefile(LISTDIR + '/' + l.name + '.lst', text);
-		} else if (stat(LISTDIR + '/' + l.name + '.lst') == null) {
-			writefile(LISTDIR + '/' + l.name + '.lst', '');
+			writefile(dst, text);
+		} else if (stat(dst) == null) {
+			writefile(dst, '');
 		}
 	}
 	// drop entry files of deleted lists

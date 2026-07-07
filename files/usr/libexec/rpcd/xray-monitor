@@ -230,6 +230,10 @@ do_reset() {
 }
 
 SUB=/usr/share/xray-monitor/xray-sub
+RULES=/usr/share/xray-monitor/xray-rules
+FW=/usr/share/xray-monitor/xray-fw
+GEODAT=/usr/share/xray-monitor/xray-geodat
+STATE=/etc/xray-monitor
 
 run_ok() {  # run a command, emit {"ok":bool}
 	"$@" >/dev/null 2>&1
@@ -274,8 +278,27 @@ case "$1" in
 			json_add_string "id" ""; json_add_string "prefix" ""
 			json_add_string "url" ""; json_add_string "enabled" ""
 		json_close_object
-		json_add_object "routing_get"; json_close_object
-		json_add_object "routing_set"; json_add_array "inbounds"; json_close_array; json_close_object
+		json_add_object "rules_get"; json_close_object
+		json_add_object "list_entries"; json_add_string "name" ""; json_close_object
+		json_add_object "lists_set"; json_add_array "lists"; json_close_array; json_close_object
+		json_add_object "devices_set"; json_add_array "devices"; json_close_array; json_close_object
+		json_add_object "georules_set"; json_add_array "rules"; json_close_array; json_close_object
+		json_add_object "routing_set"
+			json_add_string "default_exit" ""; json_add_string "registry_enabled" ""
+			json_add_string "registry_exit" ""; json_add_string "registry_geosite" ""
+			json_add_string "registry_geoip" ""; json_add_string "tproxy_port" ""
+		json_close_object
+		json_add_object "rules_apply"; json_close_object
+		json_add_object "fw_get"; json_close_object
+		json_add_object "fw_set"; json_add_string "enabled" ""; json_close_object
+		json_add_object "dhcp_leases"; json_close_object
+		json_add_object "geodat_get"; json_close_object
+		json_add_object "geodat_update"; json_close_object
+		json_add_object "geodat_setcfg"
+			json_add_string "enabled" ""; json_add_string "cron" ""
+			json_add_string "cron_schedule" ""; json_add_string "source_url" ""
+		json_close_object
+		json_add_object "geodat_rollback"; json_close_object
 		json_add_object "balancers_get"; json_close_object
 		json_add_object "balancers_set"; json_add_array "balancers"; json_close_array; json_close_object
 		json_add_object "enable_api"; json_close_object
@@ -360,13 +383,111 @@ case "$1" in
 				msg=$("$SUB" sub-edit "$id" "$p" "$u" "$en" 2>&1); rc=$?
 				json_init; json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"; json_add_string msg "$msg"; json_dump
 			;;
-			routing_get) "$SUB" routing-get ;;
+			rules_get) "$RULES" get ;;
+			list_entries)
+				input=$(cat)
+				name=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				json_init
+				if echo "$name" | grep -qE '^[A-Za-z0-9_-]{1,32}$'; then
+					json_add_string name "$name"
+					json_add_string entries "$(cat "$STATE/lists/$name.lst" 2>/dev/null)"
+				else
+					json_add_string name ""
+					json_add_string entries ""
+				fi
+				json_dump
+			;;
+			lists_set|devices_set|georules_set)
+				case "$2" in
+					lists_set)    key='@.lists';   cmd=lists-set ;;
+					devices_set)  key='@.devices'; cmd=devices-set ;;
+					georules_set) key='@.rules';   cmd=georules-set ;;
+				esac
+				input=$(cat)
+				f=$(mktemp)
+				echo "$input" | jsonfilter -e "$key" > "$f" 2>/dev/null
+				msg=$("$RULES" "$cmd" "$f" 2>&1); rc=$?
+				rm -f "$f"
+				json_init
+				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+				json_add_string msg "$msg"
+				json_dump
+			;;
 			routing_set)
 				input=$(cat)
 				f=$(mktemp)
-				echo "$input" | jsonfilter -e '@.inbounds' > "$f" 2>/dev/null
-				msg=$("$SUB" routing-set "$f" 2>&1); rc=$?
+				json_init
+				v=$(echo "$input" | jsonfilter -e '@.default_exit' 2>/dev/null);     [ -n "$v" ] && json_add_string default_exit "$v"
+				v=$(echo "$input" | jsonfilter -e '@.registry_enabled' 2>/dev/null); [ -n "$v" ] && json_add_string registry_enabled "$v"
+				v=$(echo "$input" | jsonfilter -e '@.registry_exit' 2>/dev/null);    [ -n "$v" ] && json_add_string registry_exit "$v"
+				v=$(echo "$input" | jsonfilter -e '@.registry_geosite' 2>/dev/null); [ -n "$v" ] && json_add_string registry_geosite "$v"
+				v=$(echo "$input" | jsonfilter -e '@.registry_geoip' 2>/dev/null);   [ -n "$v" ] && json_add_string registry_geoip "$v"
+				v=$(echo "$input" | jsonfilter -e '@.tproxy_port' 2>/dev/null);      [ -n "$v" ] && json_add_string tproxy_port "$v"
+				json_dump > "$f"
+				msg=$("$RULES" globals-set "$f" 2>&1); rc=$?
 				rm -f "$f"
+				json_init
+				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+				json_add_string msg "$msg"
+				json_dump
+			;;
+			rules_apply)
+				msg=$("$RULES" apply 2>&1); rc=$?
+				json_init
+				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+				json_add_string msg "$msg"
+				json_dump
+			;;
+			fw_get) "$FW" status ;;
+			fw_set)
+				input=$(cat)
+				en=$(echo "$input" | jsonfilter -e '@.enabled' 2>/dev/null)
+				case "$en" in
+					1|true)  msg=$("$FW" on 2>&1);  rc=$? ;;
+					0|false) msg=$("$FW" off 2>&1); rc=$? ;;
+					*) msg="invalid enabled value"; rc=1 ;;
+				esac
+				json_init
+				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+				json_add_string msg "$msg"
+				json_dump
+			;;
+			dhcp_leases)
+				json_init
+				json_add_array leases
+				if [ -f /tmp/dhcp.leases ]; then
+					while read -r exp mac ip host rest; do
+						[ -n "$ip" ] || continue
+						json_add_object
+						json_add_string ip "$ip"
+						json_add_string mac "$mac"
+						json_add_string host "${host:--}"
+						json_close_object
+					done < /tmp/dhcp.leases
+				fi
+				json_close_array
+				json_dump
+			;;
+			geodat_get) "$GEODAT" status ;;
+			geodat_update)
+				# detached like update_apply: the download can take minutes
+				setsid sh -c '/usr/share/xray-monitor/xray-geodat update > /tmp/xray-geodat.log 2>&1' >/dev/null 2>&1 &
+				json_init
+				json_add_boolean ok 1
+				json_add_string msg "Update started; watch the status card."
+				json_dump
+			;;
+			geodat_setcfg)
+				input=$(cat)
+				en=$(echo "$input"  | jsonfilter -e '@.enabled' 2>/dev/null)
+				c=$(echo "$input"   | jsonfilter -e '@.cron' 2>/dev/null)
+				s=$(echo "$input"   | jsonfilter -e '@.cron_schedule' 2>/dev/null)
+				u=$(echo "$input"   | jsonfilter -e '@.source_url' 2>/dev/null)
+				msg=$("$GEODAT" set-cfg "$en" "$c" "$s" "$u" 2>&1); rc=$?
+				json_init; json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"; json_add_string msg "$msg"; json_dump
+			;;
+			geodat_rollback)
+				msg=$("$GEODAT" rollback 2>&1); rc=$?
 				json_init
 				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
 				json_add_string msg "$msg"

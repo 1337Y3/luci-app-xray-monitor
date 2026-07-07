@@ -14,6 +14,7 @@ var callEnableApi = rpc.declare({ object: 'xray-monitor', method: 'enable_api' }
 var callValidate  = rpc.declare({ object: 'xray-monitor', method: 'validate' });
 var callUpdChk    = rpc.declare({ object: 'xray-monitor', method: 'update_check' });
 var callUpdApply  = rpc.declare({ object: 'xray-monitor', method: 'update_apply' });
+var callRules     = rpc.declare({ object: 'xray-monitor', method: 'rules_get' });
 
 var prev = null;  /* { ts, flat } for rate calculation */
 var root = null;  /* container element to redraw into */
@@ -405,7 +406,21 @@ return view.extend({
 
 		var bar = E('div', { 'style': 'margin:.5em 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center;' },
 			[ updBtn, validateBtn, resetBtn, pingNowBtn, autoToggle ]);
-		return E('div', {}, [ E('h2', {}, _('Xray Monitor')), bar, root ]);
+
+		// Managed-routing health: surface generator warnings (e.g. a list exit
+		// tag vanished after a subscription refresh and was remapped) so a
+		// degraded-but-working state is visible without opening the Routing page.
+		var routeWarn = E('div', {});
+		callRules().then(function(r) {
+			var w = (r && r.warnings) || [];
+			if (!w.length) return;
+			routeWarn.appendChild(E('div', { 'class': 'alert-message warning' }, [
+				E('strong', {}, _('Routing warnings — see the Routing page:')),
+				E('ul', { 'style': 'margin:.3em 0 0' }, w.map(function(m) { return E('li', {}, m); }))
+			]));
+		}).catch(function() {});
+
+		return E('div', {}, [ E('h2', {}, _('Xray Monitor')), routeWarn, bar, root ]);
 	},
 
 	handleSaveApply: null,
