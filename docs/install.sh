@@ -50,6 +50,10 @@ if ! { fetch_file "$REL" "$tmp" && tar -tzf "$tmp" >/dev/null 2>&1; }; then
 fi
 
 echo "Installing (deps come from your normal feeds) ..."
-opkg install --force-reinstall "$tmp"
+# Plain `opkg install` upgrades in place and runs the OLD package's prerm with
+# "upgrade" (which skips the removal-only cleanup). Do NOT use --force-reinstall:
+# it removes-then-installs, invoking prerm with "remove", which wipes
+# /etc/xray-monitor (the user's lists). Same version already installed = no-op.
+opkg install "$tmp"
 rm -f "$tmp"
 echo "Done — open LuCI: Services -> Xray Monitor."

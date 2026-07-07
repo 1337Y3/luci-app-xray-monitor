@@ -228,7 +228,9 @@ case "$1" in
 			curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { rm -f "$tmp"; echo "download failed"; exit 1; }
 			tar -tzf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "downloaded file is not a valid package (feed may be updating)"; exit 1; }
 		fi
-		opkg install --force-reinstall "$tmp"; rc=$?
+		# plain install = in-place upgrade (prerm runs with "upgrade", keeps state);
+		# --force-reinstall would run prerm "remove" and wipe /etc/xray-monitor.
+		opkg install "$tmp"; rc=$?
 		rm -f "$tmp"
 		[ "$rc" -eq 0 ] && echo "updated" || { echo "opkg install failed"; exit 1; }
 		;;

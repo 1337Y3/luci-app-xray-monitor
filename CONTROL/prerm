@@ -2,8 +2,9 @@
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 
 # On real removal (not upgrade): drop cron lines, tear the tproxy firewall
-# down, un-wire the dnsmasq serversfile, and remove persisted state.
-# Upgrades pass "upgrade" here, so state/cron/firewall survive package updates.
+# down, and un-wire the dnsmasq serversfile. Persisted state under
+# /etc/xray-monitor (lists / entry files / geodata) is intentionally KEPT — see
+# the note at the end. Upgrades pass "upgrade" here, so cron/firewall survive.
 if [ "$1" = "remove" ]; then
 	CRON=/etc/crontabs/root
 	if [ -f "$CRON" ]; then
@@ -26,6 +27,9 @@ if [ "$1" = "remove" ]; then
 		/etc/init.d/dnsmasq restart 2>/dev/null
 	fi
 
-	rm -rf /etc/xray-monitor 2>/dev/null
+	# Intentionally do NOT `rm -rf /etc/xray-monitor`: it holds the user's list /
+	# device entry files and geodata state. `opkg install --force-reinstall` runs
+	# this prerm with "remove", so deleting state here wipes the user's lists on a
+	# reinstall. Leave the dir for manual cleanup after a real uninstall.
 fi
 exit 0
