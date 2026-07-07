@@ -51,7 +51,7 @@ fetch() {  # <url> <out> <maxtime>
 # xray must come back after the restart; geodat rollback restores .prev files
 # (config.json is untouched by this script).
 verify_up() {
-	local need_api="$1" max="${2:-20}" i=0 tp
+	local need_api="$1" max="${2:-30}" i=0 tp
 	tp=$(tproxy_port)
 	while [ "$i" -lt "$max" ]; do
 		if pgrep -f "$XRAY run" >/dev/null 2>&1 \
@@ -187,8 +187,12 @@ case "$1" in
 			[ "$(echo "$4" | wc -w)" -eq 5 ] || { echo "invalid cron schedule (need 5 fields)"; exit 1; }
 			uci set xray-monitor.geodat.cron_schedule="$4"
 		fi
+		# non-empty = set (validated); empty = reset to the built-in default
+		# (src_url falls back when the option is absent)
 		if [ -n "$5" ]; then
 			case "$5" in http://*|https://*) uci set xray-monitor.geodat.source_url="$5" ;; *) echo "invalid url"; exit 1 ;; esac
+		else
+			uci -q delete xray-monitor.geodat.source_url
 		fi
 		uci commit xray-monitor
 		"$0" cron-sync >/dev/null 2>&1

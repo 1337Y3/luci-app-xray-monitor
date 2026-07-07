@@ -32,7 +32,7 @@ uci -q get xray-monitor.rules.registry_geosite >/dev/null || uci set xray-monito
 uci -q get xray-monitor.rules.registry_geoip   >/dev/null || uci set xray-monitor.rules.registry_geoip='ru-blocked'
 seed geodat geodat
 uci -q get xray-monitor.geodat.enabled       >/dev/null || uci set xray-monitor.geodat.enabled='1'
-uci -q get xray-monitor.geodat.cron          >/dev/null || uci set xray-monitor.geodat.cron='1'
+uci -q get xray-monitor.geodat.cron          >/dev/null || uci set xray-monitor.geodat.cron='0'
 uci -q get xray-monitor.geodat.cron_schedule >/dev/null || uci set xray-monitor.geodat.cron_schedule='0 5 * * 1,4'
 uci -q get xray-monitor.geodat.source_url    >/dev/null || uci set xray-monitor.geodat.source_url='https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release'
 uci commit xray-monitor

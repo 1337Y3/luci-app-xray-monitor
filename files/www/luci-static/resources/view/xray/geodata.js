@@ -20,6 +20,7 @@ var root = null;
 var state = { enabled: true, cron: true, cron_schedule: '0 5 * * 1,4', source_url: '', datadir: '',
               running: false, files: [], last: null };
 var cfgEls = {};
+var statusWrap = null;   // container for the status region (poll refreshes ONLY this)
 
 function fmtBytes(n) {
 	n = Number(n) || 0;
@@ -54,8 +55,9 @@ function fileCard(f) {
 	]);
 }
 
-function renderAll() {
-	cfgEls = {};
+// Status region: file cards + last-result + update/rollback buttons. Rebuilt
+// by the poll (no editable inputs here, so nothing to clobber).
+function renderStatus() {
 	var anyPrev = state.files.some(function(f) { return f.prev; });
 
 	var updateBtn = E('button', {
@@ -64,7 +66,7 @@ function renderAll() {
 		'click': function() {
 			callUpdate().then(function() {
 				ui.addNotification(null, E('p', {}, _('Update started.')), 'info');
-				state.running = true; renderAll();
+				state.running = true; refreshStatusOnly();
 			});
 		}
 	}, state.running ? _('Updating…') : _('Update now'));
@@ -91,7 +93,19 @@ function renderAll() {
 		])
 		: E('div', { 'style': 'color:#888;margin:.4em 0' }, _('No update has run yet.'));
 
-	// config form
+	return E('div', {}, [
+		E('h3', {}, _('Geodata files (geoip.dat / geosite.dat)')),
+		E('div', { 'style': 'color:#888;font-size:90%;margin-bottom:.4em' }, [ _('Asset directory: '), E('code', {}, state.datadir || '/usr/share/xray') ]),
+		E('div', { 'style': 'display:flex;gap:12px;flex-wrap:wrap;margin:.5em 0' }, state.files.map(fileCard)),
+		lastLine,
+		E('div', { 'style': 'display:flex;gap:8px;margin:.6em 0' }, [ updateBtn, rollbackBtn ])
+	]);
+}
+
+// Config form: schedule + source URL. Only (re)built on full render / explicit
+// refresh — never by the poll, so in-progress edits survive a running update.
+function renderConfig() {
+	cfgEls = {};
 	cfgEls.enabled = E('input', { 'type': 'checkbox' }); cfgEls.enabled.checked = state.cron && state.enabled;
 	var schedOpts = SCHEDS.map(function(p) { return E('option', { 'value': p[0], 'selected': (p[0] == state.cron_schedule) ? '' : null }, p[1]); });
 	if (!SCHEDS.some(function(p) { return p[0] == state.cron_schedule; }))
@@ -105,13 +119,7 @@ function renderAll() {
 		return E('div', { 'style': 'display:flex;gap:10px;align-items:center;margin:.3em 0' }, [
 			E('label', { 'style': 'min-width:12em' }, label), ctl ]);
 	}
-
-	var content = [
-		E('h3', {}, _('Geodata files (geoip.dat / geosite.dat)')),
-		E('div', { 'style': 'color:#888;font-size:90%;margin-bottom:.4em' }, [ _('Asset directory: '), E('code', {}, state.datadir || '/usr/share/xray') ]),
-		E('div', { 'style': 'display:flex;gap:12px;flex-wrap:wrap;margin:.5em 0' }, state.files.map(fileCard)),
-		lastLine,
-		E('div', { 'style': 'display:flex;gap:8px;margin:.6em 0' }, [ updateBtn, rollbackBtn ]),
+	return E('div', {}, [
 		E('h3', { 'style': 'margin-top:1em' }, _('Auto-update')),
 		row(_('Scheduled updates'), cfgEls.enabled),
 		row(_('Schedule'), cfgEls.schedule),
@@ -120,9 +128,20 @@ function renderAll() {
 		E('div', { 'style': 'color:#888;font-size:90%' }, [
 			E('p', {}, _('Each update compares the published checksum first and only downloads + restarts xray when the data actually changed. A staged xray -test validates every geosite/geoip tag before cutover, and the previous files are kept for one-click rollback.'))
 		])
-	];
+	]);
+}
+
+function renderAll() {
+	statusWrap = E('div', {}, renderStatus());
+	var content = [ statusWrap, renderConfig() ];
 	while (root.firstChild) root.removeChild(root.firstChild);
 	content.forEach(function(n) { if (n) root.appendChild(n); });
+}
+
+function refreshStatusOnly() {
+	if (!statusWrap) return;
+	while (statusWrap.firstChild) statusWrap.removeChild(statusWrap.firstChild);
+	statusWrap.appendChild(renderStatus());
 }
 
 function saveCfg2(btn) {
@@ -158,15 +177,16 @@ return view.extend({
 	render: function() {
 		root = E('div', { 'class': 'cbi-section' });
 		renderAll();
-		// while an update runs, poll faster so the card flips when it finishes
+		// Poll refreshes ONLY the status region (file cards / last-result /
+		// buttons); the config form is left untouched so edits aren't wiped
+		// while an update runs.
 		poll.add(function() {
 			return callGet().then(function(r) {
 				r = r || {};
-				var was = state.running;
 				state.running = !!r.running;
 				state.files = r.files || state.files;
 				state.last = r.last || state.last;
-				if (was || state.running || !root.childNodes.length) renderAll();
+				refreshStatusOnly();
 			});
 		}, 5);
 		return E('div', {}, [ E('h2', {}, _('Xray Geodata')), root ]);

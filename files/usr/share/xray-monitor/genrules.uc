@@ -230,10 +230,12 @@ if (!has_direct) {
 cfg.outbounds = obs;
 
 // -- rules: keep everything that is neither ours (xm:) nor a legacy simple
-//    inbound->exit rule for a swept tproxy inbound (api/socks-dns rules stay).
+//    inbound->exit rule whose inboundTags are ALL swept managed tproxy inbounds
+//    (single- or multi-inbound; api/socks-dns rules stay). Dropping multi-tag
+//    ones too avoids a dangling rule referencing removed inbounds.
 function is_legacy_managed_rule(r) {
-	if (r.type != 'field' || !r.inboundTag || length(r.inboundTag) != 1) return false;
-	if (!managed_tags[r.inboundTag[0]]) return false;
+	if (r.type != 'field' || !r.inboundTag || !length(r.inboundTag)) return false;
+	for (let t in r.inboundTag) if (!managed_tags[t]) return false;
 	if (r.domain || r.ip || r.port || r.protocol || r.source || r.user || r.network) return false;
 	return true;
 }

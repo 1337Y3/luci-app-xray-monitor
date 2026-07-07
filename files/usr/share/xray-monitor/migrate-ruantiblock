@@ -48,6 +48,7 @@ do_rollback() {
 	/etc/init.d/xray-tproxy disable >/dev/null 2>&1
 	# master gate off first: stops the nightly hook from re-sweeping the config
 	uci set xray-monitor.rules.managed='0'
+	uci set xray-monitor.rules.registry_enabled='0'
 	uci set xray-monitor.fw.enabled='0'
 	uci commit xray-monitor
 	if [ -f "$PREMIG" ]; then
@@ -182,6 +183,10 @@ case "$1" in
 			|| fail_revert "tproxy firewall did not come up"
 
 		trap - INT TERM
+		# now that geodata routing is live, keep the .dat fresh on a schedule
+		uci set xray-monitor.geodat.cron='1'
+		uci commit xray-monitor
+		/usr/share/xray-monitor/xray-geodat cron-sync >/dev/null 2>&1
 		date +%s > "$DONE"
 		log "MIGRATION COMPLETE"
 		cat <<'EOF'

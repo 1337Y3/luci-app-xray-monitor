@@ -420,8 +420,11 @@ case "$1" in
 				v=$(echo "$input" | jsonfilter -e '@.default_exit' 2>/dev/null);     [ -n "$v" ] && json_add_string default_exit "$v"
 				v=$(echo "$input" | jsonfilter -e '@.registry_enabled' 2>/dev/null); [ -n "$v" ] && json_add_string registry_enabled "$v"
 				v=$(echo "$input" | jsonfilter -e '@.registry_exit' 2>/dev/null);    [ -n "$v" ] && json_add_string registry_exit "$v"
-				v=$(echo "$input" | jsonfilter -e '@.registry_geosite' 2>/dev/null); [ -n "$v" ] && json_add_string registry_geosite "$v"
-				v=$(echo "$input" | jsonfilter -e '@.registry_geoip' 2>/dev/null);   [ -n "$v" ] && json_add_string registry_geoip "$v"
+				# geosite/geoip forwarded unconditionally (even empty) so the tags
+				# CAN be cleared — rulescfg treats an absent key as "keep", and the
+				# only caller (routing.js) always includes both fields.
+				json_add_string registry_geosite "$(echo "$input" | jsonfilter -e '@.registry_geosite' 2>/dev/null)"
+				json_add_string registry_geoip "$(echo "$input" | jsonfilter -e '@.registry_geoip' 2>/dev/null)"
 				v=$(echo "$input" | jsonfilter -e '@.tproxy_port' 2>/dev/null);      [ -n "$v" ] && json_add_string tproxy_port "$v"
 				json_dump > "$f"
 				msg=$("$RULES" globals-set "$f" 2>&1); rc=$?

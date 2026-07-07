@@ -59,6 +59,18 @@ if (action == 'lists') {
 		if (!valid_dns(s(l.dns))) die("list '" + l.name + "': invalid DNS (use IPv4[#port][,IPv4[#port]...])");
 	}
 	mkdir('/etc/xray-monitor'); mkdir(LISTDIR);
+	// Capture rename sources UP FRONT (keyed by the new name): a rename whose
+	// target collides with a same-save deletion would otherwise lose data once
+	// the trailing cleanup unlinks the old file. Reading before any write makes
+	// the write/delete order irrelevant.
+	let preserved = {};
+	for (let l in payload) {
+		let orig = s(l.orig);
+		if (l.entries == null && length(orig) && orig != l.name) {
+			let content = readfile(LISTDIR + '/' + orig + '.lst');
+			if (content != null) preserved[l.name] = content;
+		}
+	}
 	wipe_sections('list');
 	for (let l in payload) {
 		let sid = ctx.add(XM, 'list');
@@ -68,24 +80,17 @@ if (action == 'lists') {
 		ctx.set(XM, sid, 'enabled', b(l.enabled));
 		ctx.set(XM, sid, 'order', s(int(l.order ?? 100)));
 		let dst = LISTDIR + '/' + l.name + '.lst';
-		let orig = s(l.orig);
-		// preserve entries across a rename when the UI didn't resend them
-		if (l.entries == null && length(orig) && orig != l.name) {
-			let src = LISTDIR + '/' + orig + '.lst';
-			if (stat(src) != null && stat(dst) == null) {
-				writefile(dst, readfile(src) ?? '');
-				unlink(src);
-			}
-		}
 		if (l.entries != null) {
 			let text = replace('' + l.entries, "\r\n", "\n");
 			if (length(text) && substr(text, -1) != "\n") text += "\n";
 			writefile(dst, text);
+		} else if (l.name in preserved) {
+			writefile(dst, preserved[l.name]);   // renamed list keeps its entries
 		} else if (stat(dst) == null) {
 			writefile(dst, '');
 		}
 	}
-	// drop entry files of deleted lists
+	// drop entry files of deleted/renamed-away lists
 	for (let f in (lsdir(LISTDIR) ?? [])) {
 		let m = match(f, /^(.+)\.lst$/);
 		if (m && !seen[m[1]]) unlink(LISTDIR + '/' + f);

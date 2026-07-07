@@ -13,6 +13,7 @@ var callFwSet   = rpc.declare({ object: 'xray-monitor', method: 'fw_set', params
 var callApply   = rpc.declare({ object: 'xray-monitor', method: 'rules_apply' });
 
 var root = null;
+var fwWrap = null;       // container for the transparent-proxy panel (poll refreshes ONLY this)
 var state = { exits: [], managed: false, tproxy_port: 1200, default_exit: 'direct',
               registry: { enabled: false, exit: '', geosite: '', geoip: '' },
               georules: [], geodata_present: false, warnings: [] };
@@ -226,9 +227,21 @@ function renderAll() {
 			E('strong', {}, _('Routing warnings:')),
 			E('ul', {}, state.warnings.map(function(w) { return E('li', {}, w); }))
 		]));
-	content.push(renderFwPanel(), renderGlobals(), renderGeorules());
+	fwWrap = E('div', {}, renderFwPanel());
+	content.push(fwWrap, renderGlobals(), renderGeorules());
 	while (root.firstChild) root.removeChild(root.firstChild);
 	content.forEach(function(n) { if (n) root.appendChild(n); });
+}
+
+// Refresh ONLY the transparent-proxy panel from live fw status — never rebuild
+// the globals/geo-rule forms, so a status poll can't wipe in-progress edits.
+function refreshFwOnly() {
+	return callFwGet().then(function(s) {
+		fw = s || {};
+		if (!fwWrap) return;
+		while (fwWrap.firstChild) fwWrap.removeChild(fwWrap.firstChild);
+		fwWrap.appendChild(renderFwPanel());
+	});
 }
 
 function refresh() {
@@ -255,7 +268,7 @@ return view.extend({
 	render: function() {
 		root = E('div', {});
 		renderAll();
-		poll.add(function() { return callFwGet().then(function(s) { fw = s || {}; renderAll(); }); }, 10);
+		poll.add(refreshFwOnly, 10);
 		return E('div', {}, [ E('h2', {}, _('Xray Routing')), root ]);
 	},
 	handleSaveApply: null, handleSave: null, handleReset: null

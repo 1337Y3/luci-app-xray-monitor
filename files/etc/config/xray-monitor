@@ -36,9 +36,12 @@ config routing 'rules'
 	option registry_geoip 'ru-blocked'
 
 # geoip.dat/geosite.dat auto-update (runetfreedom by default).
+# cron ships OFF: an update restarts xray, so nothing is scheduled until the
+# feature is actually in use (migration enables it; or toggle it on the Geodata
+# page). Geodata is only meaningful once geosite/geoip rules exist.
 config geodat 'geodat'
 	option enabled '1'
-	option cron '1'
+	option cron '0'
 	# Mon+Thu 05:00 — every real update restarts xray, daily would be churn
 	option cron_schedule '0 5 * * 1,4'
 	option source_url 'https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release'

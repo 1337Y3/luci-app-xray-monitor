@@ -78,7 +78,7 @@ prune_backups() {
 # When managed routing is live, the tproxy inbound binding is part of
 # "healthy" — a config that lost it would blackhole the LAN.
 verify_or_rollback() {
-	local bak="$1" need_api="$2" max="${3:-15}" i=0 tp
+	local bak="$1" need_api="$2" max="${3:-30}" i=0 tp
 	tp=$(tproxy_port)
 	while [ "$i" -lt "$max" ]; do
 		if pgrep -f "$XRAY run" >/dev/null 2>&1 \
