@@ -1,9 +1,9 @@
 Package: luci-app-xray-monitor
-Version: 1.18-2
+Version: 1.18-3
 Depends: luci-base, xray-core, curl, ucode-mod-fs, ucode-mod-uci
 Section: luci
 Architecture: all
-Installed-Size: 192427
+Installed-Size: 195785
 Maintainer: vinli
 Description:  LuCI app to monitor and manage Xray: service status, live per-inbound
   and per-outbound traffic + rates (Stats API), per-outbound connectivity, rolling
@@ -11,8 +11,8 @@ Description:  LuCI app to monitor and manage Xray: service status, live per-inbo
   updates, xray-native routing (lists, per-device bypass, per-list DNS, geo-rules),
   a tproxy firewall with failsafe watchdog, and geodata auto-update. Pages under
   Services -> Xray Monitor.
-Filename: luci-app-xray-monitor_1.18-2_all.ipk
-Size: 56638
-SHA256sum: ffe0130ce74e9ec71d7b1f1c830fa032a4e36cb65a8969964da3c417f94ccd4f
-MD5Sum: 1c703d8f0b63f2faeb659ca15a893f62
+Filename: luci-app-xray-monitor_1.18-3_all.ipk
+Size: 57602
+SHA256sum: 6770797e59b7c130012c73d427e89e83769cbf085ce8d7a073240114fc3e97b8
+MD5Sum: 9757cd3df91cddf01ac006e066ac8fb4
 
