@@ -54,12 +54,36 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
   diff shows what a pending fetch would change. State lives in
   `/etc/xray-monitor/` (persists across reboots/upgrades).
 
+**Lists**
+- Named **domain/IP lists**, each mapped to an **exit** (outbound, balancer, or
+  `direct` to bypass all proxies). Entries are one-per-line (bare domain = suffix
+  match; `domain:`/`full:`/`keyword:`/`regexp:`/`geosite:` prefixes; IPv4/CIDR or
+  `geoip:` become IP matchers; `#` comments). Lower **order** = matched earlier.
+- Optional **per-list DNS**: pin those domains to an upstream (`IPv4[#port]`,
+  comma for failover) via a dnsmasq `serversfile` — reloaded with SIGHUP.
+
+**Devices**
+- Per-LAN-device **bypass**. "Bypass everything (kernel)" drops the device from
+  the tproxy firewall entirely (it never enters xray). Otherwise tick individual
+  lists (and `registry`) it should go **direct** for, matched by source IP.
+
 **Routing**
-- Manage the tproxy **dokodemo-door inbounds**: add, rename, set the tproxy
-  port, and pick each one's **exit** (any outbound or balancer) from a dropdown.
-- Save validates with `xray -test`, backs up `config.json`, restarts xray, and
-  auto-rolls-back on failure. The api inbound, balancers, outbounds and any
-  other routing rules are left untouched.
+- **Transparent proxy** panel: master on/off toggle (kill switch) with live
+  status badges (nft table / ip rule / watchdog / xray listening) — all LAN TCP
+  is tproxy'd into a single xray inbound; UDP is untouched.
+- **Routing globals**: default exit for unmatched traffic, and an **RKN registry**
+  auto-route (`geosite:ru-blocked` / `geoip:ru-blocked` → a chosen exit).
+- **Custom geo-rules**: match `geosite:`/`geoip:`/domain/source-IP/network → an
+  exit (fields within a rule are AND-ed).
+- All saves regenerate the managed `xm:`-tagged routing block, validate with
+  `xray -test`, back up `config.json`, restart xray, and auto-roll-back on
+  failure. Non-managed inbounds/rules, balancers and outbounds are preserved.
+
+**Geodata**
+- Download + **auto-update** `geoip.dat`/`geosite.dat` (default source:
+  runetfreedom). Compares the published checksum first (no needless restart),
+  validates every geo tag with a staged `xray -test` before cutover, keeps the
+  previous files for one-click **rollback**, and runs on a cron schedule.
 
 **Config**
 - A raw **`config.json` editor** with a **Test config** button (runs `xray -test`
@@ -200,9 +224,42 @@ Pure data package (`Architecture: all`), so the SDK isn't required.
 | `/www/luci-static/resources/view/xray/monitor.js` | Overview page |
 | `/www/luci-static/resources/view/xray/graphs.js` | Graphs page |
 | `/www/luci-static/resources/view/xray/subscription.js` | Subscription page |
+| `/www/luci-static/resources/view/xray/lists.js` | Lists page |
+| `/www/luci-static/resources/view/xray/devices.js` | Devices page |
 | `/www/luci-static/resources/view/xray/routing.js` | Routing page |
 | `/www/luci-static/resources/view/xray/balancers.js` | Balancers page |
+| `/www/luci-static/resources/view/xray/geodata.js` | Geodata page |
 | `/www/luci-static/resources/view/xray/config.js` | Config editor page |
-| `/usr/share/xray-monitor/{parse,apply,diff,status,routing,balancers,enable-api}.uc` | ucode JSON transforms |
-| `/usr/share/xray-monitor/xray-sub` | fetch/stage/apply helper (+ hourly cron) |
-| `/etc/config/xray-monitor` | UCI config (sub URL, user-agent, cron) — conffile |
+| `/usr/share/xray-monitor/{parse,apply,diff,status,genrules,rulescfg,gendns,balancers,enable-api}.uc` | ucode JSON transforms |
+| `/usr/share/xray-monitor/common.sh` | shared shell helpers (lock, verify/rollback) |
+| `/usr/share/xray-monitor/xray-sub` | subscription fetch/stage/apply helper (+ cron) |
+| `/usr/share/xray-monitor/xray-rules` | managed-routing apply + list/device/rule setters |
+| `/usr/share/xray-monitor/xray-fw` | tproxy nft firewall + failsafe watchdog + kill switch |
+| `/usr/share/xray-monitor/xray-geodat` | geoip/geosite downloader + auto-update (+ cron) |
+| `/usr/share/xray-monitor/migrate-ruantiblock` | one-shot ruantiblock → xray migration |
+| `/etc/init.d/xray-tproxy` | procd service running the tproxy watchdog |
+| `/etc/config/xray-monitor` | UCI config (sub, fw, rules, geodat) — conffile |
+
+## Routing into xray & migrating from ruantiblock
+
+By default the app only reads/edits routing you set up yourself. To have it own
+routing — tproxy **all LAN TCP** into xray and drive it from the Lists/Devices/
+Routing pages — enable *managed routing*. If you currently split traffic with
+**ruantiblock** (dnsmasq nftset → fwmark → tproxy port), the one-shot migration
+imports your user lists (deriving each exit from the port they target today),
+installs geodata, disables ruantiblock (kept installed for rollback), and raises
+the tproxy firewall:
+
+```sh
+/usr/share/xray-monitor/migrate-ruantiblock run       # migrate (auto-reverts on any failure)
+/usr/share/xray-monitor/migrate-ruantiblock rollback  # full undo, re-enables ruantiblock
+/usr/share/xray-monitor/xray-fw off                   # emergency kill switch (rules down, LAN direct)
+```
+
+Safety model: xray-down never blackholes the LAN — a watchdog (`/etc/init.d/xray-tproxy`)
+removes the tproxy rules within ~5 s if xray stops or wedges, and an end-to-end
+probe catches "listening but not relaying". UDP (Discord voice, QUIC, zapret) is
+untouched — only TCP is tproxy'd. IPv4 only: if your LAN ever gets IPv6
+(RA/DHCPv6), AAAA traffic bypasses these rules — keep the LAN v4-only or the
+policy won't cover it. **Always verify DNS and Discord voice from a real LAN
+client after migrating**, not just from the router.

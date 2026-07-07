@@ -1,0 +1,213 @@
+#!/bin/sh
+# One-shot migration from ruantiblock (dnsmasq nftset -> fwmark -> tproxy port)
+# to xray-native managed routing (single tproxy-in inbound, xm: rules).
+#   migrate-ruantiblock run       perform the migration (auto-reverts on failure)
+#   migrate-ruantiblock rollback  undo it (restore config, re-enable ruantiblock)
+#   migrate-ruantiblock status
+# ruantiblock is disabled but kept installed so rollback is always possible.
+. /usr/share/xray-monitor/common.sh
+
+DONE="$STATE/migrate-ruantiblock.done"
+PREMIG="$STATE/config.premigrate.json"
+RB_USERLISTS=/etc/ruantiblock/user_lists
+DNSFILE="$STATE/dnsmasq.servers"
+
+log() { logger -t xray-migrate "$*"; echo "$*"; }
+
+# Resolve the xray exit tag currently serving a given ruantiblock tproxy port,
+# straight from the live config (robust to exit-tag drift between installs).
+exit_for_port() {  # <port>
+	CFG_ENV="$CFG" PORT_ENV="$1" ucode -e '
+		import { readfile } from "fs";
+		let cfg = json(readfile(getenv("CFG_ENV")));
+		let port = int(getenv("PORT_ENV")), tag, ex = "";
+		for (let ib in (cfg.inbounds ?? [])) if (ib.port == port) tag = ib.tag;
+		for (let r in ((cfg.routing ?? {}).rules ?? []))
+			if (tag && r.inboundTag && (tag in r.inboundTag))
+				ex = r.balancerTag ?? r.outboundTag ?? "";
+		print(ex);
+	' 2>/dev/null
+}
+
+# Every ruantiblock section that targets a tproxy TCP port is a user list we
+# want to import — match on the option rather than the section-type name so we
+# don't depend on ruantiblock's exact schema version.
+ruantiblock_enabled_lists() {
+	uci -q show ruantiblock 2>/dev/null \
+		| sed -n 's/^ruantiblock\.\([^.]*\)\.u_t_proxy_port_tcp=.*/\1/p' | sort -u
+}
+
+rb_cron_comment() { sed -i '\|/usr/bin/ruantiblock update|s|^\([^#]\)|#\1|' /etc/crontabs/root 2>/dev/null; }
+rb_cron_uncomment() { sed -i '\|/usr/bin/ruantiblock update|s|^#\+||' /etc/crontabs/root 2>/dev/null; }
+
+# ---- rollback (also the auto-revert path for a failed run) ----
+do_rollback() {
+	log "rolling back to pre-migration state"
+	/usr/share/xray-monitor/xray-fw off >/dev/null 2>&1
+	/etc/init.d/xray-tproxy stop >/dev/null 2>&1
+	/etc/init.d/xray-tproxy disable >/dev/null 2>&1
+	# master gate off first: stops the nightly hook from re-sweeping the config
+	uci set xray-monitor.rules.managed='0'
+	uci set xray-monitor.fw.enabled='0'
+	uci commit xray-monitor
+	if [ -f "$PREMIG" ]; then
+		cp -a "$PREMIG" "$CFG"
+		/etc/init.d/xray restart >/dev/null 2>&1
+	fi
+	if [ "$(uci -q get dhcp.@dnsmasq[0].serversfile)" = "$DNSFILE" ]; then
+		uci -q delete dhcp.@dnsmasq[0].serversfile
+		uci commit dhcp
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1
+	fi
+	rb_cron_uncomment
+	/etc/init.d/cron restart >/dev/null 2>&1
+	if command -v ruantiblock >/dev/null 2>&1 || [ -x /etc/init.d/ruantiblock ]; then
+		/etc/init.d/ruantiblock enable >/dev/null 2>&1
+		/etc/init.d/ruantiblock start >/dev/null 2>&1
+	fi
+	# resync outbounds: the premigrate config may hold days-old rotated creds
+	/usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1
+	/usr/share/xray-monitor/xray-sub apply >/dev/null 2>&1
+	/usr/share/xray-monitor/xray-geodat set-cfg 0 0 "" "" >/dev/null 2>&1
+	rm -f "$DONE"
+	log "rollback complete — ruantiblock re-enabled"
+}
+
+case "$1" in
+	run)
+		[ -f "$DONE" ] && { echo "already migrated ($DONE). Use rollback to undo."; exit 1; }
+		command -v ruantiblock >/dev/null 2>&1 || [ -x /etc/init.d/ruantiblock ] \
+			|| { echo "ruantiblock not installed — nothing to migrate from"; exit 1; }
+		api_up || log "warning: xray stats API not answering (continuing)"
+
+		# 1) backups (timestamped + an unprunable copy the rollback relies on)
+		cp -a "$CFG" "$CFG.bak.premigrate.$(date +%Y%m%d-%H%M%S)"
+		cp -a "$CFG" "$PREMIG"
+		log "backed up config to $PREMIG"
+
+		# 2) geodata first — registry & geosite rules need the .dat for -test
+		log "downloading geodata (this can take a few minutes)…"
+		if ! /usr/share/xray-monitor/xray-geodat update; then
+			echo "geodata update failed — aborting before any change. Fix connectivity and retry."
+			exit 1
+		fi
+		uci set xray-monitor.rules.registry_enabled='1'
+
+		# 3) import ruantiblock user lists, deriving each exit from the live
+		#    config by tproxy port (so the mapping matches what works today)
+		mkdir -p "$STATE/lists"
+		# clear any previously-imported list sections/files for a clean re-run
+		for lid in $(uci -q show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=list$/\1/p'); do
+			uci -q delete "xray-monitor.$lid"
+		done
+		# empty direct list (order 0) so a "direct" list exists for device bypass
+		did=$(uci add xray-monitor list)
+		uci set "xray-monitor.$did.name"='direct'
+		uci set "xray-monitor.$did.exit"='direct'
+		uci set "xray-monitor.$did.order"='0'
+		uci set "xray-monitor.$did.enabled"='1'
+		: > "$STATE/lists/direct.lst"
+
+		ord=10
+		imported=0
+		for rid in $(ruantiblock_enabled_lists); do
+			[ "$(uci -q get "ruantiblock.$rid.u_enabled")" = "0" ] && continue
+			port=$(uci -q get "ruantiblock.$rid.u_t_proxy_port_tcp")
+			[ -n "$port" ] || port=$(uci -q get ruantiblock.config.t_proxy_port_tcp)
+			[ -n "$port" ] || continue
+			exit_tag=$(exit_for_port "$port")
+			[ -n "$exit_tag" ] || { log "no xray exit found for ruantiblock $rid (port $port) — skipping"; continue; }
+			# name: prefer a slug of the description, else the ruantiblock id
+			desc=$(uci -q get "ruantiblock.$rid.u_description")
+			name=$(echo "${desc:-$rid}" | tr 'A-Z ' 'a-z-' | sed 's/[^a-z0-9_-]//g' | cut -c1-32)
+			[ -n "$name" ] || name="$rid"
+			src="$RB_USERLISTS/$rid"
+			[ -f "$src" ] && cp -a "$src" "$STATE/lists/$name.lst" || : > "$STATE/lists/$name.lst"
+			lid=$(uci add xray-monitor list)
+			uci set "xray-monitor.$lid.name"="$name"
+			uci set "xray-monitor.$lid.exit"="$exit_tag"
+			uci set "xray-monitor.$lid.dns"=''
+			uci set "xray-monitor.$lid.order"="$ord"
+			uci set "xray-monitor.$lid.enabled"='1'
+			log "imported list '$name' (port $port -> $exit_tag, $(grep -cvE '^\s*(#|$)' "$STATE/lists/$name.lst" 2>/dev/null) entries)"
+			ord=$((ord + 10))
+			imported=$((imported + 1))
+		done
+		uci commit xray-monitor
+		[ "$imported" -gt 0 ] || log "warning: no ruantiblock lists imported"
+
+		# ---- from here: any failure auto-reverts ----
+		trap 'log "MIGRATION FAILED — auto-reverting"; do_rollback; exit 1' INT TERM
+		fail_revert() { log "step failed: $1"; do_rollback; exit 1; }
+
+		# 4) stop ruantiblock BEFORE raising xray rules (no double-tproxy window;
+		#    list traffic flows direct for the few seconds until step 5)
+		/etc/init.d/ruantiblock stop >/dev/null 2>&1
+		/etc/init.d/ruantiblock disable >/dev/null 2>&1
+		rb_cron_comment
+		/etc/init.d/cron restart >/dev/null 2>&1
+		log "ruantiblock stopped + disabled (kept installed for rollback)"
+
+		# 5) turn managed routing on and generate the xray config
+		uci set xray-monitor.rules.managed='1'
+		uci commit xray-monitor
+		out=$(/usr/share/xray-monitor/xray-rules apply 2>&1)
+		echo "$out" | grep -q '^ok' || fail_revert "xray-rules apply: $out"
+		log "managed routing applied"
+
+		# 6) per-list DNS serversfile + one-time dnsmasq wiring
+		/usr/share/xray-monitor/xray-rules dns-sync >/dev/null 2>&1
+		cur=$(uci -q get dhcp.@dnsmasq[0].serversfile)
+		if [ -z "$cur" ]; then
+			[ -f "$DNSFILE" ] || : > "$DNSFILE"
+			uci set dhcp.@dnsmasq[0].serversfile="$DNSFILE"
+			uci commit dhcp
+			/etc/init.d/dnsmasq restart >/dev/null 2>&1
+			log "wired dnsmasq serversfile -> $DNSFILE"
+		elif [ "$cur" != "$DNSFILE" ]; then
+			log "dnsmasq serversfile already set to '$cur' — leaving it; per-list DNS disabled"
+		fi
+
+		# 7) enable the tproxy firewall + watchdog
+		uci set xray-monitor.fw.enabled='1'
+		uci commit xray-monitor
+		/etc/init.d/xray-tproxy enable >/dev/null 2>&1
+		/etc/init.d/xray-tproxy start >/dev/null 2>&1
+		# give the watchdog a moment to raise the rules, then confirm
+		i=0; while [ "$i" -lt 8 ]; do
+			nft list table ip xray_tproxy >/dev/null 2>&1 && break
+			sleep 1; i=$((i + 1))
+		done
+		nft list table ip xray_tproxy >/dev/null 2>&1 \
+			|| fail_revert "tproxy firewall did not come up"
+
+		trap - INT TERM
+		date +%s > "$DONE"
+		log "MIGRATION COMPLETE"
+		cat <<'EOF'
+
+Migration done. Verify FROM A LAN CLIENT (not the router):
+  1. DNS:     nslookup example.com 192.168.1.1   (+ a list domain)
+  2. Default: curl -s https://api.ipify.org      (should be your ISP IP)
+  3. Lists:   load Netflix / Crunchyroll / Discord; check exit via
+              xray api statsquery --server=127.0.0.1:10085
+  4. Registry: open a known RKN-blocked site
+  5. Discord VOICE call (UDP path must be unchanged)
+  6. Failsafe: /etc/init.d/xray stop  -> LAN TCP still flows (~5s), then start
+Kill switch if anything is wrong:  /usr/share/xray-monitor/xray-fw off
+Full undo:                         /usr/share/xray-monitor/migrate-ruantiblock rollback
+EOF
+		;;
+
+	rollback)
+		do_rollback
+		;;
+
+	status)
+		if [ -f "$DONE" ]; then echo "migrated at $(date -d "@$(cat "$DONE")" 2>/dev/null || cat "$DONE")"; else echo "not migrated"; fi
+		echo "managed=$(uci -q get xray-monitor.rules.managed) fw.enabled=$(uci -q get xray-monitor.fw.enabled)"
+		;;
+
+	*)
+		echo "usage: migrate-ruantiblock run|rollback|status"; exit 1 ;;
+esac

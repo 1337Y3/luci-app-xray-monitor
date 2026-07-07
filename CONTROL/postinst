@@ -3,10 +3,39 @@
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 
 chmod 0755 /usr/libexec/rpcd/xray-monitor 2>/dev/null
-chmod 0755 /usr/share/xray-monitor/*.uc /usr/share/xray-monitor/xray-sub 2>/dev/null
+chmod 0755 /usr/share/xray-monitor/*.uc /usr/share/xray-monitor/xray-sub \
+           /usr/share/xray-monitor/xray-rules /usr/share/xray-monitor/xray-fw \
+           /usr/share/xray-monitor/xray-geodat /usr/share/xray-monitor/migrate-ruantiblock \
+           /etc/init.d/xray-tproxy 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null
 rm -f /tmp/luci-indexcache* 2>/dev/null
 rm -rf /tmp/luci-modulecache 2>/dev/null
+
+# Seed the new named UCI sections on upgrade: opkg keeps the existing
+# /etc/config/xray-monitor conffile, so shipped defaults never arrive on an
+# already-installed system. Idempotent; defaults are inert (fw off, managed off).
+seed() { uci -q get "xray-monitor.$1" >/dev/null 2>&1 || uci set "xray-monitor.$1=$2"; }
+seed fw fw
+uci -q get xray-monitor.fw.enabled     >/dev/null || uci set xray-monitor.fw.enabled='0'
+uci -q get xray-monitor.fw.tproxy_port >/dev/null || uci set xray-monitor.fw.tproxy_port='1200'
+uci -q get xray-monitor.fw.probe_port  >/dev/null || uci set xray-monitor.fw.probe_port='1201'
+uci -q get xray-monitor.fw.mark_out    >/dev/null || uci set xray-monitor.fw.mark_out='256'
+uci -q get xray-monitor.fw.mark_tproxy >/dev/null || uci set xray-monitor.fw.mark_tproxy='512'
+uci -q get xray-monitor.fw.rt_table    >/dev/null || uci set xray-monitor.fw.rt_table='100'
+uci -q get xray-monitor.fw.lan_if      >/dev/null || uci set xray-monitor.fw.lan_if='br-lan'
+seed rules routing
+uci -q get xray-monitor.rules.managed          >/dev/null || uci set xray-monitor.rules.managed='0'
+uci -q get xray-monitor.rules.default_exit     >/dev/null || uci set xray-monitor.rules.default_exit='direct'
+uci -q get xray-monitor.rules.registry_enabled >/dev/null || uci set xray-monitor.rules.registry_enabled='0'
+uci -q get xray-monitor.rules.registry_exit    >/dev/null || uci set xray-monitor.rules.registry_exit='balancer-default'
+uci -q get xray-monitor.rules.registry_geosite >/dev/null || uci set xray-monitor.rules.registry_geosite='ru-blocked'
+uci -q get xray-monitor.rules.registry_geoip   >/dev/null || uci set xray-monitor.rules.registry_geoip='ru-blocked'
+seed geodat geodat
+uci -q get xray-monitor.geodat.enabled       >/dev/null || uci set xray-monitor.geodat.enabled='1'
+uci -q get xray-monitor.geodat.cron          >/dev/null || uci set xray-monitor.geodat.cron='1'
+uci -q get xray-monitor.geodat.cron_schedule >/dev/null || uci set xray-monitor.geodat.cron_schedule='0 5 * * 1,4'
+uci -q get xray-monitor.geodat.source_url    >/dev/null || uci set xray-monitor.geodat.source_url='https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release'
+uci commit xray-monitor
 
 # Migrate a pre-multi-sub single URL (xray-monitor.sub.url) into a 'subscription'
 # section with prefix 'proxy' (keeps existing tags/routing). Runs once.
@@ -25,6 +54,16 @@ fi
 
 # install/refresh the subscription fetch cron from UCI (schedule + enable)
 /usr/share/xray-monitor/xray-sub cron-sync >/dev/null 2>&1
+
+# geodata auto-update cron (own marker; no-op line unless enabled)
+/usr/share/xray-monitor/xray-geodat cron-sync >/dev/null 2>&1
+
+# tproxy watchdog service: enable + restart (restart, not start, so an upgrade
+# reloads the watch loop onto the new script instead of running the old one).
+# The watchdog keeps rules DOWN until fw.enabled=1 AND xray is listening, so
+# enabling it here is inert until migration turns the firewall on.
+/etc/init.d/xray-tproxy enable 2>/dev/null
+/etc/init.d/xray-tproxy restart 2>/dev/null
 
 # Auto-enable the Xray Stats API (idempotent, path-aware, logged).
 # Result also visible later via:  logread | grep xray-monitor
