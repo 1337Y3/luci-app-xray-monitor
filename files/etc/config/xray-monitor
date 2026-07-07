@@ -9,3 +9,36 @@ config xray-monitor 'sub'
 	option auto_apply '0'
 	# auto-enable the Xray Stats API in config.json on package install (1=yes)
 	option auto_enable_api '1'
+
+# Transparent-proxy firewall (nft tproxy of all LAN TCP into xray).
+# enabled=0 keeps everything down; the migration script turns it on.
+config fw 'fw'
+	option enabled '0'
+	option tproxy_port '1200'
+	option probe_port '1201'
+	# 0x100: sockopt.mark on xray outbounds (nft loop guard skips it)
+	option mark_out '256'
+	# 0x200: fwmark/ctmark for tproxy policy routing (masked ops, zapret-safe)
+	option mark_tproxy '512'
+	option rt_table '100'
+	option lan_if 'br-lan'
+
+# Managed xray routing (lists/devices/georules -> routing.rules).
+# managed=0 = master gate: genrules/xray-rules refuse to touch config.json.
+config routing 'rules'
+	option managed '0'
+	option default_exit 'direct'
+	# RKN-registry replacement: geosite/geoip rules -> registry_exit.
+	# Ships disabled — enabled by migration AFTER geodata is installed.
+	option registry_enabled '0'
+	option registry_exit 'balancer-default'
+	option registry_geosite 'ru-blocked'
+	option registry_geoip 'ru-blocked'
+
+# geoip.dat/geosite.dat auto-update (runetfreedom by default).
+config geodat 'geodat'
+	option enabled '1'
+	option cron '1'
+	# Mon+Thu 05:00 — every real update restarts xray, daily would be churn
+	option cron_schedule '0 5 * * 1,4'
+	option source_url 'https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release'
