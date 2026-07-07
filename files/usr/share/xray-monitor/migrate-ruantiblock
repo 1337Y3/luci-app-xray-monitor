@@ -1,8 +1,11 @@
 #!/bin/sh
 # One-shot migration from ruantiblock (dnsmasq nftset -> fwmark -> tproxy port)
 # to xray-native managed routing (single tproxy-in inbound, xm: rules).
-#   migrate-ruantiblock run       perform the migration (auto-reverts on failure)
-#   migrate-ruantiblock rollback  undo it (restore config, re-enable ruantiblock)
+#   migrate-ruantiblock run              perform the migration (auto-reverts on failure)
+#   migrate-ruantiblock enable-registry  OPTIONAL: download geodata + turn on the RKN
+#                                        registry (geosite/geoip) routing rule
+#   migrate-ruantiblock disable-registry turn the registry rule back off
+#   migrate-ruantiblock rollback         undo it (restore config, re-enable ruantiblock)
 #   migrate-ruantiblock status
 # ruantiblock is disabled but kept installed so rollback is always possible.
 . /usr/share/xray-monitor/common.sh
@@ -86,13 +89,11 @@ case "$1" in
 		cp -a "$CFG" "$PREMIG"
 		log "backed up config to $PREMIG"
 
-		# 2) geodata first — registry & geosite rules need the .dat for -test
-		log "downloading geodata (this can take a few minutes)…"
-		if ! /usr/share/xray-monitor/xray-geodat update; then
-			echo "geodata update failed — aborting before any change. Fix connectivity and retry."
-			exit 1
-		fi
-		uci set xray-monitor.rules.registry_enabled='1'
+		# 2) registry routing (RKN geosite/geoip) is OPT-IN — the migration no
+		#    longer force-downloads the ~90 MB geodata. Leave registry_enabled at
+		#    its seeded 0 so genrules emits no geosite:/geoip: rules and xray -test
+		#    passes with no .dat present. Enable it afterwards with:
+		#        migrate-ruantiblock enable-registry
 
 		# 3) import ruantiblock user lists, deriving each exit from the live
 		#    config by tproxy port (so the mapping matches what works today)
@@ -183,10 +184,8 @@ case "$1" in
 			|| fail_revert "tproxy firewall did not come up"
 
 		trap - INT TERM
-		# now that geodata routing is live, keep the .dat fresh on a schedule
-		uci set xray-monitor.geodat.cron='1'
-		uci commit xray-monitor
-		/usr/share/xray-monitor/xray-geodat cron-sync >/dev/null 2>&1
+		# geodata is not downloaded here (registry routing is opt-in); the geodata
+		# auto-update cron is armed by 'enable-registry', not the migration.
 		date +%s > "$DONE"
 		log "MIGRATION COMPLETE"
 		cat <<'EOF'
@@ -196,12 +195,55 @@ Migration done. Verify FROM A LAN CLIENT (not the router):
   2. Default: curl -s https://api.ipify.org      (should be your ISP IP)
   3. Lists:   load Netflix / Crunchyroll / Discord; check exit via
               xray api statsquery --server=127.0.0.1:10085
-  4. Registry: open a known RKN-blocked site
-  5. Discord VOICE call (UDP path must be unchanged)
-  6. Failsafe: /etc/init.d/xray stop  -> LAN TCP still flows (~5s), then start
+  4. Discord VOICE call (UDP path must be unchanged)
+  5. Failsafe: /etc/init.d/xray stop  -> LAN TCP still flows (~5s), then start
+Registry (RKN-blocked sites) is OPTIONAL and NOT enabled by the migration.
+  Turn it on:  /usr/share/xray-monitor/migrate-ruantiblock enable-registry  (~90 MB geodata)
 Kill switch if anything is wrong:  /usr/share/xray-monitor/xray-fw off
 Full undo:                         /usr/share/xray-monitor/migrate-ruantiblock rollback
 EOF
+		;;
+
+	enable-registry)
+		# Optional post-migration step: download the geodata .dat files and turn
+		# on the RKN-registry (geosite/geoip) routing rule. Kept out of `run` so
+		# the migration itself stays fast and works without the ~90 MB download.
+		rules_managed || { echo "managed routing is off — run 'migrate-ruantiblock run' first"; exit 1; }
+		[ "$(uci -q get xray-monitor.rules.registry_enabled)" = "1" ] \
+			&& { echo "registry already enabled"; exit 0; }
+		log "downloading geodata (this can take a few minutes)…"
+		if ! /usr/share/xray-monitor/xray-geodat update; then
+			echo "geodata update failed — registry not enabled. Fix connectivity and retry."
+			exit 1
+		fi
+		uci set xray-monitor.rules.registry_enabled='1'
+		uci commit xray-monitor
+		out=$(/usr/share/xray-monitor/xray-rules apply 2>&1)
+		if ! echo "$out" | grep -q '^ok'; then
+			uci set xray-monitor.rules.registry_enabled='0'
+			uci commit xray-monitor
+			log "enable-registry failed, reverted: $out"
+			exit 1
+		fi
+		# now that registry routing is live, keep the .dat fresh on a schedule
+		uci set xray-monitor.geodat.cron='1'
+		uci commit xray-monitor
+		/usr/share/xray-monitor/xray-geodat cron-sync >/dev/null 2>&1
+		log "registry routing enabled"
+		;;
+
+	disable-registry)
+		[ "$(uci -q get xray-monitor.rules.registry_enabled)" = "0" ] \
+			&& { echo "registry already disabled"; exit 0; }
+		uci set xray-monitor.rules.registry_enabled='0'
+		uci set xray-monitor.geodat.cron='0'
+		uci commit xray-monitor
+		/usr/share/xray-monitor/xray-geodat cron-sync >/dev/null 2>&1
+		if rules_managed; then
+			out=$(/usr/share/xray-monitor/xray-rules apply 2>&1)
+			echo "$out" | grep -q '^ok' || { log "apply after disable-registry failed: $out"; exit 1; }
+		fi
+		log "registry routing disabled"
 		;;
 
 	rollback)
@@ -210,9 +252,9 @@ EOF
 
 	status)
 		if [ -f "$DONE" ]; then echo "migrated at $(date -d "@$(cat "$DONE")" 2>/dev/null || cat "$DONE")"; else echo "not migrated"; fi
-		echo "managed=$(uci -q get xray-monitor.rules.managed) fw.enabled=$(uci -q get xray-monitor.fw.enabled)"
+		echo "managed=$(uci -q get xray-monitor.rules.managed) fw.enabled=$(uci -q get xray-monitor.fw.enabled) registry=$(uci -q get xray-monitor.rules.registry_enabled)"
 		;;
 
 	*)
-		echo "usage: migrate-ruantiblock run|rollback|status"; exit 1 ;;
+		echo "usage: migrate-ruantiblock run|enable-registry|disable-registry|rollback|status"; exit 1 ;;
 esac

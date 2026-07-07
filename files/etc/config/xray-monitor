@@ -29,7 +29,7 @@ config routing 'rules'
 	option managed '0'
 	option default_exit 'direct'
 	# RKN-registry replacement: geosite/geoip rules -> registry_exit.
-	# Ships disabled — enabled by migration AFTER geodata is installed.
+	# Ships disabled; opt-in via 'migrate-ruantiblock enable-registry' (downloads geodata).
 	option registry_enabled '0'
 	option registry_exit 'balancer-default'
 	option registry_geosite 'ru-blocked'
@@ -37,8 +37,8 @@ config routing 'rules'
 
 # geoip.dat/geosite.dat auto-update (runetfreedom by default).
 # cron ships OFF: an update restarts xray, so nothing is scheduled until the
-# feature is actually in use (migration enables it; or toggle it on the Geodata
-# page). Geodata is only meaningful once geosite/geoip rules exist.
+# feature is actually in use ('enable-registry' arms it, or toggle it on the
+# Geodata page). Geodata is only meaningful once geosite/geoip rules exist.
 config geodat 'geodat'
 	option enabled '1'
 	option cron '0'
