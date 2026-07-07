@@ -1,0 +1,218 @@
+#!/bin/sh
+# geoip.dat / geosite.dat downloader + auto-updater for luci-app-xray-monitor.
+#   update    download (if remote sha changed), verify, stage, -test, cut over,
+#             restart xray, verify (restore .prev on failure)
+#   status    JSON for the Geodata view
+#   rollback  swap the .prev files back in and restart
+#   set-cfg <enabled> <cron> <schedule> <url>   (empty = keep)
+#   cron-sync
+. /usr/share/xray-monitor/common.sh
+
+DATADIR=$(data_dir)
+GSTAT="$STATE/geodat.status"
+RUNFLAG=/tmp/xray-geodat.running
+# Direct fetch first; raw.githubusercontent.com is DPI-throttled territory and
+# the router's own traffic bypasses xray by design, so retry through the
+# loopback socks-dns inbound (exits via balancer-default).
+SOCKS="socks5h://127.0.0.1:10808"
+FILES="geoip.dat geosite.dat"
+
+src_url() {
+	local u; u=$(uci -q get xray-monitor.geodat.source_url 2>/dev/null)
+	[ -n "$u" ] || u="https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release"
+	echo "${u%/}"
+}
+
+json_escape() { printf '%s' "$1" | tr -d '\n\r' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+file_sha() { [ -f "$1" ] && sha256sum "$1" 2>/dev/null | awk '{print $1}'; }
+
+write_status() {  # <result> <msg>
+	local g s
+	g=$(file_sha "$DATADIR/geoip.dat"); s=$(file_sha "$DATADIR/geosite.dat")
+	printf '{"ts":%s,"result":"%s","msg":"%s","geoip_sha":"%s","geosite_sha":"%s","via_proxy":%s}\n' \
+		"$(date +%s)" "$1" "$(json_escape "$2")" "${g:-}" "${s:-}" "${via_proxy:-0}" > "$GSTAT"
+}
+
+fail() {
+	write_status "${2:-error}" "$1"
+	echo "$1"
+	exit 1
+}
+
+fetch() {  # <url> <out> <maxtime>
+	curl -fsSL --max-time "$3" -o "$2" "$1" 2>/dev/null && return 0
+	if curl -fsSL --max-time "$3" -x "$SOCKS" -o "$2" "$1" 2>/dev/null; then
+		via_proxy=1; return 0
+	fi
+	return 1
+}
+
+# xray must come back after the restart; geodat rollback restores .prev files
+# (config.json is untouched by this script).
+verify_up() {
+	local need_api="$1" max="${2:-20}" i=0 tp
+	tp=$(tproxy_port)
+	while [ "$i" -lt "$max" ]; do
+		if pgrep -f "$XRAY run" >/dev/null 2>&1 \
+			&& { [ "$need_api" != 1 ] || api_up; } \
+			&& { ! rules_managed || port_listening "$tp"; }; then
+			return 0
+		fi
+		sleep 1; i=$((i + 1))
+	done
+	return 1
+}
+
+case "$1" in
+	update)
+		if [ -f "$RUNFLAG" ]; then
+			p=$(cat "$RUNFLAG" 2>/dev/null)
+			[ -n "$p" ] && [ -d "/proc/$p" ] && { echo "update already running (pid $p)"; exit 1; }
+			rm -f "$RUNFLAG"   # stale flag (crash/reboot mid-update)
+		fi
+		echo $$ > "$RUNFLAG"
+		trap 'rm -f "$RUNFLAG"' EXIT INT TERM
+		via_proxy=0
+		base=$(src_url)
+		tmpd=$(mktemp -d) || fail "mktemp failed"
+
+		# 1) compare tiny .sha256sum files first: identical => no 90MB
+		#    download, no xray restart (runetfreedom republishes every 6h,
+		#    but a restart is a household TCP reset - skip when possible)
+		changed=0
+		for f in $FILES; do
+			fetch "$base/$f.sha256sum" "$tmpd/$f.sha256sum" 30 \
+				|| { rm -rf "$tmpd"; fail "cannot fetch $f.sha256sum from $base"; }
+			rsha=$(awk '{print $1}' "$tmpd/$f.sha256sum" 2>/dev/null)
+			[ -n "$rsha" ] || { rm -rf "$tmpd"; fail "empty checksum for $f"; }
+			[ "$rsha" = "$(file_sha "$DATADIR/$f")" ] || changed=1
+		done
+		if [ "$changed" = 0 ]; then
+			write_status ok "already up to date"
+			echo "already up to date"
+			rm -rf "$tmpd"
+			exit 0
+		fi
+
+		# 2) download + checksum-verify in /tmp (tmpfs)
+		for f in $FILES; do
+			fetch "$base/$f" "$tmpd/$f" 900 || { rm -rf "$tmpd"; fail "download failed: $f"; }
+			rsha=$(awk '{print $1}' "$tmpd/$f.sha256sum")
+			dsha=$(file_sha "$tmpd/$f")
+			[ "$rsha" = "$dsha" ] || { rm -rf "$tmpd"; fail "checksum mismatch: $f (corrupt/tampered download)" "checksum-error"; }
+		done
+
+		# 3) stage on the same filesystem as DATADIR, gate on xray -test with
+		#    the NEW files (validates every geosite:/geoip: tag the config
+		#    references before anything is touched)
+		mkdir -p "$DATADIR" || { rm -rf "$tmpd"; fail "cannot create $DATADIR"; }
+		stage="$DATADIR/.staging"
+		rm -rf "$stage"; mkdir "$stage" || { rm -rf "$tmpd"; fail "cannot create staging dir"; }
+		mv "$tmpd"/*.dat "$stage/" || { rm -rf "$tmpd" "$stage"; fail "staging move failed"; }
+		rm -rf "$tmpd"
+		if ! XRAY_LOCATION_ASSET="$stage" "$XRAY" -test -format json -config "$CFG" >/dev/null 2>&1; then
+			rm -rf "$stage"
+			fail "xray -test rejected the new geodata (tag renamed/removed upstream?) - keeping current files" "test-failed"
+		fi
+
+		# 4) cut over (mv within one fs = atomic), restart, verify, rollback
+		lock_acquire
+		api_before=0; api_up && api_before=1
+		for f in $FILES; do
+			[ -f "$DATADIR/$f" ] && mv "$DATADIR/$f" "$DATADIR/$f.prev"
+			mv "$stage/$f" "$DATADIR/$f"
+		done
+		rm -rf "$stage"
+		/etc/init.d/xray restart >/dev/null 2>&1
+		if verify_up "$api_before" 20; then
+			write_status ok "updated"
+			echo "updated"
+		else
+			for f in $FILES; do
+				[ -f "$DATADIR/$f.prev" ] && mv "$DATADIR/$f.prev" "$DATADIR/$f"
+			done
+			/etc/init.d/xray restart >/dev/null 2>&1
+			fail "xray failed to come back with new geodata - previous files restored" "rolled-back"
+		fi
+		;;
+
+	rollback)
+		have=0
+		for f in $FILES; do [ -f "$DATADIR/$f.prev" ] && have=1; done
+		[ "$have" = 1 ] || { echo "no .prev files to roll back to"; exit 1; }
+		lock_acquire
+		api_before=0; api_up && api_before=1
+		for f in $FILES; do
+			[ -f "$DATADIR/$f.prev" ] || continue
+			mv "$DATADIR/$f" "$DATADIR/$f.rbtmp" 2>/dev/null
+			mv "$DATADIR/$f.prev" "$DATADIR/$f"
+			mv "$DATADIR/$f.rbtmp" "$DATADIR/$f.prev" 2>/dev/null
+		done
+		/etc/init.d/xray restart >/dev/null 2>&1
+		if verify_up "$api_before" 20; then
+			write_status ok "rolled back to previous geodata"
+			echo ok
+		else
+			fail "xray did not come back after rollback" "error"
+		fi
+		;;
+
+	status)
+		en=$(uci -q get xray-monitor.geodat.enabled); [ -n "$en" ] || en=1
+		cr=$(uci -q get xray-monitor.geodat.cron); [ -n "$cr" ] || cr=1
+		sch=$(uci -q get xray-monitor.geodat.cron_schedule); [ -n "$sch" ] || sch="0 5 * * 1,4"
+		run=0
+		if [ -f "$RUNFLAG" ]; then
+			p=$(cat "$RUNFLAG" 2>/dev/null)
+			[ -n "$p" ] && [ -d "/proc/$p" ] && run=1
+		fi
+		files=""
+		for f in $FILES; do
+			pres=0; size=0; mt=0; prev=0
+			[ -f "$DATADIR/$f" ] && { pres=1; size=$(wc -c < "$DATADIR/$f" 2>/dev/null | tr -d ' '); mt=$(date -r "$DATADIR/$f" +%s 2>/dev/null); }
+			[ -f "$DATADIR/$f.prev" ] && prev=1
+			[ -n "$files" ] && files="$files,"
+			files="$files{\"name\":\"$f\",\"present\":$pres,\"size\":${size:-0},\"mtime\":${mt:-0},\"prev\":$prev}"
+		done
+		last=$(cat "$GSTAT" 2>/dev/null); [ -n "$last" ] || last=null
+		printf '{"enabled":%s,"cron":%s,"cron_schedule":"%s","source_url":"%s","datadir":"%s","running":%s,"files":[%s],"last":%s}\n' \
+			"$en" "$cr" "$(json_escape "$sch")" "$(json_escape "$(src_url)")" "$(json_escape "$DATADIR")" "$run" "$files" "$last"
+		;;
+
+	set-cfg)  # <enabled> <cron> <schedule> <url>  (empty = keep)
+		[ -n "$2" ] && uci set xray-monitor.geodat.enabled="$2"
+		[ -n "$3" ] && uci set xray-monitor.geodat.cron="$3"
+		if [ -n "$4" ]; then
+			[ "$(echo "$4" | wc -w)" -eq 5 ] || { echo "invalid cron schedule (need 5 fields)"; exit 1; }
+			uci set xray-monitor.geodat.cron_schedule="$4"
+		fi
+		if [ -n "$5" ]; then
+			case "$5" in http://*|https://*) uci set xray-monitor.geodat.source_url="$5" ;; *) echo "invalid url"; exit 1 ;; esac
+		fi
+		uci commit xray-monitor
+		"$0" cron-sync >/dev/null 2>&1
+		echo ok
+		;;
+
+	cron-sync)
+		CRON=/etc/crontabs/root
+		mkdir -p /etc/crontabs; touch "$CRON"
+		# own marker; must not collide with the 'xray-monitor/xray-sub fetch'
+		# sed patterns used by xray-sub cron-sync and CONTROL/prerm
+		sed -i '/xray-monitor\/xray-geodat update/d' "$CRON" 2>/dev/null
+		cr=$(uci -q get xray-monitor.geodat.cron); [ -n "$cr" ] || cr=1
+		en=$(uci -q get xray-monitor.geodat.enabled); [ -n "$en" ] || en=1
+		sch=$(uci -q get xray-monitor.geodat.cron_schedule); [ -n "$sch" ] || sch="0 5 * * 1,4"
+		if [ "$cr" != 0 ] && [ "$en" != 0 ]; then
+			echo "$sch /usr/share/xray-monitor/xray-geodat update >/dev/null 2>&1" >> "$CRON"
+		fi
+		/etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart 2>/dev/null
+		echo ok
+		;;
+
+	*)
+		echo "usage: xray-geodat update|status|rollback|set-cfg <enabled> <cron> <schedule> <url>|cron-sync"
+		exit 1
+		;;
+esac
