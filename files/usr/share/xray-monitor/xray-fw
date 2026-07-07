@@ -69,6 +69,15 @@ $delems
 		ct state established,related return
 		ct state new meta l4proto tcp tproxy to :$port ct mark set ct mark or $mt meta mark set mark or $mt accept
 	}
+	# Locally-generated traffic (router + xray itself). Every xray outbound
+	# carries SO_MARK $mo (streamSettings.sockopt.mark). Return for it here, at
+	# the output routing hook (before the route is chosen), so xray-originated
+	# packets can never be pulled into the tproxy policy route and looped back
+	# into the dispatcher. Explicit loop guard, independent of mark disjointness.
+	chain output {
+		type route hook output priority -150; policy accept;
+		meta mark & $mo == $mo return
+	}
 }
 EOF
 }
