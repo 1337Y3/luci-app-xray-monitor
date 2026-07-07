@@ -27,6 +27,11 @@ config fw 'fw'
 	# other UDP (DNS/voice/games) is never touched - zapret keeps owning it.
 	option tproxy_udp '0'
 	option udp_ports '443'
+	# Resolve at exit (opt-in): when 1, the sniffed SNI OVERRIDES the dst so
+	# proxy exits resolve the domain at the VPS (remote DNS - immune to client
+	# poisoning + exit-correct CDN geo); direct exits re-resolve via router DoH.
+	# Ships OFF; caveat: can misroute ECH/domain-fronting/IP-pinned connections.
+	option resolve_exit '0'
 
 # Managed xray routing (lists/devices/georules -> routing.rules).
 # managed=0 = master gate: genrules/xray-rules refuse to touch config.json.

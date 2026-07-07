@@ -11,6 +11,7 @@ var callGeorules = rpc.declare({ object: 'xray-monitor', method: 'georules_set',
 var callFwGet   = rpc.declare({ object: 'xray-monitor', method: 'fw_get' });
 var callFwSet   = rpc.declare({ object: 'xray-monitor', method: 'fw_set', params: [ 'enabled' ] });
 var callFwUdp   = rpc.declare({ object: 'xray-monitor', method: 'fw_udp', params: [ 'enabled' ] });
+var callFwResolve = rpc.declare({ object: 'xray-monitor', method: 'fw_resolve', params: [ 'enabled' ] });
 var callApply   = rpc.declare({ object: 'xray-monitor', method: 'rules_apply' });
 
 var root = null;
@@ -67,6 +68,20 @@ function renderFwPanel() {
 		}
 	}, fw.udp ? _('QUIC: ON') : _('Tunnel QUIC (UDP 443)'));
 
+	var resolveToggle = E('button', {
+		'class': 'cbi-button ' + (fw.resolve ? 'cbi-button-negative' : 'cbi-button-neutral'),
+		'disabled': on ? null : '',
+		'click': function() {
+			var q = fw.resolve ? _('Go back to trusting the client\'s resolved IP (routeOnly)? Exits stop re-resolving domains.')
+			                   : _('Resolve domains at the exit? Proxied domains get resolved by the VPS (immune to DNS poisoning, exit-correct CDN geo). Can misroute ECH / domain-fronting / IP-pinned sites — verify Cloudflare-hosted pages after.');
+			if (!confirm(q)) return;
+			callFwResolve(fw.resolve ? '0' : '1').then(function(res) {
+				if (!(res && res.ok)) ui.addNotification(null, E('p', {}, _('Resolve toggle failed. ') + ((res && res.msg) || '')), 'error');
+				refresh();
+			});
+		}
+	}, fw.resolve ? _('Resolve at exit: ON') : _('Resolve at exit'));
+
 	return E('div', { 'class': 'cbi-section', 'style': 'border:1px solid #ddd;padding:10px;border-radius:6px' }, [
 		E('h3', {}, _('Transparent proxy (tproxy)')),
 		E('div', {}, [
@@ -76,11 +91,13 @@ function renderFwPanel() {
 			badge(_('ip rule'), !!fw.rule_present),
 			badge(_('port ') + (fw.port || '?') + (fw.port_listening ? ' ' + _('listening') : ''), !!fw.port_listening),
 			badge(_('watchdog'), !!fw.watchdog_running),
-			badge(_('QUIC') + (fw.udp ? ' ' + (fw.udp_ports || '443') : ''), !!fw.udp)
+			badge(_('QUIC') + (fw.udp ? ' ' + (fw.udp_ports || '443') : ''), !!fw.udp),
+			badge(_('resolve@exit'), !!fw.resolve)
 		]),
-		E('div', { 'style': 'margin:.5em 0;display:flex;gap:8px;flex-wrap:wrap' }, [ toggle, udpToggle ]),
+		E('div', { 'style': 'margin:.5em 0;display:flex;gap:8px;flex-wrap:wrap' }, [ toggle, udpToggle, resolveToggle ]),
 		E('div', { 'style': 'color:#888;font-size:90%' }, [
 			E('p', {}, _('When ON, all LAN TCP is tproxy\'d into xray on port ') + (fw.port || state.tproxy_port) + (fw.udp ? _('. QUIC (UDP ') + (fw.udp_ports || '443') + _(') tunnels too; other UDP (DNS/voice) stays direct.') : _('. UDP is untouched (zapret owns it).')) + _(' If xray goes down the watchdog removes the rules within ~5s so the LAN keeps working.')),
+			E('p', {}, fw.resolve ? _('Resolve at exit is ON: the sniffed domain overrides the destination, so proxied domains are resolved by the VPS (defeats DNS poisoning + fixes CDN geo). ECH / domain-fronting / IP-pinned sites may misroute.') : _('Resolve at exit is OFF: xray routes by SNI but dials the client\'s resolved IP (routeOnly). Safe with the router\'s forced DoH; turn ON for exit-side resolution.')),
 			E('p', {}, [ _('Emergency kill switch from a shell: '), E('code', {}, '/usr/share/xray-monitor/xray-fw off') ])
 		])
 	]);

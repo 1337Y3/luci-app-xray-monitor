@@ -25,6 +25,7 @@ mark_out_hex()    { printf '0x%x' "$(uget mark_out 256)"; }
 mark_tproxy_hex() { printf '0x%x' "$(uget mark_tproxy 512)"; }
 udp_on()          { [ "$(uget tproxy_udp 0)" = "1" ]; }
 udp_ports()       { uget udp_ports 443; }
+resolve_on()      { [ "$(uget resolve_exit 0)" = "1" ]; }
 
 # LAN devices with bypass_all=1: never enter xray at all (kernel-level bypass)
 bypass_dev_ips() {
@@ -206,8 +207,9 @@ case "$1" in
 		en=0; fw_enabled && en=1
 		mg=0; rules_managed && mg=1
 		udp=0; udp_on && udp=1
-		printf '{"enabled":%s,"managed":%s,"active":%s,"rule_present":%s,"port":%s,"port_listening":%s,"watchdog_running":%s,"udp":%s,"udp_ports":"%s"}\n' \
-			"$en" "$mg" "$tbl" "$rul" "$(tproxy_port)" "$lst" "$wd" "$udp" "$(udp_ports)"
+		res=0; resolve_on && res=1
+		printf '{"enabled":%s,"managed":%s,"active":%s,"rule_present":%s,"port":%s,"port_listening":%s,"watchdog_running":%s,"udp":%s,"udp_ports":"%s","resolve":%s}\n' \
+			"$en" "$mg" "$tbl" "$rul" "$(tproxy_port)" "$lst" "$wd" "$udp" "$(udp_ports)" "$res"
 		;;
 	on)
 		uci set xray-monitor.fw.enabled='1'; uci commit xray-monitor; fw_sync; echo ok ;;
@@ -225,6 +227,18 @@ case "$1" in
 		"$SHARE/xray-rules" apply >/dev/null 2>&1
 		fw_sync
 		echo "udp tproxy $2 (ports $(udp_ports))" ;;
+	resolve)
+		# Toggle exit-side domain resolution: flip the tproxy-in sniffing
+		# routeOnly flag via xray-rules apply. Pure xray-config change (the nft
+		# table is unaffected), so no fw_sync needed.
+		case "$2" in
+			on)  uci set xray-monitor.fw.resolve_exit='1' ;;
+			off) uci set xray-monitor.fw.resolve_exit='0' ;;
+			*)   echo "usage: xray-fw resolve on|off"; exit 1 ;;
+		esac
+		uci commit xray-monitor
+		"$SHARE/xray-rules" apply >/dev/null 2>&1
+		echo "resolve-at-exit $2" ;;
 	*)
-		echo "usage: xray-fw up|down|sync|render|watch|status|on|off|udp on|off"; exit 1 ;;
+		echo "usage: xray-fw up|down|sync|render|watch|status|on|off|udp on|off|resolve on|off"; exit 1 ;;
 esac

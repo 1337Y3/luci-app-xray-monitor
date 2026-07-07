@@ -25,6 +25,7 @@ uci -q get xray-monitor.fw.rt_table    >/dev/null || uci set xray-monitor.fw.rt_
 uci -q get xray-monitor.fw.lan_if      >/dev/null || uci set xray-monitor.fw.lan_if='br-lan'
 uci -q get xray-monitor.fw.tproxy_udp  >/dev/null || uci set xray-monitor.fw.tproxy_udp='0'
 uci -q get xray-monitor.fw.udp_ports   >/dev/null || uci set xray-monitor.fw.udp_ports='443'
+uci -q get xray-monitor.fw.resolve_exit >/dev/null || uci set xray-monitor.fw.resolve_exit='0'
 seed rules routing
 uci -q get xray-monitor.rules.managed          >/dev/null || uci set xray-monitor.rules.managed='0'
 uci -q get xray-monitor.rules.default_exit     >/dev/null || uci set xray-monitor.rules.default_exit='direct'

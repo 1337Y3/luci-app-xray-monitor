@@ -41,7 +41,8 @@ let fw = {
 	tproxy_port: int(uget('fw', 'tproxy_port', 1200)),
 	probe_port:  int(uget('fw', 'probe_port', 1201)),
 	mark_out:    int(uget('fw', 'mark_out', 256)),
-	udp:         uget('fw', 'tproxy_udp', '0') == '1'
+	udp:         uget('fw', 'tproxy_udp', '0') == '1',
+	resolve_exit: uget('fw', 'resolve_exit', '0') == '1'
 };
 let globals = {
 	managed:          uget('rules', 'managed', '0') == '1',
@@ -202,7 +203,12 @@ managed_tags['tproxy-in'] = 1;
 push(new_in, {
 	tag: 'tproxy-in', protocol: 'dokodemo-door', listen: '0.0.0.0', port: fw.tproxy_port,
 	settings: { network: fw.udp ? 'tcp,udp' : 'tcp', followRedirect: true },
-	sniffing: { enabled: true, destOverride: fw.udp ? [ 'http', 'tls', 'quic' ] : [ 'http', 'tls' ], routeOnly: true },
+	// routeOnly:true = route by sniffed SNI but dial the ORIGINAL client IP
+	// (trusts client DNS). resolve_exit=1 flips it to false so the sniffed
+	// domain OVERRIDES the dst: proxy exits carry the domain to the VPS
+	// (remote resolve, immune to client-side poisoning + exit-correct CDN geo);
+	// direct exits re-resolve via the router's DoH. Caveat: ECH/fronting.
+	sniffing: { enabled: true, destOverride: fw.udp ? [ 'http', 'tls', 'quic' ] : [ 'http', 'tls' ], routeOnly: !fw.resolve_exit },
 	streamSettings: { sockopt: { tproxy: 'tproxy' } }
 });
 // Loopback-only probe: the xray-fw watchdog curls through it to prove the
