@@ -41,7 +41,15 @@ port_listening() { netstat -ltn 2>/dev/null | grep -q ":$1 "; }
 lock_acquire() {
 	if command -v flock >/dev/null 2>&1; then
 		exec 9>"$XMLOCK" || return 0
-		flock -w 180 9 || { echo "busy: another xray-monitor operation is running"; exit 1; }
+		# BusyBox flock supports only [-sxun] FD — no -w timeout — so poll with
+		# -n (non-blocking) rather than blocking with a deadline. Portable:
+		# util-linux flock honours -n in FD mode too.
+		local i=0
+		while ! flock -n 9 2>/dev/null; do
+			i=$((i + 1))
+			[ "$i" -ge 180 ] && { echo "busy: another xray-monitor operation is running"; exit 1; }
+			sleep 1
+		done
 		return 0
 	fi
 	local d="$XMLOCK.d" p i=0
