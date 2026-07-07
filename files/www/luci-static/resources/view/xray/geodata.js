@@ -49,7 +49,7 @@ function fileCard(f) {
 			? E('div', { 'style': 'color:#888;font-size:90%' }, [
 				E('div', {}, fmtBytes(f.size)),
 				E('div', {}, _('updated ') + fmtAgo(f.mtime)),
-				f.prev ? E('div', { 'style': 'color:#46a546' }, _('previous version kept')) : null
+				f.prev ? E('div', { 'style': 'color:#46a546' }, _('previous version kept')) : ''
 			])
 			: E('div', { 'style': 'color:#cc3300' }, _('not installed'))
 	]);
@@ -88,8 +88,8 @@ function renderStatus() {
 			_('Last update: '),
 			E('span', { 'style': 'color:' + resultColor(last.result) }, (last.result || '?')),
 			' · ' + fmtAgo(last.ts),
-			(last.via_proxy ? E('span', { 'style': 'color:#888' }, ' · ' + _('via proxy')) : null),
-			last.msg ? E('div', { 'style': 'color:#888;font-size:90%' }, last.msg) : null
+			(last.via_proxy ? E('span', { 'style': 'color:#888' }, ' · ' + _('via proxy')) : ''),
+			last.msg ? E('div', { 'style': 'color:#888;font-size:90%' }, last.msg) : ''
 		])
 		: E('div', { 'style': 'color:#888;margin:.4em 0' }, _('No update has run yet.'));
 
