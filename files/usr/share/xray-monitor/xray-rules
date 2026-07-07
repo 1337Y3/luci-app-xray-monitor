@@ -1,0 +1,72 @@
+#!/bin/sh
+# Managed-routing orchestrator for luci-app-xray-monitor.
+#   get                          -> genrules.uc get (payload for the UI)
+#   apply                        -> regenerate managed block, test, restart, verify
+#   lists-set|devices-set|georules-set|globals-set <payload.json>
+#                                -> persist UCI/files, then apply (if managed)
+#   dns-sync                     -> regenerate dnsmasq serversfile, HUP on change
+. /usr/share/xray-monitor/common.sh
+
+DNSFILE="$STATE/dnsmasq.servers"
+
+gen_apply() {
+	rules_managed || { echo "managed routing is off (xray-monitor.rules.managed=0)"; return 1; }
+	lock_acquire
+	local api_before=0 bak out rc warn
+	api_up && api_before=1
+	bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
+	out=$("$SHARE/genrules.uc" set "$CFG" "$CFG.new" 2>&1); rc=$?
+	if [ "$rc" -ne 0 ] || [ ! -s "$CFG.new" ]; then
+		rm -f "$CFG.new"; echo "generate failed: $out"; return 1
+	fi
+	if ! "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
+		rm -f "$CFG.new"; echo "config test failed - not applied"; return 1
+	fi
+	mv "$CFG.new" "$CFG"
+	/etc/init.d/xray restart >/dev/null 2>&1
+	if verify_or_rollback "$bak" "$api_before"; then
+		prune_backups
+		[ -x "$SHARE/xray-fw" ] && "$SHARE/xray-fw" sync >/dev/null 2>&1
+		"$0" dns-sync >/dev/null 2>&1
+		warn=$(echo "$out" | jsonfilter -e '@.warnings[*]' 2>/dev/null | sed 's/^/warning: /')
+		[ -n "$warn" ] && echo "$warn"
+		echo ok
+	else
+		echo "xray failed health check after apply - rolled back"
+		return 1
+	fi
+}
+
+case "$1" in
+	get)
+		exec "$SHARE/genrules.uc" get "$CFG"
+		;;
+	apply)
+		gen_apply
+		;;
+	lists-set|devices-set|georules-set|globals-set)
+		[ -s "$2" ] || { echo "no input"; exit 1; }
+		sub="${1%-set}"
+		msg=$("$SHARE/rulescfg.uc" "$sub" "$2" 2>&1) || { echo "$msg"; exit 1; }
+		if rules_managed; then
+			gen_apply
+		else
+			# pre-migration: state persisted, nothing touches xray yet
+			"$0" dns-sync >/dev/null 2>&1
+			echo "saved (managed routing is off - not applied to xray)"
+		fi
+		;;
+	dns-sync)
+		[ -x "$SHARE/gendns.uc" ] || { echo ok; exit 0; }
+		out=$("$SHARE/gendns.uc" 2>&1) || { echo "dns generate failed: $out"; exit 1; }
+		if [ "$out" = "changed" ] \
+			&& [ "$(uci -q get dhcp.@dnsmasq[0].serversfile)" = "$DNSFILE" ]; then
+			killall -HUP dnsmasq 2>/dev/null
+		fi
+		echo ok
+		;;
+	*)
+		echo "usage: xray-rules get|apply|lists-set <f>|devices-set <f>|georules-set <f>|globals-set <f>|dns-sync"
+		exit 1
+		;;
+esac

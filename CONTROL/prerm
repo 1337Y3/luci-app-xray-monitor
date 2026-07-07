@@ -1,12 +1,31 @@
 #!/bin/sh
 [ -n "${IPKG_INSTROOT}" ] && exit 0
 
-# On real removal (not upgrade): drop the cron line and persisted state.
-# Upgrades pass "upgrade" here, so state/cron survive package updates.
+# On real removal (not upgrade): drop cron lines, tear the tproxy firewall
+# down, un-wire the dnsmasq serversfile, and remove persisted state.
+# Upgrades pass "upgrade" here, so state/cron/firewall survive package updates.
 if [ "$1" = "remove" ]; then
 	CRON=/etc/crontabs/root
-	[ -f "$CRON" ] && sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
+	if [ -f "$CRON" ]; then
+		sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
+		sed -i '/xray-monitor\/xray-geodat update/d' "$CRON" 2>/dev/null
+	fi
 	/etc/init.d/cron restart 2>/dev/null
+
+	# stop the watchdog and remove the tproxy rules so removal can't leave the
+	# LAN routed into a package that's gone
+	/etc/init.d/xray-tproxy stop 2>/dev/null
+	/etc/init.d/xray-tproxy disable 2>/dev/null
+	/usr/share/xray-monitor/xray-fw down 2>/dev/null
+
+	# a dangling serversfile is a dnsmasq startup error -> would break LAN DNS
+	# on the next dnsmasq restart; remove the wiring before deleting the file
+	if [ "$(uci -q get dhcp.@dnsmasq[0].serversfile)" = "/etc/xray-monitor/dnsmasq.servers" ]; then
+		uci -q delete dhcp.@dnsmasq[0].serversfile
+		uci commit dhcp
+		/etc/init.d/dnsmasq restart 2>/dev/null
+	fi
+
 	rm -rf /etc/xray-monitor 2>/dev/null
 fi
 exit 0

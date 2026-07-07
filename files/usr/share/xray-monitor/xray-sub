@@ -2,33 +2,19 @@
 # Remnawave multi-subscription / config helper for luci-app-xray-monitor.
 # Commands: fetch | apply | status | set-cfg ... | cron-sync
 #         | sub-add <prefix> <url> | sub-del <id> | sub-edit <id> <prefix> <url> <enabled>
-#         | routing-get | routing-set <f> | balancers-get | balancers-set <f>
+#         | balancers-get | balancers-set <f>
 #         | config-save <f> | enable-api
-SHARE=/usr/share/xray-monitor
-STATE=/etc/xray-monitor
-XRAY=/usr/bin/xray
+# (managed routing lives in the sibling `xray-rules`; shared helpers in common.sh)
 FEED="https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs"
 REL="https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.ipk"
 PKG=luci-app-xray-monitor
 
-config_file() {
-	local f; f=$(uci -q get xray.config.conffiles 2>/dev/null | awk '{print $1}')
-	[ -f "$f" ] && { echo "$f"; return; }
-	echo "/etc/xray/config.json"
-}
-CFG=$(config_file)
-mkdir -p "$STATE"
+. /usr/share/xray-monitor/common.sh
 
 ua_default=$(uci -q get xray-monitor.sub.user_agent); [ -n "$ua_default" ] || ua_default="v2rayNG/1.8.0"
 cron=$(uci -q get xray-monitor.sub.cron); [ -n "$cron" ] || cron=1
 cron_schedule=$(uci -q get xray-monitor.sub.cron_schedule); [ -n "$cron_schedule" ] || cron_schedule="0 * * * *"
 auto_apply=$(uci -q get xray-monitor.sub.auto_apply); [ -n "$auto_apply" ] || auto_apply=0
-
-fetch_url() {  # <url> <user-agent> [header-dump-file]
-	local hdr="${3:-/dev/null}"
-	if command -v curl >/dev/null 2>&1; then curl -s -D "$hdr" -A "$2" --max-time 25 "$1"
-	else uclient-fetch -q -O - -U "$2" -T 25 "$1"; fi
-}
 
 # Parse the standard `subscription-userinfo` response header into usage state:
 #   subscription-userinfo: upload=0; download=123; total=456; expire=1735689600
@@ -59,38 +45,6 @@ prefix_in_use() {  # <prefix> <exclude-id>
 		[ "$id" = "$2" ] && continue
 		[ "$(uci -q get "xray-monitor.$id.prefix")" = "$1" ] && return 0
 	done; return 1
-}
-
-# Keep the newest $1 (default 3) "$CFG.bak.*" backups, delete the rest.
-# Only ever runs after a config change verified working (xray -test + restart).
-prune_backups() {
-	local keep="${1:-3}" f n=0
-	for f in $(ls -t "$CFG".bak.* 2>/dev/null); do
-		n=$((n + 1))
-		[ "$n" -le "$keep" ] && continue
-		[ "$f" = "$CFG" ] && continue   # never the live config
-		rm -f "$f"
-	done
-}
-
-# Stats API reachability probe (rc 0 = answering on 127.0.0.1:10085).
-APISRV="127.0.0.1:10085"
-api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
-
-# After a config change + restart, confirm xray came back healthy; if not,
-# restore the pre-change backup and restart. $1 = backup file to restore,
-# $2 = 1 to also require the stats API to answer (else only require xray up).
-verify_or_rollback() {
-	local bak="$1" need_api="$2" i
-	for i in 1 2 3 4 5; do
-		if pgrep -f "$XRAY run" >/dev/null 2>&1 && { [ "$need_api" != 1 ] || api_up; }; then
-			return 0
-		fi
-		sleep 1
-	done
-	[ -f "$bak" ] && cp -a "$bak" "$CFG"
-	/etc/init.d/xray restart >/dev/null 2>&1
-	return 1
 }
 
 case "$1" in
@@ -136,10 +90,23 @@ case "$1" in
 
 	apply)
 		[ -s "$STATE/staged.json" ] || { echo "nothing staged"; exit 1; }
+		lock_acquire
 		api_before=0; api_up && api_before=1
 		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$CFG.new" >/dev/null 2>&1 \
-			&& "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
+		ok=1
+		"$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$CFG.new" >/dev/null 2>&1 || ok=0
+		# Managed routing on: regenerate the xm: block against the fresh
+		# outbounds in the SAME pass (one restart per night, and list exits
+		# whose tag vanished from the subscription get remapped with a warning).
+		if [ "$ok" = 1 ] && rules_managed; then
+			if "$SHARE/genrules.uc" set "$CFG.new" "$CFG.new.gen" >/dev/null 2>&1; then
+				mv "$CFG.new.gen" "$CFG.new"
+			else
+				rm -f "$CFG.new.gen"; ok=0
+			fi
+		fi
+		[ "$ok" = 1 ] && { "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1 || ok=0; }
+		if [ "$ok" = 1 ]; then
 			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
 			if verify_or_rollback "$bak" "$api_before"; then
 				prune_backups
@@ -213,15 +180,14 @@ case "$1" in
 		echo ok
 		;;
 
-	routing-get)   "$SHARE/routing.uc" get "$CFG" ;;
 	balancers-get) "$SHARE/balancers.uc" get "$CFG" ;;
 
-	routing-set|balancers-set)
+	balancers-set)
 		[ -s "$2" ] || { echo "no input"; exit 1; }
-		case "$1" in routing-set) uc="$SHARE/routing.uc" ;; *) uc="$SHARE/balancers.uc" ;; esac
+		lock_acquire
 		api_before=0; api_up && api_before=1
 		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if "$uc" set "$CFG" "$2" "$CFG.new" >/dev/null 2>&1 && "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
+		if "$SHARE/balancers.uc" set "$CFG" "$2" "$CFG.new" >/dev/null 2>&1 && "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
 			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
 			if verify_or_rollback "$bak" "$api_before"; then prune_backups; echo ok
 			else echo "xray/api failed health check - rolled back"; exit 1; fi
@@ -233,6 +199,7 @@ case "$1" in
 	config-save)
 		[ -s "$2" ] || { echo "empty config"; exit 1; }
 		if "$XRAY" -test -format json -config "$2" >/dev/null 2>&1; then
+			lock_acquire
 			api_before=0; api_up && api_before=1
 			bak="$CFG.bak.manual.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 			cat "$2" > "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
@@ -292,5 +259,5 @@ case "$1" in
 		;;
 
 	*)
-		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api"; exit 1 ;;
+		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|balancers-get|balancers-set <f>|config-save <f>|enable-api"; exit 1 ;;
 esac

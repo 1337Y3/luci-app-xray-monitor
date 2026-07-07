@@ -1,0 +1,196 @@
+#!/bin/sh
+# Transparent-proxy firewall for managed xray routing: renders and owns
+# `table ip xray_tproxy` (tproxy of LAN TCP into xray) + the policy route.
+#   up | down | sync | watch | status | on | off
+# Failsafe by construction: `sync` only raises rules while xray's tproxy port
+# actually LISTENs, and the `watch` loop (procd service xray-tproxy) re-syncs
+# every 5s and probes the data plane every ~30s. `off` is the kill switch.
+. /usr/share/xray-monitor/common.sh
+
+NFT_FILE=/tmp/xray-tproxy.nft
+NFT_APPLIED=/tmp/xray-tproxy.nft.applied
+
+fw_enabled() { [ "$(uci -q get xray-monitor.fw.enabled 2>/dev/null)" = "1" ]; }
+
+uget() {  # <option> <default>
+	local v; v=$(uci -q get "xray-monitor.fw.$1" 2>/dev/null)
+	[ -n "$v" ] || v="$2"
+	echo "$v"
+}
+
+probe_port() { uget probe_port 1201; }
+rt_table()   { uget rt_table 100; }
+lan_if()     { uget lan_if br-lan; }
+mark_out_hex()    { printf '0x%x' "$(uget mark_out 256)"; }
+mark_tproxy_hex() { printf '0x%x' "$(uget mark_tproxy 512)"; }
+
+# LAN devices with bypass_all=1: never enter xray at all (kernel-level bypass)
+bypass_dev_ips() {
+	local id ips=""
+	for id in $(uci -q show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=device$/\1/p'); do
+		[ "$(uci -q get "xray-monitor.$id.bypass_all")" = "1" ] || continue
+		[ "$(uci -q get "xray-monitor.$id.enabled")" = "0" ] && continue
+		ips="$ips $(uci -q get "xray-monitor.$id.ip")"
+	done
+	echo "$ips"
+}
+
+render() {
+	local port mo mt lan devs delems=""
+	port=$(tproxy_port); mo=$(mark_out_hex); mt=$(mark_tproxy_hex); lan=$(lan_if)
+	devs=$(bypass_dev_ips)
+	# nft rejects an empty `elements = { }` — emit the line only when populated
+	[ -n "${devs# }" ] && delems="		elements = { $(echo $devs | tr ' ' ',') }"
+	cat <<EOF
+table ip xray_tproxy
+delete table ip xray_tproxy
+table ip xray_tproxy {
+	set bypass_dev {
+		type ipv4_addr
+$delems
+	}
+	set no_tproxy_dst {
+		type ipv4_addr
+		flags interval
+		elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+		             169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16,
+		             224.0.0.0/4, 240.0.0.0/4 }
+	}
+	# priority -50: AFTER fw4 dstnat (-100) so force_dns/port-forward
+	# redirects resolve to a local/LAN dst first and are naturally excluded
+	chain prerouting {
+		type filter hook prerouting priority -50; policy accept;
+		iifname != "$lan" return
+		ip daddr @no_tproxy_dst return
+		ip saddr @bypass_dev return
+		tcp dport { 53, 853 } return
+		meta mark & $mo == $mo return
+		ct mark & $mt == $mt meta l4proto tcp tproxy to :$port meta mark set mark or $mt accept
+		ct state established,related return
+		ct state new meta l4proto tcp tproxy to :$port ct mark set ct mark or $mt meta mark set mark or $mt accept
+	}
+}
+EOF
+}
+
+table_up() { nft list table ip xray_tproxy >/dev/null 2>&1; }
+
+route_up() {
+	local mt rt; mt=$(mark_tproxy_hex); rt=$(rt_table)
+	ip rule list 2>/dev/null | grep -q "fwmark $mt.* lookup $rt" \
+		|| ip rule add fwmark "$mt/$mt" lookup "$rt" pref 1100 2>/dev/null \
+		|| ip rule add fwmark "$mt" lookup "$rt" pref 1100 2>/dev/null
+	ip route show table "$rt" 2>/dev/null | grep -q "^local default" \
+		|| ip route add local default dev lo table "$rt" 2>/dev/null
+}
+
+route_down() {
+	local mt rt; mt=$(mark_tproxy_hex); rt=$(rt_table)
+	while ip rule del fwmark "$mt/$mt" lookup "$rt" 2>/dev/null; do :; done
+	while ip rule del fwmark "$mt" lookup "$rt" 2>/dev/null; do :; done
+	ip route del local default dev lo table "$rt" 2>/dev/null
+}
+
+fw_up() {
+	render > "$NFT_FILE.new"
+	if ! table_up || ! cmp -s "$NFT_FILE.new" "$NFT_APPLIED" 2>/dev/null; then
+		if nft -f "$NFT_FILE.new" 2>/dev/null; then
+			mv "$NFT_FILE.new" "$NFT_APPLIED"
+		else
+			logger -t xray-fw "nft -f failed - tproxy rules NOT installed"
+			rm -f "$NFT_FILE.new"
+			return 1
+		fi
+	else
+		rm -f "$NFT_FILE.new"
+	fi
+	route_up
+}
+
+fw_down() {
+	nft delete table ip xray_tproxy 2>/dev/null
+	route_down
+	rm -f "$NFT_APPLIED"
+}
+
+# Raise rules only when it is safe: fw enabled AND xray listening on the
+# tproxy port AND managed routing on (the inbound exists). Anything else: down.
+fw_sync() {
+	if fw_enabled && rules_managed && port_listening "$(tproxy_port)"; then
+		fw_up
+	else
+		if table_up; then
+			logger -t xray-fw "conditions not met (enabled=$(uget enabled 0), managed=$(uci -q get xray-monitor.rules.managed), port $(tproxy_port) listening=$(port_listening "$(tproxy_port)" && echo 1 || echo 0)) - removing tproxy rules. Kill switch: /usr/share/xray-monitor/xray-fw off"
+		fi
+		fw_down
+	fi
+}
+
+# End-to-end data-plane probe through the loopback xm-probe inbound: any HTTP
+# status proves xray accepted, dialed out via the direct outbound and relayed.
+# "listening but not proxying" (wedged dispatcher) is what this catches.
+probe_ok() {
+	local code
+	code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+		-H 'Host: www.gstatic.com' "http://127.0.0.1:$(probe_port)/generate_204" 2>/dev/null)
+	[ -n "$code" ] && [ "$code" != "000" ]
+}
+
+case "$1" in
+	up)   fw_up ;;
+	down) fw_down ;;
+	sync) fw_sync ;;
+	render) render ;;
+	watch)
+		fails=0; restarted=0; hold=0; n=0
+		while :; do
+			if [ "$hold" = 1 ]; then
+				# torn down after failed probes: stay down until the data
+				# plane answers again (probe is loopback, works without rules)
+				if probe_ok; then
+					hold=0; fails=0; restarted=0
+					logger -t xray-fw "data-plane probe recovered - re-enabling tproxy"
+					fw_sync
+				fi
+			else
+				fw_sync
+				n=$((n + 1))
+				if [ $((n % 6)) -eq 0 ] && fw_enabled && rules_managed && port_listening "$(tproxy_port)"; then
+					if probe_ok; then
+						fails=0; restarted=0
+					else
+						fails=$((fails + 1))
+						logger -t xray-fw "data-plane probe failed ($fails/3)"
+						if [ "$fails" -ge 3 ]; then
+							logger -t xray-fw "xray listening but not relaying - removing tproxy rules (LAN TCP goes direct). Kill switch stays available: /usr/share/xray-monitor/xray-fw off"
+							fw_down
+							hold=1; fails=0
+							if [ "$restarted" = 0 ]; then
+								restarted=1
+								logger -t xray-fw "attempting one xray restart"
+								/etc/init.d/xray restart >/dev/null 2>&1
+							fi
+						fi
+					fi
+				fi
+			fi
+			sleep 5
+		done
+		;;
+	status)
+		wd=0; pgrep -f "xray-fw watch" >/dev/null 2>&1 && wd=1
+		tbl=0; table_up && tbl=1
+		lst=0; port_listening "$(tproxy_port)" && lst=1
+		rul=0; ip rule list 2>/dev/null | grep -q "fwmark $(mark_tproxy_hex).* lookup $(rt_table)" && rul=1
+		en=0; fw_enabled && en=1
+		mg=0; rules_managed && mg=1
+		printf '{"enabled":%s,"managed":%s,"active":%s,"rule_present":%s,"port":%s,"port_listening":%s,"watchdog_running":%s}\n' \
+			"$en" "$mg" "$tbl" "$rul" "$(tproxy_port)" "$lst" "$wd"
+		;;
+	on)
+		uci set xray-monitor.fw.enabled='1'; uci commit xray-monitor; fw_sync; echo ok ;;
+	off)
+		uci set xray-monitor.fw.enabled='0'; uci commit xray-monitor; fw_sync; echo ok ;;
+	*)
+		echo "usage: xray-fw up|down|sync|render|watch|status|on|off"; exit 1 ;;
+esac
