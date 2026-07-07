@@ -22,6 +22,11 @@ config fw 'fw'
 	option mark_tproxy '512'
 	option rt_table '100'
 	option lan_if 'br-lan'
+	# QUIC/HTTP3 tproxy (opt-in): when 1, ALSO tproxy LAN UDP on udp_ports
+	# (default 443) into xray so listed domains' QUIC tunnels too. Ships OFF;
+	# other UDP (DNS/voice/games) is never touched - zapret keeps owning it.
+	option tproxy_udp '0'
+	option udp_ports '443'
 
 # Managed xray routing (lists/devices/georules -> routing.rules).
 # managed=0 = master gate: genrules/xray-rules refuse to touch config.json.

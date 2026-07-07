@@ -23,6 +23,8 @@ rt_table()   { uget rt_table 100; }
 lan_if()     { uget lan_if br-lan; }
 mark_out_hex()    { printf '0x%x' "$(uget mark_out 256)"; }
 mark_tproxy_hex() { printf '0x%x' "$(uget mark_tproxy 512)"; }
+udp_on()          { [ "$(uget tproxy_udp 0)" = "1" ]; }
+udp_ports()       { uget udp_ports 443; }
 
 # LAN devices with bypass_all=1: never enter xray at all (kernel-level bypass)
 bypass_dev_ips() {
@@ -41,6 +43,14 @@ render() {
 	devs=$(bypass_dev_ips)
 	# nft rejects an empty `elements = { }` — emit the line only when populated
 	[ -n "${devs# }" ] && delems="		elements = { $(echo $devs | tr ' ' ',') }"
+	# UDP/QUIC tproxy (opt-in, default off): tproxy needs an explicit l4proto
+	# match, so add SEPARATE udp sticky + new-flow rules for udp_ports
+	# (default 443). The tcp rules are left byte-for-byte untouched.
+	local udpsticky="" udpnew=""
+	if udp_on; then
+		udpsticky="		ct mark & $mt == $mt meta l4proto udp tproxy to :$port meta mark set mark or $mt accept"
+		udpnew="		ct state new meta l4proto udp udp dport { $(udp_ports | tr ' ' ',') } tproxy to :$port ct mark set ct mark or $mt meta mark set mark or $mt accept"
+	fi
 	cat <<EOF
 table ip xray_tproxy
 delete table ip xray_tproxy
@@ -66,8 +76,10 @@ $delems
 		tcp dport { 53, 853 } return
 		meta mark & $mo == $mo return
 		ct mark & $mt == $mt meta l4proto tcp tproxy to :$port meta mark set mark or $mt accept
+${udpsticky}
 		ct state established,related return
 		ct state new meta l4proto tcp tproxy to :$port ct mark set ct mark or $mt meta mark set mark or $mt accept
+${udpnew}
 	}
 	# Locally-generated traffic (router + xray itself). Every xray outbound
 	# carries SO_MARK $mo (streamSettings.sockopt.mark). Return for it here, at
@@ -193,13 +205,26 @@ case "$1" in
 		rul=0; ip rule list 2>/dev/null | grep -q "fwmark $(mark_tproxy_hex).* lookup $(rt_table)" && rul=1
 		en=0; fw_enabled && en=1
 		mg=0; rules_managed && mg=1
-		printf '{"enabled":%s,"managed":%s,"active":%s,"rule_present":%s,"port":%s,"port_listening":%s,"watchdog_running":%s}\n' \
-			"$en" "$mg" "$tbl" "$rul" "$(tproxy_port)" "$lst" "$wd"
+		udp=0; udp_on && udp=1
+		printf '{"enabled":%s,"managed":%s,"active":%s,"rule_present":%s,"port":%s,"port_listening":%s,"watchdog_running":%s,"udp":%s,"udp_ports":"%s"}\n' \
+			"$en" "$mg" "$tbl" "$rul" "$(tproxy_port)" "$lst" "$wd" "$udp" "$(udp_ports)"
 		;;
 	on)
 		uci set xray-monitor.fw.enabled='1'; uci commit xray-monitor; fw_sync; echo ok ;;
 	off)
 		uci set xray-monitor.fw.enabled='0'; uci commit xray-monitor; fw_sync; echo ok ;;
+	udp)
+		# Toggle QUIC (UDP udp_ports) tproxy: rewrite the inbound (tcp,udp +
+		# quic sniffing) via xray-rules apply, then re-render the nft table.
+		case "$2" in
+			on)  uci set xray-monitor.fw.tproxy_udp='1' ;;
+			off) uci set xray-monitor.fw.tproxy_udp='0' ;;
+			*)   echo "usage: xray-fw udp on|off"; exit 1 ;;
+		esac
+		uci commit xray-monitor
+		"$SHARE/xray-rules" apply >/dev/null 2>&1
+		fw_sync
+		echo "udp tproxy $2 (ports $(udp_ports))" ;;
 	*)
-		echo "usage: xray-fw up|down|sync|render|watch|status|on|off"; exit 1 ;;
+		echo "usage: xray-fw up|down|sync|render|watch|status|on|off|udp on|off"; exit 1 ;;
 esac

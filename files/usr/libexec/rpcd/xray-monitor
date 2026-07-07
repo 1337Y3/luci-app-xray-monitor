@@ -291,6 +291,7 @@ case "$1" in
 		json_add_object "rules_apply"; json_close_object
 		json_add_object "fw_get"; json_close_object
 		json_add_object "fw_set"; json_add_string "enabled" ""; json_close_object
+		json_add_object "fw_udp"; json_add_string "enabled" ""; json_close_object
 		json_add_object "dhcp_leases"; json_close_object
 		json_add_object "geodat_get"; json_close_object
 		json_add_object "geodat_update"; json_close_object
@@ -448,6 +449,19 @@ case "$1" in
 				case "$en" in
 					1|true)  msg=$("$FW" on 2>&1);  rc=$? ;;
 					0|false) msg=$("$FW" off 2>&1); rc=$? ;;
+					*) msg="invalid enabled value"; rc=1 ;;
+				esac
+				json_init
+				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+				json_add_string msg "$msg"
+				json_dump
+			;;
+			fw_udp)
+				input=$(cat)
+				en=$(echo "$input" | jsonfilter -e '@.enabled' 2>/dev/null)
+				case "$en" in
+					1|true)  msg=$("$FW" udp on 2>&1);  rc=$? ;;
+					0|false) msg=$("$FW" udp off 2>&1); rc=$? ;;
 					*) msg="invalid enabled value"; rc=1 ;;
 				esac
 				json_init

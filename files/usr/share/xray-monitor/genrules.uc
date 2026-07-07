@@ -40,7 +40,8 @@ let cfg = json(readfile(cfg_path));
 let fw = {
 	tproxy_port: int(uget('fw', 'tproxy_port', 1200)),
 	probe_port:  int(uget('fw', 'probe_port', 1201)),
-	mark_out:    int(uget('fw', 'mark_out', 256))
+	mark_out:    int(uget('fw', 'mark_out', 256)),
+	udp:         uget('fw', 'tproxy_udp', '0') == '1'
 };
 let globals = {
 	managed:          uget('rules', 'managed', '0') == '1',
@@ -200,8 +201,8 @@ managed_tags['tproxy-in'] = 1;
 
 push(new_in, {
 	tag: 'tproxy-in', protocol: 'dokodemo-door', listen: '0.0.0.0', port: fw.tproxy_port,
-	settings: { network: 'tcp', followRedirect: true },
-	sniffing: { enabled: true, destOverride: [ 'http', 'tls' ], routeOnly: true },
+	settings: { network: fw.udp ? 'tcp,udp' : 'tcp', followRedirect: true },
+	sniffing: { enabled: true, destOverride: fw.udp ? [ 'http', 'tls', 'quic' ] : [ 'http', 'tls' ], routeOnly: true },
 	streamSettings: { sockopt: { tproxy: 'tproxy' } }
 });
 // Loopback-only probe: the xray-fw watchdog curls through it to prove the

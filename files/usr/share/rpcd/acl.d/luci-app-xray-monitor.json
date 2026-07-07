@@ -8,7 +8,7 @@
 		},
 		"write": {
 			"ubus": {
-				"xray-monitor": [ "reset", "probe_set", "sub_fetch", "sub_apply", "sub_setcfg", "sub_add", "sub_del", "sub_edit", "routing_set", "lists_set", "devices_set", "georules_set", "rules_apply", "fw_set", "geodat_update", "geodat_setcfg", "geodat_rollback", "balancers_set", "enable_api", "config_save", "update_apply" ]
+				"xray-monitor": [ "reset", "probe_set", "sub_fetch", "sub_apply", "sub_setcfg", "sub_add", "sub_del", "sub_edit", "routing_set", "lists_set", "devices_set", "georules_set", "rules_apply", "fw_set", "fw_udp", "geodat_update", "geodat_setcfg", "geodat_rollback", "balancers_set", "enable_api", "config_save", "update_apply" ]
 			},
 			"uci": [ "xray-monitor" ]
 		}

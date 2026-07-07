@@ -23,6 +23,8 @@ uci -q get xray-monitor.fw.mark_out    >/dev/null || uci set xray-monitor.fw.mar
 uci -q get xray-monitor.fw.mark_tproxy >/dev/null || uci set xray-monitor.fw.mark_tproxy='512'
 uci -q get xray-monitor.fw.rt_table    >/dev/null || uci set xray-monitor.fw.rt_table='100'
 uci -q get xray-monitor.fw.lan_if      >/dev/null || uci set xray-monitor.fw.lan_if='br-lan'
+uci -q get xray-monitor.fw.tproxy_udp  >/dev/null || uci set xray-monitor.fw.tproxy_udp='0'
+uci -q get xray-monitor.fw.udp_ports   >/dev/null || uci set xray-monitor.fw.udp_ports='443'
 seed rules routing
 uci -q get xray-monitor.rules.managed          >/dev/null || uci set xray-monitor.rules.managed='0'
 uci -q get xray-monitor.rules.default_exit     >/dev/null || uci set xray-monitor.rules.default_exit='direct'
