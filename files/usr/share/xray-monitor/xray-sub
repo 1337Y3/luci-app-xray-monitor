@@ -228,8 +228,24 @@ case "$1" in
 			curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { rm -f "$tmp"; echo "download failed"; exit 1; }
 			tar -tzf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "downloaded file is not a valid package (feed may be updating)"; exit 1; }
 		fi
+		# Refuse to go backwards: an older build ignores a newer rules.mode and
+		# would regenerate the default routing model on the next apply, blackholing
+		# a config that depends on the newer one.
+		d=$(mktemp -d)
+		new=""
+		if tar -xzf "$tmp" -C "$d" 2>/dev/null && tar -xzf "$d/control.tar.gz" -C "$d" 2>/dev/null; then
+			new=$(sed -n 's/^Version: //p' "$d/control" 2>/dev/null | head -n1)
+		fi
+		rm -rf "$d"
+		cur=$(opkg status luci-app-xray-monitor 2>/dev/null | sed -n 's/^Version: //p' | head -n1)
+		if [ -n "$cur" ] && [ -n "$new" ] && ! opkg compare-versions "$new" '>=' "$cur" 2>/dev/null; then
+			rm -f "$tmp"
+			echo "refusing to downgrade: installed $cur, offered $new"
+			exit 1
+		fi
 		# plain install = in-place upgrade (prerm runs with "upgrade", keeps state);
-		# --force-reinstall would run prerm "remove" and wipe /etc/xray-monitor.
+		# --force-reinstall would run prerm "remove", wipe /etc/xray-monitor AND drop
+		# the uci conffile (routing mode + inbound sections).
 		opkg install "$tmp"; rc=$?
 		rm -f "$tmp"
 		[ "$rc" -eq 0 ] && echo "updated" || { echo "opkg install failed"; exit 1; }

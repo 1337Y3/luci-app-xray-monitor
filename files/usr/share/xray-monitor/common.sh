@@ -77,6 +77,36 @@ managed_ports_up() {
 	return 0
 }
 
+# Mirror the routing state OUTSIDE the uci conffile.
+#
+# /etc/config/xray-monitor is a conffile, so a normal `opkg install` upgrade
+# keeps it — but `opkg install --force-reinstall` does remove-then-install and
+# drops conffiles, which would silently reset the mode and delete every inbound
+# section (the LAN would then be steered to tproxy ports xray no longer binds).
+# /etc/xray-monitor survives that (prerm keeps it on purpose), so snapshot the
+# routing bits here after every successful change; postinst restores them if the
+# conffile came back empty.
+ROUTING_STATE="$STATE/routing.state"
+
+save_routing_state() {
+	local sid n p e en o
+	{
+		echo "# luci-app-xray-monitor routing state — auto-generated."
+		echo "# Restored by postinst if /etc/config/xray-monitor is reset by a reinstall."
+		echo "managed=$(uci -q get xray-monitor.rules.managed 2>/dev/null)"
+		echo "mode=$(rules_mode)"
+		for sid in $(inbound_sids); do
+			n=$(uci -q get "xray-monitor.$sid.name")
+			p=$(uci -q get "xray-monitor.$sid.port")
+			e=$(uci -q get "xray-monitor.$sid.exit")
+			en=$(uci -q get "xray-monitor.$sid.enabled")
+			o=$(uci -q get "xray-monitor.$sid.order")
+			[ -n "$n" ] && [ -n "$p" ] || continue
+			echo "inbound=$n|$p|$e|${en:-1}|${o:-100}"
+		done
+	} > "$ROUTING_STATE.tmp" 2>/dev/null && mv "$ROUTING_STATE.tmp" "$ROUTING_STATE"
+}
+
 # One writer at a time across xray-sub apply / xray-rules apply / xray-geodat
 # update / config-save: their backup->test->mv->restart->verify sections race
 # otherwise (one caller's verify can "roll back" another's healthy restart).

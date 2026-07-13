@@ -46,6 +46,8 @@ gen_apply() {
 		[ "$i" -gt 0 ] && uci commit xray-monitor
 		warn=$(echo "$out" | jsonfilter -e '@.warnings[*]' 2>/dev/null | sed 's/^/warning: /')
 		[ -n "$warn" ] && echo "$warn"
+		# snapshot the routing state so a conffile-dropping reinstall can restore it
+		save_routing_state
 		echo ok
 	else
 		echo "xray failed health check after apply - rolled back"
@@ -69,6 +71,7 @@ case "$1" in
 		else
 			# pre-migration: state persisted, nothing touches xray yet
 			"$0" dns-sync >/dev/null 2>&1
+			save_routing_state
 			echo "saved (managed routing is off - not applied to xray)"
 		fi
 		;;

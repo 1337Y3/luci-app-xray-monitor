@@ -42,6 +42,62 @@ uci -q get xray-monitor.geodat.cron_schedule >/dev/null || uci set xray-monitor.
 uci -q get xray-monitor.geodat.source_url    >/dev/null || uci set xray-monitor.geodat.source_url='https://raw.githubusercontent.com/runetfreedom/russia-v2ray-rules-dat/release'
 uci commit xray-monitor
 
+# ---------------------------------------------------------------------------
+# Restore routing state that a conffile-dropping reinstall would have lost.
+#
+# /etc/config/xray-monitor is a conffile: a plain `opkg install` upgrade keeps
+# it, but `opkg install --force-reinstall` removes-then-installs and replaces it
+# with the shipped default. That silently resets rules.mode to 'lists' and
+# deletes every 'inbound' section — in inbounds mode the LAN keeps being steered
+# to tproxy ports that xray would no longer bind, i.e. a total blackhole of every
+# proxied domain. /etc/xray-monitor survives (prerm keeps it), so xray-rules
+# mirrors the routing bits to routing.state after every successful change.
+# Only ever ADDS what is missing; never overwrites a live config.
+# ---------------------------------------------------------------------------
+RSTATE=/etc/xray-monitor/routing.state
+if [ -f "$RSTATE" ]; then
+	have_inbounds=$(uci -q show xray-monitor 2>/dev/null | grep -c '=inbound$')
+	want_mode=$(sed -n 's/^mode=//p' "$RSTATE" | head -n1)
+	want_managed=$(sed -n 's/^managed=//p' "$RSTATE" | head -n1)
+	want_inbounds=$(grep -c '^inbound=' "$RSTATE" 2>/dev/null)
+
+	# the conffile lost the inbound sections but we know we had some -> restore
+	if [ "${have_inbounds:-0}" -eq 0 ] && [ "${want_inbounds:-0}" -gt 0 ]; then
+		logger -t xray-monitor "uci conffile was reset by this install - restoring routing state from $RSTATE"
+		echo "luci-app-xray-monitor: restoring $want_inbounds inbound(s) + mode='$want_mode' from $RSTATE"
+		grep '^inbound=' "$RSTATE" | while IFS= read -r line; do
+			line=${line#inbound=}
+			n=$(echo "$line" | cut -d'|' -f1); p=$(echo "$line" | cut -d'|' -f2)
+			e=$(echo "$line" | cut -d'|' -f3); en=$(echo "$line" | cut -d'|' -f4)
+			o=$(echo "$line" | cut -d'|' -f5)
+			[ -n "$n" ] && [ -n "$p" ] || continue
+			sid=$(uci add xray-monitor inbound)
+			uci set "xray-monitor.$sid.name=$n"
+			uci set "xray-monitor.$sid.port=$p"
+			uci set "xray-monitor.$sid.exit=$e"
+			uci set "xray-monitor.$sid.enabled=${en:-1}"
+			uci set "xray-monitor.$sid.order=${o:-100}"
+		done
+		[ -n "$want_mode" ]    && uci set "xray-monitor.rules.mode=$want_mode"
+		[ -n "$want_managed" ] && uci set "xray-monitor.rules.managed=$want_managed"
+		uci commit xray-monitor
+	fi
+fi
+
+# Refuse to run a routing mode this build does not implement: an older genrules
+# silently ignores rules.mode and would regenerate the single-tproxy 'lists'
+# config on the next apply (nightly sub-fetch), blackholing an inbounds setup.
+# Fail closed - managed=0 leaves the working config.json alone.
+cur_mode=$(uci -q get xray-monitor.rules.mode)
+if [ -n "$cur_mode" ] && ! grep -q "'$cur_mode'" /usr/share/xray-monitor/genrules.uc 2>/dev/null; then
+	logger -t xray-monitor "installed build does not support rules.mode='$cur_mode' - setting managed=0 (config.json left untouched)"
+	echo "luci-app-xray-monitor: WARNING this build does not support routing mode '$cur_mode'."
+	echo "  Managed routing disabled (managed=0) so your working config.json is not rewritten."
+	echo "  Install a build that supports it, then set: uci set xray-monitor.rules.managed=1"
+	uci set xray-monitor.rules.managed='0'
+	uci commit xray-monitor
+fi
+
 # Migrate a pre-multi-sub single URL (xray-monitor.sub.url) into a 'subscription'
 # section with prefix 'proxy' (keeps existing tags/routing). Runs once.
 if [ -z "$(uci show xray-monitor 2>/dev/null | grep '=subscription')" ]; then
@@ -63,12 +119,23 @@ fi
 # geodata auto-update cron (own marker; no-op line unless enabled)
 /usr/share/xray-monitor/xray-geodat cron-sync >/dev/null 2>&1
 
-# tproxy watchdog service: enable + restart (restart, not start, so an upgrade
-# reloads the watch loop onto the new script instead of running the old one).
-# The watchdog keeps rules DOWN until fw.enabled=1 AND xray is listening, so
-# enabling it here is inert until migration turns the firewall on.
-/etc/init.d/xray-tproxy enable 2>/dev/null
-/etc/init.d/xray-tproxy restart 2>/dev/null
+# tproxy watchdog service. In 'inbounds' mode an external steerer (ruantiblock)
+# owns the nft tproxy table and the policy route — our watchdog has nothing to
+# manage there, and enabling it would only fight for the same packets if
+# fw.enabled were ever flipped. Converge to the configured mode instead of
+# blindly re-enabling it on every upgrade.
+if [ "$(uci -q get xray-monitor.rules.mode)" = "inbounds" ]; then
+	/etc/init.d/xray-tproxy stop 2>/dev/null
+	/etc/init.d/xray-tproxy disable 2>/dev/null
+	/usr/share/xray-monitor/xray-fw down 2>/dev/null
+else
+	# enable + restart (restart, not start, so an upgrade reloads the watch loop
+	# onto the new script instead of running the old one). The watchdog keeps
+	# rules DOWN until fw.enabled=1 AND xray is listening, so enabling it here is
+	# inert until migration turns the firewall on.
+	/etc/init.d/xray-tproxy enable 2>/dev/null
+	/etc/init.d/xray-tproxy restart 2>/dev/null
+fi
 
 # Auto-enable the Xray Stats API (idempotent, path-aware, logged).
 # Result also visible later via:  logread | grep xray-monitor
