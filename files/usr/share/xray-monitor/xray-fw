@@ -136,8 +136,17 @@ fw_down() {
 }
 
 # Raise rules only when it is safe: fw enabled AND xray listening on the
-# tproxy port AND managed routing on (the inbound exists). Anything else: down.
+# tproxy port AND managed routing on (the inbound exists) AND we are in 'lists'
+# mode. In 'inbounds' mode an external steerer (ruantiblock) owns the nft table
+# and the policy route — raising ours too would double-tproxy the LAN.
 fw_sync() {
+	if [ "$(rules_mode)" = "inbounds" ]; then
+		if table_up; then
+			logger -t xray-fw "routing mode is 'inbounds' (external steerer owns tproxy) - removing our tproxy rules"
+		fi
+		fw_down
+		return
+	fi
 	if fw_enabled && rules_managed && port_listening "$(tproxy_port)"; then
 		fw_up
 	else
@@ -208,10 +217,15 @@ case "$1" in
 		mg=0; rules_managed && mg=1
 		udp=0; udp_on && udp=1
 		res=0; resolve_on && res=1
-		printf '{"enabled":%s,"managed":%s,"active":%s,"rule_present":%s,"port":%s,"port_listening":%s,"watchdog_running":%s,"udp":%s,"udp_ports":"%s","resolve":%s}\n' \
-			"$en" "$mg" "$tbl" "$rul" "$(tproxy_port)" "$lst" "$wd" "$udp" "$(udp_ports)" "$res"
+		printf '{"enabled":%s,"managed":%s,"mode":"%s","active":%s,"rule_present":%s,"port":%s,"port_listening":%s,"watchdog_running":%s,"udp":%s,"udp_ports":"%s","resolve":%s}\n' \
+			"$en" "$mg" "$(rules_mode)" "$tbl" "$rul" "$(tproxy_port)" "$lst" "$wd" "$udp" "$(udp_ports)" "$res"
 		;;
 	on)
+		if [ "$(rules_mode)" = "inbounds" ]; then
+			echo "refusing: routing mode is 'inbounds' - ruantiblock owns the tproxy rules." >&2
+			echo "Switch the mode to 'lists' first (Xray Monitor -> Inbounds)." >&2
+			exit 1
+		fi
 		uci set xray-monitor.fw.enabled='1'; uci commit xray-monitor; fw_sync; echo ok ;;
 	off)
 		uci set xray-monitor.fw.enabled='0'; uci commit xray-monitor; fw_sync; echo ok ;;

@@ -2,9 +2,10 @@
 // Validate UI payloads and persist them as UCI state + per-list entry files.
 // The counterpart reader is genrules.uc; this script never touches config.json.
 //   rulescfg.uc lists    <payload.json>   [{name,exit,dns,enabled,order,entries}]
+//   rulescfg.uc inbounds <payload.json>   [{name,port,exit,enabled,order}]
 //   rulescfg.uc devices  <payload.json>   [{name,ip,bypass_all,bypass[],enabled}]
 //   rulescfg.uc georules <payload.json>   [{name,enabled,order,domain[],ip[],source[],network,exit}]
-//   rulescfg.uc globals  <payload.json>   {default_exit,registry_enabled,registry_exit,
+//   rulescfg.uc globals  <payload.json>   {mode,default_exit,registry_enabled,registry_exit,
 //                                          registry_geosite,registry_geoip,tproxy_port}
 // Replaces ALL sections of the type with the payload (the UI always sends the
 // full set). Prints "ok" on success, die()s with a message on invalid input.
@@ -120,6 +121,30 @@ else if (action == 'devices') {
 	ctx.commit(XM);
 	print("ok\n");
 }
+else if (action == 'inbounds') {
+	if (type(payload) != 'array') die('payload must be an array');
+	let seen = {}, seenp = {};
+	for (let ib in payload) {
+		if (!valid_name(s(ib.name))) die("invalid inbound name: '" + s(ib.name) + "'");
+		if (seen[ib.name]) die('duplicate inbound name: ' + ib.name);
+		seen[ib.name] = 1;
+		if (!valid_port(ib.port)) die("inbound '" + ib.name + "': invalid port '" + s(ib.port) + "'");
+		if (seenp[int(ib.port)]) die('duplicate inbound port: ' + ib.port);
+		seenp[int(ib.port)] = 1;
+		if (!length(s(ib.exit))) die("inbound '" + ib.name + "': empty exit");
+	}
+	wipe_sections('inbound');
+	for (let ib in payload) {
+		let sid = ctx.add(XM, 'inbound');
+		ctx.set(XM, sid, 'name', s(ib.name));
+		ctx.set(XM, sid, 'port', s(int(ib.port)));
+		ctx.set(XM, sid, 'exit', s(ib.exit));
+		ctx.set(XM, sid, 'enabled', b(ib.enabled));
+		ctx.set(XM, sid, 'order', s(int(ib.order ?? 100)));
+	}
+	ctx.commit(XM);
+	print("ok\n");
+}
 else if (action == 'georules') {
 	if (type(payload) != 'array') die('payload must be an array');
 	let seen = {};
@@ -151,9 +176,13 @@ else if (action == 'globals') {
 	if (type(payload) != 'object') die('payload must be an object');
 	if (payload.tproxy_port != null && !valid_port(payload.tproxy_port))
 		die('invalid tproxy_port');
+	if (payload.mode != null && !(s(payload.mode) in [ 'lists', 'inbounds' ]))
+		die("mode must be 'lists' or 'inbounds'");
 	// sections are seeded by postinst; tolerate a wiped config anyway
 	if (ctx.get(XM, 'rules') == null) ctx.set(XM, 'rules', 'routing');
 	if (ctx.get(XM, 'fw') == null) ctx.set(XM, 'fw', 'fw');
+	if (payload.mode != null && length(s(payload.mode)))
+		ctx.set(XM, 'rules', 'mode', s(payload.mode));
 	if (payload.default_exit != null && length(s(payload.default_exit)))
 		ctx.set(XM, 'rules', 'default_exit', s(payload.default_exit));
 	if (payload.registry_enabled != null)
@@ -170,5 +199,5 @@ else if (action == 'globals') {
 	print("ok\n");
 }
 else {
-	die('usage: rulescfg.uc lists|devices|georules|globals <payload.json>');
+	die('usage: rulescfg.uc lists|inbounds|devices|georules|globals <payload.json>');
 }

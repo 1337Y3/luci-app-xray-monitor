@@ -37,6 +37,16 @@ config fw 'fw'
 # managed=0 = master gate: genrules/xray-rules refuse to touch config.json.
 config routing 'rules'
 	option managed '0'
+	# Routing model:
+	#   lists    - xray-native: ONE tproxy inbound (fw.tproxy_port) + domain/geo
+	#              rules built from the list/device/georule sections. xray-fw owns
+	#              the nft tproxy table.
+	#   inbounds - an external steerer (ruantiblock) decides WHAT to proxy by
+	#              destination IP and tproxies each of its lists to its own port;
+	#              xray is then a pure inboundTag->outboundTag map built from the
+	#              'inbound' sections below. No domain rules, no default rule, and
+	#              xray-fw stays DOWN (ruantiblock owns the nft table).
+	option mode 'lists'
 	option default_exit 'direct'
 	# RKN-registry replacement: geosite/geoip rules -> registry_exit.
 	# Ships disabled; opt-in via 'migrate-ruantiblock enable-registry' (downloads geodata).
@@ -44,6 +54,17 @@ config routing 'rules'
 	option registry_exit 'balancer-default'
 	option registry_geosite 'ru-blocked'
 	option registry_geoip 'ru-blocked'
+
+# One per external-steerer tproxy port (mode='inbounds' only). `port` MUST equal
+# that ruantiblock list's u_t_proxy_port_tcp; `exit` is any outbound or balancer
+# tag from config.json. Managed from LuCI: Xray Monitor -> Inbounds.
+#
+# config inbound
+#	option name 'de'                  # -> xray inbound tag "tproxy-in-de"
+#	option port '1100'                # ruantiblock list1 u_t_proxy_port_tcp
+#	option exit 'balancer-default'
+#	option enabled '1'
+#	option order '10'
 
 # geoip.dat/geosite.dat auto-update (runetfreedom by default).
 # cron ships OFF: an update restarts xray, so nothing is scheduled until the

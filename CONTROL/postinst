@@ -28,6 +28,8 @@ uci -q get xray-monitor.fw.udp_ports   >/dev/null || uci set xray-monitor.fw.udp
 uci -q get xray-monitor.fw.resolve_exit >/dev/null || uci set xray-monitor.fw.resolve_exit='0'
 seed rules routing
 uci -q get xray-monitor.rules.managed          >/dev/null || uci set xray-monitor.rules.managed='0'
+# 'lists' keeps every existing install on the v1.18 model it already runs
+uci -q get xray-monitor.rules.mode             >/dev/null || uci set xray-monitor.rules.mode='lists'
 uci -q get xray-monitor.rules.default_exit     >/dev/null || uci set xray-monitor.rules.default_exit='direct'
 uci -q get xray-monitor.rules.registry_enabled >/dev/null || uci set xray-monitor.rules.registry_enabled='0'
 uci -q get xray-monitor.rules.registry_exit    >/dev/null || uci set xray-monitor.rules.registry_exit='balancer-default'

@@ -6,9 +6,18 @@
 //   genrules.uc get <config.json>            -> JSON payload for the UI views
 //   genrules.uc set <config.json> <out-path> -> rewritten config + {"ok":true,"warnings":[...]}
 //
+// Two routing modes (uci xray-monitor.rules.mode):
+//   lists    - xray-native (default): ONE tproxy inbound on fw.tproxy_port and
+//              domain/geo rules generated from the lists/devices/georules.
+//   inbounds - an external steerer (ruantiblock) decides WHAT to proxy by
+//              destination IP and tproxies it to a port per list; xray is then a
+//              pure inboundTag->outboundTag map with one tproxy inbound per
+//              `inbound` section, no domain rules and no default rule. xray-fw
+//              must stay down (ruantiblock owns the nft table).
+//
 // Managed artifacts are identified by ruleTag prefix "xm:" (rules), tag
-// "tproxy-in" (single tproxy inbound) and tag "xm-probe" (watchdog probe
-// inbound); everything else in the config is preserved verbatim.
+// "tproxy-in" / "tproxy-in-<name>" (tproxy inbounds) and tag "xm-probe"
+// (watchdog probe inbound); everything else in the config is preserved verbatim.
 // `set` is a hard error unless uci xray-monitor.rules.managed == '1' — this is
 // the master gate that keeps the package inert until migration flips it, and
 // makes rollback one-step-durable (clearing it disables the nightly re-gen).
@@ -46,6 +55,11 @@ let fw = {
 };
 let globals = {
 	managed:          uget('rules', 'managed', '0') == '1',
+	// 'lists'    - xray-native: one tproxy inbound + domain/geo rules (v1.18 model)
+	// 'inbounds' - ruantiblock owns the steering (dst-IP nftset -> fwmark -> its own
+	//              tproxy port per list); xray is a pure inboundTag->outboundTag map.
+	//              No domain/geo rules, no default rule, xray-fw stays down.
+	mode:             uget('rules', 'mode', 'lists'),
 	default_exit:     uget('rules', 'default_exit', 'direct'),
 	registry_enabled: uget('rules', 'registry_enabled', '0') == '1',
 	registry_exit:    uget('rules', 'registry_exit', 'direct'),
@@ -68,6 +82,19 @@ ctx.foreach('xray-monitor', 'list', function(s) {
 	});
 });
 sort(lists, by_order);
+
+// inbounds mode: one tproxy inbound per section, each pinned to one exit.
+// `port` must match the tproxy port the external steerer (ruantiblock's
+// u_t_proxy_port_tcp) sends that list to.
+let inbounds = [];
+ctx.foreach('xray-monitor', 'inbound', function(s) {
+	push(inbounds, {
+		name: s.name ?? '', port: int(s.port ?? 0), exit: s.exit ?? 'direct',
+		enabled: (s.enabled ?? '1') == '1', order: int(s.order ?? 100),
+		_sid: s['.name']
+	});
+});
+sort(inbounds, by_order);
 
 let devices = [];
 ctx.foreach('xray-monitor', 'device', function(s) {
@@ -154,6 +181,14 @@ if (action == 'get') {
 			counts: { domain: length(e.domains), ip: length(e.ips) }
 		});
 	}
+	for (let ib in inbounds)
+		if (ib.enabled && !known[ib.exit])
+			push(warnings, sprintf("inbound '%s': exit '%s' missing (would fall back)", ib.name, ib.exit));
+	if (globals.mode == 'inbounds') {
+		let n = 0;
+		for (let ib in inbounds) if (ib.enabled) n++;
+		if (!n) push(warnings, 'routing mode is "inbounds" but no inbound is enabled — nothing would be proxied');
+	}
 	for (let g in georules)
 		if (g.enabled && !known[g.exit])
 			push(warnings, sprintf("georule '%s': exit '%s' missing (would fall back)", g.name, g.exit));
@@ -168,13 +203,14 @@ if (action == 'get') {
 	for (let t in keys(known)) push(exits, { tag: t, kind: known[t] });
 
 	printf('%J\n', {
-		managed: globals.managed,
+		managed: globals.managed, mode: globals.mode,
 		tproxy_port: fw.tproxy_port, probe_port: fw.probe_port,
 		default_exit: globals.default_exit,
 		registry: {
 			enabled: globals.registry_enabled, exit: globals.registry_exit,
 			geosite: globals.registry_geosite, geoip: globals.registry_geoip
 		},
+		inbounds: inbounds,
 		lists: out_lists, devices: devices, georules: georules,
 		exits: exits, geodata_present: geodata_present(), warnings: warnings
 	});
@@ -200,23 +236,62 @@ for (let i = 0; i < length(ins); i++) {
 }
 managed_tags['tproxy-in'] = 1;
 
-push(new_in, {
-	tag: 'tproxy-in', protocol: 'dokodemo-door', listen: '0.0.0.0', port: fw.tproxy_port,
-	settings: { network: fw.udp ? 'tcp,udp' : 'tcp', followRedirect: true },
-	// routeOnly:true = route by sniffed SNI but dial the ORIGINAL client IP
-	// (trusts client DNS). resolve_exit=1 flips it to false so the sniffed
-	// domain OVERRIDES the dst: proxy exits carry the domain to the VPS
-	// (remote resolve, immune to client-side poisoning + exit-correct CDN geo);
-	// direct exits re-resolve via the router's DoH. Caveat: ECH/fronting.
-	sniffing: { enabled: true, destOverride: fw.udp ? [ 'http', 'tls', 'quic' ] : [ 'http', 'tls' ], routeOnly: !fw.resolve_exit },
-	streamSettings: { sockopt: { tproxy: 'tproxy' } }
-});
-// Loopback-only probe: the xray-fw watchdog curls through it to prove the
-// data plane (dispatcher + freedom outbound) end-to-end, not just a bound port.
-push(new_in, {
-	tag: 'xm-probe', protocol: 'dokodemo-door', listen: '127.0.0.1', port: fw.probe_port,
-	settings: { address: 'www.gstatic.com', port: 80, network: 'tcp' }
-});
+// active inbound sections (inbounds mode only), validated up front
+let act_in = [];
+if (globals.mode == 'inbounds') {
+	let seen_name = {}, seen_port = {};
+	for (let ib in inbounds) {
+		if (!ib.enabled) continue;
+		if (!length(ib.name)) die('inbound section with an empty name');
+		if (seen_name[ib.name]) die('duplicate inbound name: ' + ib.name);
+		if (seen_port[ib.port]) die('duplicate inbound port: ' + ib.port);
+		if (ib.port < 1 || ib.port > 65535) die("inbound '" + ib.name + "': invalid port " + ib.port);
+		seen_name[ib.name] = 1; seen_port[ib.port] = 1;
+		push(act_in, ib);
+	}
+	// A config with no tproxy inbound would silently un-proxy the whole LAN and
+	// still pass `xray -test` — refuse rather than write it.
+	if (!length(act_in))
+		die('routing mode is "inbounds" but no inbound is enabled — refusing to write a config with no tproxy inbound');
+}
+
+if (globals.mode == 'inbounds') {
+	// One tproxy inbound per section. The steerer (ruantiblock) already decided
+	// WHAT to proxy by destination IP, so routing never consults a sniffed
+	// domain — no sniff-miss can leak a connection to `direct` here.
+	// destOverride without routeOnly = the sniffed SNI replaces the dst, so proxy
+	// exits carry the DOMAIN to the VPS (remote resolve). This is the shape the
+	// pre-v1.18 config ran for months; keep it byte-identical.
+	for (let ib in act_in) {
+		let tag = 'tproxy-in-' + ib.name;
+		managed_tags[tag] = 1;
+		push(new_in, {
+			tag: tag, protocol: 'dokodemo-door', listen: '0.0.0.0', port: ib.port,
+			settings: { network: 'tcp,udp', followRedirect: true },
+			sniffing: { enabled: true, destOverride: [ 'http', 'tls' ] },
+			streamSettings: { sockopt: { tproxy: 'tproxy' } }
+		});
+	}
+} else {
+	push(new_in, {
+		tag: 'tproxy-in', protocol: 'dokodemo-door', listen: '0.0.0.0', port: fw.tproxy_port,
+		settings: { network: fw.udp ? 'tcp,udp' : 'tcp', followRedirect: true },
+		// routeOnly:true = route by sniffed SNI but dial the ORIGINAL client IP
+		// (trusts client DNS). resolve_exit=1 flips it to false so the sniffed
+		// domain OVERRIDES the dst: proxy exits carry the domain to the VPS
+		// (remote resolve, immune to client-side poisoning + exit-correct CDN geo);
+		// direct exits re-resolve via the router's DoH. Caveat: ECH/fronting.
+		sniffing: { enabled: true, destOverride: fw.udp ? [ 'http', 'tls', 'quic' ] : [ 'http', 'tls' ], routeOnly: !fw.resolve_exit },
+		streamSettings: { sockopt: { tproxy: 'tproxy' } }
+	});
+	// Loopback-only probe: the xray-fw watchdog curls through it to prove the
+	// data plane (dispatcher + freedom outbound) end-to-end, not just a bound port.
+	// It exists only for xray-fw, which is down in inbounds mode.
+	push(new_in, {
+		tag: 'xm-probe', protocol: 'dokodemo-door', listen: '127.0.0.1', port: fw.probe_port,
+		settings: { address: 'www.gstatic.com', port: 80, network: 'tcp' }
+	});
+}
 cfg.inbounds = new_in;
 
 // -- outbounds: sockopt.mark on everything that dials out (loop prevention —
@@ -286,6 +361,30 @@ function mk_rule(tag, exit_tag, fields) {
 }
 
 let managed = [];
+
+// ---- inbounds mode: a pure inboundTag -> exit map, nothing else ----------
+if (globals.mode == 'inbounds') {
+	for (let ib in act_in) {
+		let ex = resolve_exit(ib.exit, "inbound '" + ib.name + "'",
+			{ section: ib._sid, option: 'exit' });
+		let r = { type: 'field', inboundTag: [ 'tproxy-in-' + ib.name ],
+		          ruleTag: 'xm:in:' + ib.name };
+		if (known[ex] == 'balancer') r.balancerTag = ex; else r.outboundTag = ex;
+		push(managed, r);
+	}
+	// No xm:default: every packet that reaches a tproxy inbound was put there by
+	// the steerer and belongs to that inbound's exit. Traffic it did NOT steer
+	// never enters xray at all, so it needs no rule (and a catch-all would be a
+	// lie about what is proxied).
+	if (!cfg.routing) cfg.routing = {};
+	for (let r in managed) push(kept, r);
+	cfg.routing.rules = kept;
+	writefile(out_path, sprintf('%.2J', cfg));
+	printf('%J\n', { ok: true, warnings: warnings, remaps: remaps });
+	exit(0);
+}
+
+// ---- lists mode ----------------------------------------------------------
 
 // probe first: must always exit direct
 push(managed, { type: 'field', inboundTag: [ 'xm-probe' ], ruleTag: 'xm:probe', outboundTag: 'direct' });

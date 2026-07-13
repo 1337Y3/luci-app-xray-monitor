@@ -281,9 +281,11 @@ case "$1" in
 		json_add_object "rules_get"; json_close_object
 		json_add_object "list_entries"; json_add_string "name" ""; json_close_object
 		json_add_object "lists_set"; json_add_array "lists"; json_close_array; json_close_object
+		json_add_object "inbounds_set"; json_add_array "inbounds"; json_close_array; json_close_object
 		json_add_object "devices_set"; json_add_array "devices"; json_close_array; json_close_object
 		json_add_object "georules_set"; json_add_array "rules"; json_close_array; json_close_object
 		json_add_object "routing_set"
+			json_add_string "mode" ""
 			json_add_string "default_exit" ""; json_add_string "registry_enabled" ""
 			json_add_string "registry_exit" ""; json_add_string "registry_geosite" ""
 			json_add_string "registry_geoip" ""; json_add_string "tproxy_port" ""
@@ -399,11 +401,12 @@ case "$1" in
 				fi
 				json_dump
 			;;
-			lists_set|devices_set|georules_set)
+			lists_set|inbounds_set|devices_set|georules_set)
 				case "$2" in
-					lists_set)    key='@.lists';   cmd=lists-set ;;
-					devices_set)  key='@.devices'; cmd=devices-set ;;
-					georules_set) key='@.rules';   cmd=georules-set ;;
+					lists_set)    key='@.lists';    cmd=lists-set ;;
+					inbounds_set) key='@.inbounds'; cmd=inbounds-set ;;
+					devices_set)  key='@.devices';  cmd=devices-set ;;
+					georules_set) key='@.rules';    cmd=georules-set ;;
 				esac
 				input=$(cat)
 				f=$(mktemp)
@@ -419,6 +422,7 @@ case "$1" in
 				input=$(cat)
 				f=$(mktemp)
 				json_init
+				v=$(echo "$input" | jsonfilter -e '@.mode' 2>/dev/null);             [ -n "$v" ] && json_add_string mode "$v"
 				v=$(echo "$input" | jsonfilter -e '@.default_exit' 2>/dev/null);     [ -n "$v" ] && json_add_string default_exit "$v"
 				v=$(echo "$input" | jsonfilter -e '@.registry_enabled' 2>/dev/null); [ -n "$v" ] && json_add_string registry_enabled "$v"
 				v=$(echo "$input" | jsonfilter -e '@.registry_exit' 2>/dev/null);    [ -n "$v" ] && json_add_string registry_exit "$v"

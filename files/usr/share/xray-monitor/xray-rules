@@ -2,7 +2,7 @@
 # Managed-routing orchestrator for luci-app-xray-monitor.
 #   get                          -> genrules.uc get (payload for the UI)
 #   apply                        -> regenerate managed block, test, restart, verify
-#   lists-set|devices-set|georules-set|globals-set <payload.json>
+#   lists-set|inbounds-set|devices-set|georules-set|globals-set <payload.json>
 #                                -> persist UCI/files, then apply (if managed)
 #   dns-sync                     -> regenerate dnsmasq serversfile, HUP on change
 . /usr/share/xray-monitor/common.sh
@@ -60,7 +60,7 @@ case "$1" in
 	apply)
 		gen_apply
 		;;
-	lists-set|devices-set|georules-set|globals-set)
+	lists-set|inbounds-set|devices-set|georules-set|globals-set)
 		[ -s "$2" ] || { echo "no input"; exit 1; }
 		sub="${1%-set}"
 		msg=$("$SHARE/rulescfg.uc" "$sub" "$2" 2>&1) || { echo "$msg"; exit 1; }
@@ -82,7 +82,7 @@ case "$1" in
 		echo ok
 		;;
 	*)
-		echo "usage: xray-rules get|apply|lists-set <f>|devices-set <f>|georules-set <f>|globals-set <f>|dns-sync"
+		echo "usage: xray-rules get|apply|lists-set <f>|inbounds-set <f>|devices-set <f>|georules-set <f>|globals-set <f>|dns-sync"
 		exit 1
 		;;
 esac

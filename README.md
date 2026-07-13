@@ -240,11 +240,49 @@ Pure data package (`Architecture: all`), so the SDK isn't required.
 | `/etc/init.d/xray-tproxy` | procd service running the tproxy watchdog |
 | `/etc/config/xray-monitor` | UCI config (sub, fw, rules, geodat) — conffile |
 
-## Routing into xray & migrating from ruantiblock
+## Routing modes
 
-By default the app only reads/edits routing you set up yourself. To have it own
-routing — tproxy **all LAN TCP** into xray and drive it from the Lists/Devices/
-Routing pages — enable *managed routing*. If you currently split traffic with
+Managed routing (`uci xray-monitor.rules.managed=1`) can generate either of two
+models, selected by `uci xray-monitor.rules.mode`:
+
+| mode | who decides **what** is proxied | who decides **where** it exits | xray config |
+|---|---|---|---|
+| `lists` *(default)* | xray, by domain/geo rules from the **Lists** page | the list's exit | ONE tproxy inbound (`fw.tproxy_port`) + `xm:*` domain rules; **xray-fw** owns the nft table |
+| `inbounds` | an **external steerer** (ruantiblock), by destination IP | the inbound's exit | one tproxy inbound **per steerer port** + a pure `inboundTag → outboundTag` map; **no domain rules, no default rule**; xray-fw stays down |
+
+### `inbounds` mode (ruantiblock alongside xray)
+
+Keep ruantiblock doing what it is good at — resolving its user lists via dnsmasq
+into nftsets, marking by **destination IP** and tproxy'ing each list to its own
+port — and let xray be a plain port → exit map. Manage it from
+**Services → Xray Monitor → Inbounds**: one row per ruantiblock list, where
+`port` **must equal** that list's `u_t_proxy_port_tcp` and `exit` is any outbound
+or balancer tag.
+
+```
+ruantiblock list1 (u_t_proxy_port_tcp 1100) ──▶ tproxy-in-de :1100 ──▶ balancer-default
+ruantiblock list2 (u_t_proxy_port_tcp 1101) ──▶ tproxy-in-lv :1101 ──▶ Matryona-lv
+ruantiblock list3 (u_t_proxy_port_tcp 1102) ──▶ tproxy-in-kz :1102 ──▶ Matryona-kz-3
+```
+
+Because routing keys off the **inbound**, never off a sniffed domain, a failed
+SNI sniff cannot leak a connection to `direct` — the failure mode that makes a
+domain-rule model drop QUIC/long-lived UDP sessions straight out to the internet
+until xray is restarted. Traffic ruantiblock does not steer never enters xray at
+all, which is why there is no default rule.
+
+Requirements and guard rails:
+- ruantiblock must be running, with `proxy_local_clients=0` (otherwise it eats
+  xray's own loopback traffic and the Stats API on 10085 goes dark).
+- `xray-fw` refuses to raise its nft table in this mode and `xray-fw on` is a
+  hard error — two tproxy tables would fight over the same packets.
+- Health checks (apply/geodata verify) watch the **inbound ports**, not
+  `fw.tproxy_port` — 1200 is never bound here.
+
+## Migrating from ruantiblock (to `lists` mode)
+
+To have xray own routing entirely — tproxy **all LAN TCP** into xray and drive it
+from the Lists/Devices/Routing pages — use `lists` mode. If you currently split traffic with
 **ruantiblock** (dnsmasq nftset → fwmark → tproxy port), the one-shot migration
 imports your user lists (deriving each exit from the port they target today),
 installs geodata, disables ruantiblock (kept installed for rollback), and raises

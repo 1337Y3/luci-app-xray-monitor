@@ -32,7 +32,50 @@ tproxy_port() {
 
 rules_managed() { [ "$(uci -q get xray-monitor.rules.managed 2>/dev/null)" = "1" ]; }
 
+# Routing mode (see genrules.uc):
+#   lists    - xray-native: ONE tproxy inbound (fw.tproxy_port), domain/geo rules
+#   inbounds - ruantiblock drives the steering (dst-IP nftset -> fwmark -> its own
+#              tproxy port per list); xray is a plain inboundTag->outboundTag map,
+#              one tproxy inbound per `inbound` section. xray-fw stays DOWN.
+rules_mode() {
+	local m; m=$(uci -q get xray-monitor.rules.mode 2>/dev/null)
+	[ -n "$m" ] || m=lists
+	echo "$m"
+}
+
+inbound_sids() {
+	uci -q show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=inbound$/\1/p'
+}
+
+# Ports that MUST be bound for a managed config to count as healthy. In lists
+# mode that is the single xray-fw tproxy port; in inbounds mode it is every
+# enabled inbound section's port (1200 is never bound there, so checking
+# tproxy_port would fail every apply and roll back a perfectly good config).
+health_ports() {
+	local sid p
+	if [ "$(rules_mode)" = "inbounds" ]; then
+		for sid in $(inbound_sids); do
+			[ "$(uci -q get "xray-monitor.$sid.enabled" 2>/dev/null)" = "0" ] && continue
+			p=$(uci -q get "xray-monitor.$sid.port" 2>/dev/null)
+			[ -n "$p" ] && echo "$p"
+		done
+	else
+		tproxy_port
+	fi
+}
+
 port_listening() { netstat -ltn 2>/dev/null | grep -q ":$1 "; }
+
+# All ports the live routing mode depends on are bound (vacuously true when
+# managed routing is off).
+managed_ports_up() {
+	local p
+	rules_managed || return 0
+	for p in $(health_ports); do
+		port_listening "$p" || return 1
+	done
+	return 0
+}
 
 # One writer at a time across xray-sub apply / xray-rules apply / xray-geodat
 # update / config-save: their backup->test->mv->restart->verify sections race
@@ -86,12 +129,11 @@ prune_backups() {
 # When managed routing is live, the tproxy inbound binding is part of
 # "healthy" — a config that lost it would blackhole the LAN.
 verify_or_rollback() {
-	local bak="$1" need_api="$2" max="${3:-30}" i=0 tp
-	tp=$(tproxy_port)
+	local bak="$1" need_api="$2" max="${3:-30}" i=0
 	while [ "$i" -lt "$max" ]; do
 		if pgrep -f "$XRAY run" >/dev/null 2>&1 \
 			&& { [ "$need_api" != 1 ] || api_up; } \
-			&& { ! rules_managed || port_listening "$tp"; }; then
+			&& managed_ports_up; then
 			return 0
 		fi
 		sleep 1
