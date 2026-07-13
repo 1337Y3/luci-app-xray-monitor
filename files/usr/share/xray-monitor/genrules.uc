@@ -155,6 +155,67 @@ function exit_map() {
 	return known;
 }
 
+// A tproxy inbound: dokodemo-door with sockopt.tproxy. These are the inbounds
+// this script owns (it sweeps and re-emits them on `set`).
+function is_tproxy_in(o) {
+	return o.protocol == 'dokodemo-door' && o.streamSettings &&
+	       o.streamSettings.sockopt && o.streamSettings.sockopt.tproxy == 'tproxy';
+}
+
+// Read the inbound->exit map straight out of config.json.
+//
+// The UCI `inbound` sections are the source of truth, but a config can predate
+// them — set up by hand, restored from a backup, or written by an older build.
+// Without this, such a mapping is live in xray yet invisible in the UI, and an
+// apply would refuse ("no enabled inbound") or wipe it. Discover it instead, so
+// the UI can show it and the user can adopt it with one Save.
+//
+// The single lists-mode 'tproxy-in' and the loopback 'xm-probe' are not part of
+// the map and are skipped.
+function discover_inbounds() {
+	let found = [], ins = cfg.inbounds ?? [];
+	let rules = (cfg.routing && cfg.routing.rules) ? cfg.routing.rules : [];
+	let ord = 10;
+	for (let i = 0; i < length(ins); i++) {
+		let o = ins[i];
+		if (!is_tproxy_in(o)) continue;
+		let tag = o.tag ?? '';
+		if (substr(tag, 0, 10) != 'tproxy-in-') continue;   // skips 'tproxy-in'
+		let name = substr(tag, 10);
+		if (!length(name)) continue;
+		// exit = the first rule that routes this inbound
+		let ex = '';
+		for (let r = 0; r < length(rules); r++) {
+			let rl = rules[r];
+			if (!rl.inboundTag) continue;
+			if (!(tag in rl.inboundTag)) continue;
+			ex = rl.balancerTag ?? rl.outboundTag ?? '';
+			if (length(ex)) break;
+		}
+		push(found, {
+			name: name, port: int(o.port ?? 0), exit: length(ex) ? ex : 'direct',
+			enabled: true, order: ord, _sid: null, source: 'config'
+		});
+		ord += 10;
+	}
+	return found;
+}
+
+// UCI sections win; anything in config.json that UCI doesn't already cover
+// (by name or by port) is appended as a discovered row.
+function merged_inbounds() {
+	let out = [], by_name = {}, by_port = {};
+	for (let ib in inbounds) {
+		by_name[ib.name] = 1; by_port[ib.port] = 1;
+		push(out, { name: ib.name, port: ib.port, exit: ib.exit, enabled: ib.enabled,
+		            order: ib.order, _sid: ib._sid, source: 'uci' });
+	}
+	for (let d in discover_inbounds())
+		if (!by_name[d.name] && !by_port[d.port]) push(out, d);
+	sort(out, by_order);
+	return out;
+}
+
 function geodata_paths() {
 	let d = ctx.get('xray', 'config', 'datadir');
 	if (d == null || d == '') d = '/usr/share/xray';
@@ -181,12 +242,18 @@ if (action == 'get') {
 			counts: { domain: length(e.domains), ip: length(e.ips) }
 		});
 	}
-	for (let ib in inbounds)
+	let ui_inbounds = merged_inbounds();
+	let n_disc = 0;
+	for (let ib in ui_inbounds) {
+		if (ib.source == 'config') n_disc++;
 		if (ib.enabled && !known[ib.exit])
 			push(warnings, sprintf("inbound '%s': exit '%s' missing (would fall back)", ib.name, ib.exit));
+	}
+	if (n_disc)
+		push(warnings, sprintf('%d inbound(s) found in config.json are not managed yet — press Save to adopt them', n_disc));
 	if (globals.mode == 'inbounds') {
 		let n = 0;
-		for (let ib in inbounds) if (ib.enabled) n++;
+		for (let ib in ui_inbounds) if (ib.enabled) n++;
 		if (!n) push(warnings, 'routing mode is "inbounds" but no inbound is enabled — nothing would be proxied');
 	}
 	for (let g in georules)
@@ -210,7 +277,7 @@ if (action == 'get') {
 			enabled: globals.registry_enabled, exit: globals.registry_exit,
 			geosite: globals.registry_geosite, geoip: globals.registry_geoip
 		},
-		inbounds: inbounds,
+		inbounds: ui_inbounds,
 		lists: out_lists, devices: devices, georules: georules,
 		exits: exits, geodata_present: geodata_present(), warnings: warnings
 	});
@@ -224,14 +291,9 @@ let warnings = [];
 
 // -- inbounds: keep non-managed (api, socks-dns, ...), sweep managed tproxy
 //    inbounds (incl. legacy tproxy-in-de/lv/kz) and any previous xm-probe.
-function is_managed_in(o) {
-	return o.protocol == 'dokodemo-door' && o.streamSettings &&
-	       o.streamSettings.sockopt && o.streamSettings.sockopt.tproxy == 'tproxy';
-}
-
 let new_in = [], managed_tags = {}, ins = cfg.inbounds ?? [];
 for (let i = 0; i < length(ins); i++) {
-	if (is_managed_in(ins[i]) || ins[i].tag == 'xm-probe') managed_tags[ins[i].tag] = 1;
+	if (is_tproxy_in(ins[i]) || ins[i].tag == 'xm-probe') managed_tags[ins[i].tag] = 1;
 	else push(new_in, ins[i]);
 }
 managed_tags['tproxy-in'] = 1;
@@ -239,10 +301,20 @@ managed_tags['tproxy-in'] = 1;
 // active inbound sections (inbounds mode only), validated up front
 let act_in = [];
 if (globals.mode == 'inbounds') {
+	let src = [];
+	for (let ib in inbounds) if (ib.enabled) push(src, ib);
+	// Nothing in UCI: adopt whatever tproxy inbounds config.json already carries
+	// rather than refusing. A hand-written / restored / older-build config would
+	// otherwise fail every apply (including the nightly sub-fetch) even though a
+	// perfectly good map is live. Regenerating what is already there is a no-op.
+	if (!length(src)) {
+		src = discover_inbounds();
+		if (length(src))
+			push(warnings, sprintf('no inbound sections in UCI — adopted %d tproxy inbound(s) from config.json; press Save on the Inbounds page to persist them', length(src)));
+	}
 	let seen_name = {}, seen_port = {};
-	for (let ib in inbounds) {
-		if (!ib.enabled) continue;
-		if (!length(ib.name)) die('inbound section with an empty name');
+	for (let ib in src) {
+		if (!length(ib.name)) die('inbound with an empty name');
 		if (seen_name[ib.name]) die('duplicate inbound name: ' + ib.name);
 		if (seen_port[ib.port]) die('duplicate inbound port: ' + ib.port);
 		if (ib.port < 1 || ib.port > 65535) die("inbound '" + ib.name + "': invalid port " + ib.port);
@@ -252,7 +324,7 @@ if (globals.mode == 'inbounds') {
 	// A config with no tproxy inbound would silently un-proxy the whole LAN and
 	// still pass `xray -test` — refuse rather than write it.
 	if (!length(act_in))
-		die('routing mode is "inbounds" but no inbound is enabled — refusing to write a config with no tproxy inbound');
+		die('routing mode is "inbounds" but no inbound is enabled and config.json has none — refusing to write a config with no tproxy inbound');
 }
 
 if (globals.mode == 'inbounds') {

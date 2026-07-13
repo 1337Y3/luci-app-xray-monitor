@@ -271,6 +271,15 @@ domain-rule model drop QUIC/long-lived UDP sessions straight out to the internet
 until xray is restarted. Traffic ruantiblock does not steer never enters xray at
 all, which is why there is no default rule.
 
+The page **reads the map back out of `config.json`**, so an inbound → exit
+mapping that already exists — hand-written, restored from a backup, or produced
+by an older build — shows up straight away, tagged *from config.json*, with its
+exit resolved from the routing rule that serves it. UCI sections stay the source
+of truth; press **Save & Apply** to adopt what was discovered (the generated
+config is identical, so nothing changes on the wire). An apply with no UCI
+sections adopts the live inbounds rather than refusing, so a not-yet-adopted map
+can never be wiped by e.g. the nightly subscription refresh.
+
 Requirements and guard rails:
 - ruantiblock must be running, with `proxy_local_clients=0` (otherwise it eats
   xray's own loopback traffic and the Stats API on 10085 goes dark).

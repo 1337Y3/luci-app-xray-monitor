@@ -46,6 +46,7 @@ function mkExitSelect(sel) {
 }
 
 function buildRow(ib, idx) {
+	var discovered = (ib.source == 'config');
 	var nameI = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:120px',
 		'value': ib.name, 'placeholder': 'de' });
 	var portI = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:80px',
@@ -64,9 +65,16 @@ function buildRow(ib, idx) {
 
 	rowEls.push({ name: nameI, port: portI, exit: exitS, enabled: enCb, order: ordI });
 
+	var tagLine = [ E('span', {}, 'tproxy-in-' + (ib.name || '?')) ];
+	if (discovered)
+		tagLine.push(E('span', {
+			'style': 'margin-left:6px;padding:1px 5px;border-radius:3px;background:#f0ad4e;color:#fff;font-size:90%;',
+			'title': _('Live in config.json but not stored in UCI yet. Press Save & Apply to adopt it.')
+		}, _('from config.json')));
+
 	return E('tr', { 'class': 'tr' }, [
-		E('td', { 'class': 'td' }, [ nameI, E('div', { 'style': 'color:#888;font-size:85%;' },
-			'tproxy-in-' + (ib.name || '?')) ]),
+		E('td', { 'class': 'td' }, [ nameI,
+			E('div', { 'style': 'color:#888;font-size:85%;margin-top:2px;' }, tagLine) ]),
 		E('td', { 'class': 'td' }, portI),
 		E('td', { 'class': 'td' }, exitS),
 		E('td', { 'class': 'td', 'style': 'text-align:center;' }, enCb),
@@ -79,7 +87,8 @@ function handleAdd() {
 	syncFromInputs();
 	var maxOrder = 0;
 	working.forEach(function(r) { maxOrder = Math.max(maxOrder, parseInt(r.order, 10) || 0); });
-	working.push({ name: '', port: '', exit: defaultExit(), enabled: true, order: String(maxOrder + 10) });
+	working.push({ name: '', port: '', exit: defaultExit(), enabled: true,
+		order: String(maxOrder + 10), source: 'uci' });
 	renderTable();
 }
 
@@ -183,6 +192,15 @@ function renderTable() {
 		]);
 	}
 
+	var nDisc = working.filter(function(r) { return r.source == 'config'; }).length;
+	var adoptBox = nDisc
+		? E('div', { 'class': 'alert-message warning' }, [
+			E('strong', {}, _('%d inbound(s) read from config.json').format(nDisc)), ' ',
+			_('They are live in xray but not stored in UCI, so the app is not managing them yet. Review the exits below and press '),
+			E('em', {}, _('Save & Apply')), _(' to adopt them — the generated config is identical, so nothing changes on the wire.')
+		])
+		: '';
+
 	var warnBox = warnings.length
 		? E('div', { 'class': 'alert-message warning' },
 			[ E('strong', {}, _('Warnings')), E('ul', {}, warnings.map(function(w) { return E('li', {}, w); })) ])
@@ -203,7 +221,7 @@ function renderTable() {
 	]));
 
 	var content = [
-		banner, warnBox, table,
+		banner, adoptBox, warnBox, table,
 		E('div', { 'style': 'margin-top:.8em;' }, [ addBtn, ' ', saveBtn, ' ', modeBtn ])
 	];
 
@@ -219,7 +237,8 @@ function refresh() {
 		warnings = (r && r.warnings) || [];
 		working  = ((r && r.inbounds) || []).map(function(ib) {
 			return { name: ib.name, port: String(ib.port), exit: ib.exit,
-				enabled: !!ib.enabled, order: String(ib.order) };
+				enabled: !!ib.enabled, order: String(ib.order),
+				source: ib.source || 'uci' };
 		});
 		renderTable();
 	});
