@@ -5,7 +5,7 @@
 set -e
 
 PKG="luci-app-xray-monitor"
-VER="1.19-2"
+VER="1.20-1"
 ARCH="all"
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -20,13 +20,7 @@ cp -a "$HERE/files/." "$WORK/data/"
 cp -a "$HERE/CONTROL/." "$WORK/control/"
 chmod 0755 "$WORK/data/usr/libexec/rpcd/xray-monitor"
 chmod 0755 "$WORK"/data/usr/share/xray-monitor/*.uc \
-           "$WORK"/data/usr/share/xray-monitor/xray-sub \
-           "$WORK"/data/usr/share/xray-monitor/xray-rules \
-           "$WORK"/data/usr/share/xray-monitor/xray-fw \
-           "$WORK"/data/usr/share/xray-monitor/xray-geodat \
-           "$WORK"/data/usr/share/xray-monitor/migrate-ruantiblock \
-           "$WORK"/data/etc/init.d/xray-tproxy
-# common.sh is sourced, not executed -> stays 0644
+           "$WORK"/data/usr/share/xray-monitor/xray-sub
 chmod 0755 "$WORK/control/postinst" "$WORK/control/prerm" "$WORK/control/postrm"
 
 # ---- control metadata ----
@@ -42,9 +36,7 @@ Maintainer: vinli
 Description:  LuCI app to monitor and manage Xray: service status, live per-inbound
   and per-outbound traffic + rates (Stats API), per-outbound connectivity, rolling
   throughput graphs, a Remnawave subscription parser that auto-stages outbound
-  updates, xray-native routing (lists, per-device bypass, per-list DNS, geo-rules),
-  a tproxy firewall with failsafe watchdog, and geodata auto-update. Pages under
-  Services -> Xray Monitor.
+  updates, and exit-routing controls. Pages under Services -> Xray Monitor.
 CONTROL_EOF
 
 # Force uid/gid 0 in the archives so the package installs as root no matter where

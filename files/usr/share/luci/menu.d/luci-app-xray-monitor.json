@@ -6,9 +6,7 @@
 			"type": "firstchild"
 		},
 		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
+			"acl": [ "luci-app-xray-monitor" ]
 		}
 	},
 	"admin/services/xray-monitor/overview": {
@@ -19,9 +17,7 @@
 			"path": "xray/monitor"
 		},
 		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
+			"acl": [ "luci-app-xray-monitor" ]
 		}
 	},
 	"admin/services/xray-monitor/graphs": {
@@ -32,9 +28,7 @@
 			"path": "xray/graphs"
 		},
 		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
+			"acl": [ "luci-app-xray-monitor" ]
 		}
 	},
 	"admin/services/xray-monitor/subscription": {
@@ -45,100 +39,40 @@
 			"path": "xray/subscription"
 		},
 		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
-		}
-	},
-	"admin/services/xray-monitor/inbounds": {
-		"title": "Inbounds",
-		"order": 4,
-		"action": {
-			"type": "view",
-			"path": "xray/inbounds"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
-		}
-	},
-	"admin/services/xray-monitor/lists": {
-		"title": "Lists",
-		"order": 5,
-		"action": {
-			"type": "view",
-			"path": "xray/lists"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
-		}
-	},
-	"admin/services/xray-monitor/devices": {
-		"title": "Devices",
-		"order": 6,
-		"action": {
-			"type": "view",
-			"path": "xray/devices"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
+			"acl": [ "luci-app-xray-monitor" ]
 		}
 	},
 	"admin/services/xray-monitor/routing": {
 		"title": "Routing",
-		"order": 7,
+		"order": 4,
 		"action": {
 			"type": "view",
 			"path": "xray/routing"
 		},
 		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
+			"acl": [ "luci-app-xray-monitor" ]
 		}
 	},
 	"admin/services/xray-monitor/balancers": {
 		"title": "Balancers",
-		"order": 8,
+		"order": 5,
 		"action": {
 			"type": "view",
 			"path": "xray/balancers"
 		},
 		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
-		}
-	},
-	"admin/services/xray-monitor/geodata": {
-		"title": "Geodata",
-		"order": 9,
-		"action": {
-			"type": "view",
-			"path": "xray/geodata"
-		},
-		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
+			"acl": [ "luci-app-xray-monitor" ]
 		}
 	},
 	"admin/services/xray-monitor/config": {
 		"title": "Config",
-		"order": 10,
+		"order": 6,
 		"action": {
 			"type": "view",
 			"path": "xray/config"
 		},
 		"depends": {
-			"acl": [
-				"luci-app-xray-monitor"
-			]
+			"acl": [ "luci-app-xray-monitor" ]
 		}
 	}
 }
