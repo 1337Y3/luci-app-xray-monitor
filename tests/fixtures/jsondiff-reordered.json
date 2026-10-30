@@ -1,0 +1,29 @@
+{
+	"routing": {
+		"rules": [ { "outboundTag": "api", "inboundTag": [ "api" ], "type": "field" } ],
+		"domainStrategy": "AsIs"
+	},
+	"outbounds": [
+		{
+			"streamSettings": {
+				"realitySettings": { "shortId": "0123", "serverName": "de.example.com" },
+				"security": "reality",
+				"network": "tcp"
+			},
+			"settings": {
+				"vnext": [
+					{
+						"users": [ { "encryption": "none", "id": "11111111-2222-3333-4444-555555555555" } ],
+						"port": 443,
+						"address": "de.example.com"
+					}
+				]
+			},
+			"protocol": "vless",
+			"tag": "proxy-de"
+		},
+		{ "protocol": "freedom", "tag": "direct" }
+	],
+	"dns": { "servers": [ "1.1.1.1", "8.8.8.8" ] },
+	"log": { "access": "/tmp/xray-a.log", "loglevel": "warning" }
+}

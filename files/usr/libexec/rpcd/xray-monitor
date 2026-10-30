@@ -337,6 +337,39 @@ sub_msg() {  # <args...> — run xray-sub, emit {"ok":bool,"msg":string}
 	json_dump
 }
 
+# --- config.json backups (xray-sub backups-*) --------------------------------
+# The client sends only a backup basename. It must be a plain basename, be
+# present in the real listing of $CFG.bak.* files, and be pipeline-shaped;
+# the path is always rebuilt from the config file's own directory, so no
+# client path ever reaches the filesystem. Mirrors backup_path() in xray-sub
+# (defense in depth), including the shape check - config_diff never reaches
+# xray-sub, so this is the only gate for it.
+backup_check() {  # <basename> -> prints path, rc 1 = rejected
+	local cfg d b pfx rest
+	case "$1" in
+		''|*[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	cfg=$(config_file)
+	d=$(dirname "$cfg")
+	for b in $(ls -t "$d/$(basename "$cfg").bak."* 2>/dev/null); do
+		if [ "${b##*/}" = "$1" ]; then
+			# same shape rules as backup_meta() in xray-sub:
+			# [pinned.][manual.|preapi.]<timestamp>
+			pfx="$(basename "$cfg").bak."
+			rest="$1"
+			case "$rest" in "$pfx"*) rest="${rest#"$pfx"}" ;; *) return 1 ;; esac
+			case "$rest" in pinned.*) rest="${rest#pinned.}" ;; esac
+			case "$rest" in manual.*|preapi.*) rest="${rest#*.}" ;; esac
+			case "$rest" in
+				20[0-9][0-9][01][0-9][0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9]) ;;
+				*) return 1 ;;
+			esac
+			echo "$d/$1"; return 0
+		fi
+	done
+	return 1
+}
+
 # Validate the live xray config with `xray -test` (read-only)
 do_validate() {
 	local cfg out rc msg
@@ -383,6 +416,12 @@ case "$1" in
 		json_add_object "config_save"; json_add_string "config" ""; json_close_object
 		json_add_object "update_check"; json_close_object
 		json_add_object "update_apply"; json_close_object
+		json_add_object "backups_list"; json_close_object
+		json_add_object "backups_get"; json_add_string "name" ""; json_close_object
+		json_add_object "backups_delete"; json_add_string "name" ""; json_close_object
+		json_add_object "backups_pin"; json_add_string "name" ""; json_add_string "pinned" ""; json_close_object
+		json_add_object "backups_restore"; json_add_string "name" ""; json_close_object
+		json_add_object "config_diff"; json_add_string "name" ""; json_close_object
 		json_dump
 	;;
 	call)
@@ -522,6 +561,81 @@ case "$1" in
 					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
 					json_add_string msg "$msg"
 					json_dump
+				fi
+			;;
+			backups_list) "$SUB" backups-list ;;
+			backups_get)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if p=$(backup_check "$nm") && [ -r "$p" ]; then
+					# keep the file byte-exact (incl. its trailing newline)
+					# so View and Download match the backup on disk
+					cfg_txt=$(cat "$p" 2>/dev/null; echo x)
+					cfg_txt="${cfg_txt%x}"
+					json_init
+					json_add_boolean ok 1
+					json_add_string name "$nm"
+					json_add_string config "$cfg_txt"
+					json_dump
+				else
+					json_init
+					json_add_boolean ok 0
+					json_add_string msg "no such backup"
+					json_dump
+				fi
+			;;
+			backups_delete)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if backup_check "$nm" >/dev/null; then
+					msg=$("$SUB" backups-delete "$nm" 2>&1); rc=$?
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				else
+					json_init; json_add_boolean ok 0; json_add_string msg "no such backup"; json_dump
+				fi
+			;;
+			backups_pin)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				pin=$(echo "$input" | jsonfilter -e '@.pinned' 2>/dev/null)
+				case "$pin" in 0|1) ;; *) pin="" ;; esac
+				if backup_check "$nm" >/dev/null && [ -n "$pin" ]; then
+					msg=$("$SUB" backups-pin "$nm" "$pin" 2>&1); rc=$?
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"   # msg = the new (renamed) basename on success
+					json_dump
+				else
+					json_init; json_add_boolean ok 0; json_add_string msg "no such backup"; json_dump
+				fi
+			;;
+			backups_restore)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if backup_check "$nm" >/dev/null; then
+					msg=$("$SUB" backups-restore "$nm" 2>&1); rc=$?
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				else
+					json_init; json_add_boolean ok 0; json_add_string msg "no such backup"; json_dump
+				fi
+			;;
+			# Semantic diff of the current config vs a backup, as
+			# paths_diff(current, backup): added = restore would add it,
+			# removed = restore would drop it, changed = differs either way.
+			config_diff)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if p=$(backup_check "$nm"); then
+					"$SHARE/jsondiff-cli.uc" "$(config_file)" "$p" 2>/dev/null \
+						|| { printf '{"added":[],"removed":[],"changed":[],"error":"diff failed"}'; }
+				else
+					printf '{"added":[],"removed":[],"changed":[],"error":"no such backup"}'
 				fi
 			;;
 			*)         printf '{}' ;;

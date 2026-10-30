@@ -81,6 +81,14 @@ printf '}]}' >> "$W/staged.json"
 "$SHARE/diff.uc" "$W/staged.json" "$FIX/config.json" proxy work -- > "$W/diff-added.json"
 check "diff: new sub added, manual-vps untouched (task 2)" "$EXP/diff-added.json" "$W/diff-added.json"
 
+echo "== jsondiff (F16: paths_diff via canonsig, order-independent)"
+"$SHARE/jsondiff-cli.uc" "$FIX/jsondiff-a.json" "$FIX/jsondiff-b.json" > "$W/jsondiff-ab.json" \
+	|| { echo "FAIL   jsondiff a->b exited non-zero"; fails=$((fails + 1)); }
+check "jsondiff: add/remove/change on nested objects and arrays" "$EXP/jsondiff-ab.json" "$W/jsondiff-ab.json"
+"$SHARE/jsondiff-cli.uc" "$FIX/jsondiff-a.json" "$FIX/jsondiff-reordered.json" > "$W/jsondiff-re.json" \
+	|| { echo "FAIL   jsondiff reorder exited non-zero"; fails=$((fails + 1)); }
+check "jsondiff: same object, keys reordered -> empty diff" "$EXP/jsondiff-re.json" "$W/jsondiff-re.json"
+
 echo "== apply (tasks 2+7: prefixes, // block comments)"
 "$SHARE/apply.uc" "$FIX/config.json" "$W/staged.json" "$W/apply.json" proxy work >/dev/null
 check "apply: subscription groups + local block" "$EXP/apply.json" "$W/apply.json"

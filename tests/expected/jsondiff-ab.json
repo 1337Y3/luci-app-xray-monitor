@@ -1,0 +1,1 @@
+{ "added": [ "outbounds.0.settings.vnext.0.users.0.email", "outbounds.2" ], "removed": [ "routing.domainStrategy" ], "changed": [ "dns.servers.1", "log.loglevel", "outbounds.0.settings.vnext.0.port", "outbounds.0.streamSettings.realitySettings.shortId", "routing.rules.0.outboundTag" ] }
