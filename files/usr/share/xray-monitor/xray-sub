@@ -488,7 +488,11 @@ case "$1" in
 		for b in $(backup_names); do
 			meta=$(backup_meta "$b") || continue
 			set -- $meta; kind=$1; ts=$2; pinned=$3
-			size=$(wc -c < "$(dirname "$CFG")/$b" | tr -d ' ')
+			size=$(wc -c < "$(dirname "$CFG")/$b" 2>/dev/null | tr -d ' ')
+			# The file can vanish between backup_names' ls and the wc (a
+			# concurrent prune from cron or another pin's mv). Skip it rather
+			# than emit an empty "size":, which would break the whole reply.
+			case "$size" in ''|*[!0-9]*) continue ;; esac
 			[ "$first" = 1 ] || printf ','
 			first=0
 			printf '{"name":"%s","kind":"%s","ts":"%s","size":%s,"pinned":%s}' \
@@ -521,7 +525,9 @@ case "$1" in
 		[ "$new" = "$name" ] && { echo "$name"; exit 0; }   # already pinned/unpinned
 		target="$(dirname "$CFG")/$new"
 		[ -e "$target" ] && { echo "target name already exists"; exit 1; }
-		mv "$p" "$target" && echo "$new"
+		# Say why on failure - the rpcd layer would otherwise show the user
+		# an empty "Pin failed:" with no reason.
+		if mv "$p" "$target"; then echo "$new"; else echo "pin rename failed"; exit 1; fi
 		;;
 
 	# Restore = a config write like any other: the backup content is staged and
