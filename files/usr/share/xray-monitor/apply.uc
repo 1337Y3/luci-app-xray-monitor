@@ -6,8 +6,10 @@
 // staged-groups.json = { "groups": [ { "label": "<prefix>", "outbounds": [ {...} ] } ] }
 // Prefixes mark the managed exits (all configured subscriptions, enabled or not);
 // without prefixes every proxy outbound is treated as managed (legacy behavior).
+// The outbounds section is laid out by render.uc (shared with routing/balancers).
 'use strict';
-import { readfile, writefile } from 'fs';
+import { readfile } from 'fs';
+import { emit } from 'render';
 
 let cfg = json(readfile(ARGV[0]));
 let staged = json(readfile(ARGV[1]));
@@ -30,30 +32,4 @@ let old = cfg.outbounds ?? [];
 for (let i = 0; i < length(old); i++)
 	if (!(old[i].protocol in proxy_protos) || !is_managed(old[i].tag)) push(kept, old[i]);
 
-function indent(s, pad) {
-	let lines = split(s, "\n"), out = [];
-	for (let i = 0; i < length(lines); i++) push(out, pad + lines[i]);
-	return join("\n", out);
-}
-
-let parts = [];
-for (let g = 0; g < length(groups); g++) {
-	let grp = groups[g], obs = grp.outbounds ?? [];
-	if (!length(obs)) continue;
-	push(parts, "    // === subscription: " + ((grp.label && length(grp.label)) ? grp.label : "(default)") + " ===");
-	for (let i = 0; i < length(obs); i++)
-		push(parts, indent(sprintf('%.2J', obs[i]), "    "));
-}
-if (length(kept)) {
-	push(parts, "    // === local ===");
-	for (let i = 0; i < length(kept); i++)
-		push(parts, indent(sprintf('%.2J', kept[i]), "    "));
-}
-let ob_text = "[\n" + join(",\n", parts) + "\n  ]";
-
-cfg.outbounds = "__OB__";
-let full = sprintf('%.2J', cfg);
-full = replace(full, '"outbounds": "__OB__"', '"outbounds": ' + ob_text);
-
-if (out_path) { writefile(out_path, full); printf('OK\n'); }
-else printf('%s\n', full);
+emit(cfg, groups, kept, out_path);

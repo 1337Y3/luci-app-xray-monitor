@@ -189,7 +189,10 @@ before installing. If your API runs on a different port than 10085, edit
 Common causes: the `ucode-mod-fs` dependency wasn't installed (install it:
 `opkg install ucode-mod-fs`), the xray config isn't at the path in
 `uci get xray.config.conffiles`, or you installed a pre-1.7 build (auto-enable
-was added in 1.7). The merge also needs the config to be plain JSON (no comments).
+was added in 1.7). `//` comments in the config are fine — both ucode's `json()`
+and xray itself accept them. (Any rewrite of config.json by the app keeps the
+generated `// === subscription … ===` / `// === local ===` block headers;
+free-form comments elsewhere are dropped by the JSON round-trip.)
 
 The merge it performs (equivalent, if you ever want to do it by hand):
 
@@ -235,6 +238,6 @@ Pure data package (`Architecture: all`), so the SDK isn't required.
 | `/www/luci-static/resources/view/xray/routing.js` | Routing page |
 | `/www/luci-static/resources/view/xray/balancers.js` | Balancers page |
 | `/www/luci-static/resources/view/xray/config.js` | Config editor page |
-| `/usr/share/xray-monitor/{parse,apply,diff,status,routing,balancers,enable-api}.uc` | ucode JSON transforms |
+| `/usr/share/xray-monitor/{parse,apply,diff,snapshot,status,routing,balancers,enable-api,render}.uc` | ucode JSON transforms (render = shared outbounds renderer) |
 | `/usr/share/xray-monitor/xray-sub` | fetch/stage/apply helper (+ hourly cron) |
 | `/etc/config/xray-monitor` | UCI config (sub URL, user-agent, cron) — conffile |

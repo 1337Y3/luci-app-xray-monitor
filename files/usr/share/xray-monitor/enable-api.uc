@@ -2,12 +2,16 @@
 // Idempotently add the Xray Stats API (stats/api/policy + api inbound + api rule)
 // to an existing config. Writes the (possibly unchanged) result to out-path and
 // prints "changed" or "unchanged".
-//   enable-api.uc <config.json> <out-path> [port]
+//   enable-api.uc <config.json> <out-path> [port] [prefix ...]
+// Prefixes keep the outbounds section's // group comments on the rewrite (render.uc).
 'use strict';
 import { readfile, writefile } from 'fs';
+import { split_outbounds, render_config } from 'render';
 
 let cfg_path = ARGV[0], out_path = ARGV[1];
 let port = ARGV[2] ? int(ARGV[2]) : 10085;
+let prefixes = [];
+for (let i = 3; i < length(ARGV); i++) push(prefixes, ARGV[i]);
 
 let cfg = json(readfile(cfg_path));
 if (type(cfg) != 'object') { warn('not a JSON object\n'); exit(1); }
@@ -65,5 +69,7 @@ if (!has_rule) {
 	cfg.routing.rules = nr;
 }
 
-writefile(out_path, sprintf('%.2J', cfg));
+// plain %.2J would drop the outbounds' // group comments - re-render them
+let so = split_outbounds(cfg, prefixes);
+writefile(out_path, render_config(cfg, so.groups, so.locals));
 print((before != sprintf('%J', cfg)) ? 'changed\n' : 'unchanged\n');

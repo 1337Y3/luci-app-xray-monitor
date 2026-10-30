@@ -279,7 +279,7 @@ case "$1" in
 		api_before=0; api_up && api_before=1
 		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 		stage_init
-		if "$uc" set "$CFG" "$2" "$STAGE_DIR/config.json" >/dev/null 2>&1 \
+		if "$uc" set "$CFG" "$2" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1 \
 			&& test_and_install "$STAGE_DIR/config.json"; then
 			/etc/init.d/xray restart >/dev/null 2>&1
 			if verify_or_rollback "$bak" "$api_before"; then prune_backups; echo ok
@@ -329,7 +329,7 @@ case "$1" in
 		ucode -e 'import { readfile } from "fs";' >/dev/null 2>&1 || { echo "ucode-mod-fs not installed"; exit 1; }
 		[ -f "$CFG" ] || { echo "xray config not found at $CFG"; exit 1; }
 		stage_init
-		res=$("$SHARE/enable-api.uc" "$CFG" "$STAGE_DIR/config.json" 10085 2>&1)
+		res=$("$SHARE/enable-api.uc" "$CFG" "$STAGE_DIR/config.json" 10085 $(sub_prefixes) 2>&1)
 		case "$res" in
 			unchanged) echo "already enabled ($CFG)"; exit 0 ;;
 			changed)   ;;
