@@ -30,7 +30,7 @@ held=0
 STAGE_DIR=""
 cleanup() {
 	[ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"
-	[ "$held" = 1 ] && lock -u "$LOCK" 2>/dev/null
+	[ "$held" = 1 ] && lock -u "$LOCK" </dev/null >/dev/null 2>&1
 	return 0
 }
 trap cleanup EXIT
@@ -215,7 +215,11 @@ do_cron_sync() {
 case "$1" in
 	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync)
 		lw=0
-		while ! lock -n "$LOCK" 2>/dev/null; do
+		# The lock(1) holder is a lingering child process: redirect ALL its fds,
+		# or it inherits this script's stdout - under rpcd that is the command
+		# substitution pipe, which then never sees EOF and the call hangs until
+		# the rpcd timeout long after this script has exited.
+		while ! lock -n "$LOCK" </dev/null >/dev/null 2>&1; do
 			lw=$((lw + 1))
 			[ "$lw" -ge 55 ] && { echo "another xray-monitor operation is running"; exit 1; }
 			sleep 1
