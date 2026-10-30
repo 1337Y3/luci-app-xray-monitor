@@ -116,7 +116,8 @@ function renderUnified(aText, bText) {
 	}
 
 	/* mark which op indices are visible (inside a hunk window) */
-	var vis = new Array(ops.length).fill(false);
+	var vis = [], q;
+	for (q = 0; q < ops.length; q++) vis[q] = false;
 	for (j = 0; j < groups.length; j++)
 		for (i = Math.max(0, groups[j].first - CONTEXT); i <= Math.min(ops.length - 1, groups[j].last + CONTEXT); i++)
 			vis[i] = true;

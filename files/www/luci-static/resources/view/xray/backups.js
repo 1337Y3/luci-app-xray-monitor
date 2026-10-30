@@ -80,7 +80,7 @@ function viewBackup(b) {
 			]),
 			E('pre', {
 				'style': 'max-height:60vh;overflow:auto;margin:0;white-space:pre;font-family:monospace;font-size:12px;'
-			}, (res.config || '') + '\n')
+			}, (res.config || ''))
 		]);
 	}, function() { setBusy(false); ui.addNotification(null, E('p', {}, _('View call failed.')), 'error'); });
 }
