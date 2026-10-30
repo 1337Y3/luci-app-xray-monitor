@@ -240,7 +240,7 @@ ok_eq "test-failed: last xray -test verdict" "fail" "$(last_test)"
 is "test-failed: no leftover \$CFG.new" "$([ ! -e "$CFG.new" ] && echo 1 || echo 0)"
 ok_eq "test-failed: no restart" "$r0" "$(restarts)"
 ok_eq "test-failed: no hooks" "$h0" "$(hookruns)"
-ok_eq "test-failed: backup still taken (as before the refactor)" "$((b0 + 1))" "$(baks)"
+ok_eq "test-failed: no backup left (validated before the snapshot)" "$b0" "$(baks)"
 
 echo "== verify-failed: xray does not come back -> rollback restores the snapshot"
 reset_cfg

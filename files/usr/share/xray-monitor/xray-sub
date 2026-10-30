@@ -242,6 +242,8 @@ post_restart_hooks() { return 0; }
 #   3  install_config failed - $CFG untouched, snapshot kept
 # The candidate is always validated BEFORE the snapshot is taken, so a
 # rejected candidate leaves no backup behind (see the note above prune_backups).
+# The status of prune_backups / post_restart_hooks never leaks into the return
+# value: rc 0 means the new config is installed and healthy, nothing else.
 # Usage: commit_config <kind> <need_api> <candidate> [no-restart]
 #   kind      backup tag: "" = automatic timestamp-only name, else a word
 #             ("manual", "preapi", ...) -> $CFG.bak[.<kind>].<YYYYmmdd-HHMMSS>
@@ -258,6 +260,7 @@ post_restart_hooks() { return 0; }
 COMMIT_BAK=""
 commit_config() {  # <kind> <need_api> <candidate> [no-restart]
 	local kind="$1" need_api="$2" cand="$3" mode="${4:-}" ts
+	COMMIT_BAK=""
 	test_config "$cand" || return 1
 	ts=$(date +%Y%m%d-%H%M%S)
 	if [ -n "$kind" ]; then COMMIT_BAK="$CFG.bak.$kind.$ts"; else COMMIT_BAK="$CFG.bak.$ts"; fi
@@ -268,6 +271,7 @@ commit_config() {  # <kind> <need_api> <candidate> [no-restart]
 	verify_or_rollback "$COMMIT_BAK" "$need_api" || return 2
 	post_restart_hooks
 	prune_backups
+	return 0   # prune/hook status must not leak: the change is installed+healthy
 }
 
 # `apply` as a function: the command runs it under the lock, and fetch's
