@@ -175,6 +175,9 @@ api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
 #   test_config     -> xray -test on a candidate (no writes anywhere)
 #   install_config  -> cp -> <target>.new -> mv onto the target (atomic)
 #   test_and_install <candidate> -> test_config || return; install_config
+#   commit_config <kind> <need_api> <candidate> [no-restart] -> test_config,
+#     snapshot, install_config, restart, verify_or_rollback, post_restart_hooks,
+#     prune_backups - the single entry point every writer funnels through
 # Writers run test_config BEFORE making the backup: a backup is only worth
 # keeping if a verified candidate actually follows it, and prune_backups keeps
 # just 3 - a series of failed attempts must not evict the meaningful ones.
@@ -217,6 +220,60 @@ verify_or_rollback() {
 	return 1
 }
 
+# Extension point (F15): invoked under the write lock after every successful
+# restart+verify, before prune_backups - $CFG already holds the new config and
+# xray is confirmed healthy. Empty for now; later features append their own
+# steps here. Its return value is ignored (the change is already live), hooks
+# report their own failures.
+post_restart_hooks() { return 0; }
+
+# --- Config write pipeline ----------------------------------------------
+# One place for everything that happens AFTER a writer has produced its
+# candidate config (formerly five copies of the same sequence in do_apply /
+# routing-set / balancers-set / config-save / enable-api): `xray -test` the
+# candidate, snapshot the live config, atomically replace it (install_config,
+# symlink-aware), restart xray, verify it came back (rolling back to the
+# snapshot otherwise), then the extension point and backup pruning. Writers
+# keep their transform (.uc call) and their user-facing messages / exit codes
+# - commit_config itself prints nothing and returns:
+#   0  installed (and healthy, unless no-restart)
+#   1  `xray -test` rejected the candidate - nothing written, no snapshot
+#   2  installed but unhealthy - snapshot restored, xray restarted again
+#   3  install_config failed - $CFG untouched, snapshot kept
+# The candidate is always validated BEFORE the snapshot is taken, so a
+# rejected candidate leaves no backup behind (see the note above prune_backups).
+# The status of prune_backups / post_restart_hooks never leaks into the return
+# value: rc 0 means the new config is installed and healthy, nothing else.
+# Usage: commit_config <kind> <need_api> <candidate> [no-restart]
+#   kind      backup tag: "" = automatic timestamp-only name, else a word
+#             ("manual", "preapi", ...) -> $CFG.bak[.<kind>].<YYYYmmdd-HHMMSS>
+#   need_api  1 = the health check must also require the stats API (the
+#             caller's api_before), 0 = xray running is enough
+#   candidate the finished candidate - $STAGE_DIR/config.json, or the
+#             uploaded file as-is for config-save
+#   no-restart (4th arg) skips restart/verify/hooks/prune: validate, snapshot
+#             and replace only. Hot-swap (F14) reconciles the running xray
+#             with `xray api` afterwards and, if that fails, falls back to a
+#             full restart + verify against the snapshot in $COMMIT_BAK.
+# $COMMIT_BAK holds the snapshot path on return ("" when none was taken).
+# Callers hold the write lock.
+COMMIT_BAK=""
+commit_config() {  # <kind> <need_api> <candidate> [no-restart]
+	local kind="$1" need_api="$2" cand="$3" mode="${4:-}" ts
+	COMMIT_BAK=""
+	test_config "$cand" || return 1
+	ts=$(date +%Y%m%d-%H%M%S)
+	if [ -n "$kind" ]; then COMMIT_BAK="$CFG.bak.$kind.$ts"; else COMMIT_BAK="$CFG.bak.$ts"; fi
+	cp -a "$CFG" "$COMMIT_BAK"
+	install_config "$cand" || return 3
+	if [ "$mode" = "no-restart" ]; then return 0; fi
+	/etc/init.d/xray restart >/dev/null 2>&1
+	verify_or_rollback "$COMMIT_BAK" "$need_api" || return 2
+	post_restart_hooks
+	prune_backups
+	return 0   # prune/hook status must not leak: the change is installed+healthy
+}
+
 # `apply` as a function: the command runs it under the lock, and fetch's
 # auto-apply calls it in-process - re-running `"$0" apply` would deadlock on
 # the very lock fetch already holds. Non-zero return (and state files) on any
@@ -230,18 +287,13 @@ do_apply() {
 		echo "merge-failed" > "$STATE/status"
 		echo "staged merge failed - not applied: $apply_err"; return 1
 	fi
-	test_config "$STAGE_DIR/config.json" || {
-		echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1; }
-	bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-	install_config "$STAGE_DIR/config.json" || {
-		echo "install-failed" > "$STATE/status"; echo "failed to install new config"; return 1; }
-	/etc/init.d/xray restart >/dev/null 2>&1
-	if verify_or_rollback "$bak" "$api_before"; then
-		prune_backups
-		echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
-	else
-		echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; return 1
-	fi
+	rc=0; commit_config "" "$api_before" "$STAGE_DIR/config.json" || rc=$?
+	case "$rc" in
+		0) echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok ;;
+		2) echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; return 1 ;;
+		3) echo "install-failed" > "$STATE/status"; echo "failed to install new config"; return 1 ;;
+		*) echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1 ;;
+	esac
 }
 
 # cron-sync likewise: set-cfg calls it in-process instead of `"$0" cron-sync`.
@@ -406,13 +458,14 @@ case "$1" in
 		case "$1" in routing-set) uc="$SHARE/routing.uc" ;; *) uc="$SHARE/balancers.uc" ;; esac
 		api_before=0; api_up && api_before=1
 		stage_init
-		if "$uc" set "$CFG" "$2" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1 \
-			&& test_config "$STAGE_DIR/config.json"; then
-			bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-			install_config "$STAGE_DIR/config.json" || { echo "failed to install new config"; exit 1; }
-			/etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" "$api_before"; then prune_backups; echo ok
-			else echo "xray/api failed health check - rolled back"; exit 1; fi
+		if "$uc" set "$CFG" "$2" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1; then
+			rc=0; commit_config "" "$api_before" "$STAGE_DIR/config.json" || rc=$?
+			case "$rc" in
+				0) echo ok ;;
+				2) echo "xray/api failed health check - rolled back"; exit 1 ;;
+				3) echo "failed to install new config"; exit 1 ;;
+				*) echo "config test failed - not applied"; exit 1 ;;
+			esac
 		else
 			echo "config test failed - not applied"; exit 1
 		fi
@@ -420,16 +473,13 @@ case "$1" in
 
 	config-save)
 		[ -s "$2" ] || { echo "empty config"; exit 1; }
-		test_config "$2" || { echo "xray -test failed; not saved"; exit 1; }
-		bak="$CFG.bak.manual.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		install_config "$2" || { echo "failed to install new config"; exit 1; }
-		/etc/init.d/xray restart >/dev/null 2>&1
-		if verify_or_rollback "$bak" 0; then
-			prune_backups
-			echo "saved and restarted xray"
-		else
-			echo "saved but xray failed to start - rolled back"; exit 1
-		fi
+		rc=0; commit_config manual 0 "$2" || rc=$?
+		case "$rc" in
+			0) echo "saved and restarted xray" ;;
+			2) echo "saved but xray failed to start - rolled back"; exit 1 ;;
+			3) echo "failed to install new config"; exit 1 ;;
+			*) echo "xray -test failed; not saved"; exit 1 ;;
+		esac
 		;;
 
 	latest-version)
@@ -484,16 +534,13 @@ case "$1" in
 			changed)   ;;
 			*)         echo "merge failed: $res"; exit 1 ;;
 		esac
-		test_config "$STAGE_DIR/config.json" || { echo "xray -test failed on merged config; not applied"; exit 1; }
-		bak="$CFG.bak.preapi.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		install_config "$STAGE_DIR/config.json" || { echo "failed to install new config"; exit 1; }
-		/etc/init.d/xray restart >/dev/null 2>&1
-		if verify_or_rollback "$bak" 1; then
-			prune_backups
-			echo "enabled and restarted xray ($CFG)"
-		else
-			echo "enabled but stats API did not come up - rolled back"; exit 1
-		fi
+		rc=0; commit_config preapi 1 "$STAGE_DIR/config.json" || rc=$?
+		case "$rc" in
+			0) echo "enabled and restarted xray ($CFG)" ;;
+			2) echo "enabled but stats API did not come up - rolled back"; exit 1 ;;
+			3) echo "failed to install new config"; exit 1 ;;
+			*) echo "xray -test failed on merged config; not applied"; exit 1 ;;
+		esac
 		;;
 
 	*)
