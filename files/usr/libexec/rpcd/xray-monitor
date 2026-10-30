@@ -297,19 +297,34 @@ SHARE=/usr/share/xray-monitor
 SUB=$SHARE/xray-sub
 
 # --- config.json backups (xray-sub backups-*) --------------------------------
-# The client sends only a backup basename. It must be a plain basename AND be
-# present in the real listing of $CFG.bak.* files; the path is always rebuilt
-# from the config file's own directory, so no client path ever reaches the
-# filesystem. Mirrors backup_path() in xray-sub (defense in depth).
+# The client sends only a backup basename. It must be a plain basename, be
+# present in the real listing of $CFG.bak.* files, and be pipeline-shaped;
+# the path is always rebuilt from the config file's own directory, so no
+# client path ever reaches the filesystem. Mirrors backup_path() in xray-sub
+# (defense in depth), including the shape check - config_diff never reaches
+# xray-sub, so this is the only gate for it.
 backup_check() {  # <basename> -> prints path, rc 1 = rejected
-	local cfg d b
+	local cfg d b pfx rest
 	case "$1" in
 		''|*[!A-Za-z0-9._-]*) return 1 ;;
 	esac
 	cfg=$(config_file)
 	d=$(dirname "$cfg")
 	for b in $(ls -t "$d/$(basename "$cfg").bak."* 2>/dev/null); do
-		if [ "${b##*/}" = "$1" ]; then echo "$d/$1"; return 0; fi
+		if [ "${b##*/}" = "$1" ]; then
+			# same shape rules as backup_meta() in xray-sub:
+			# [pinned.][manual.|preapi.]<timestamp>
+			pfx="$(basename "$cfg").bak."
+			rest="$1"
+			case "$rest" in "$pfx"*) rest="${rest#"$pfx"}" ;; *) return 1 ;; esac
+			case "$rest" in pinned.*) rest="${rest#pinned.}" ;; esac
+			case "$rest" in manual.*|preapi.*) rest="${rest#*.}" ;; esac
+			case "$rest" in
+				20[0-9][0-9][01][0-9][0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9]) ;;
+				*) return 1 ;;
+			esac
+			echo "$d/$1"; return 0
+		fi
 	done
 	return 1
 }
@@ -501,11 +516,15 @@ case "$1" in
 			backups_get)
 				input=$(cat)
 				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
-				if p=$(backup_check "$nm"); then
+				if p=$(backup_check "$nm") && [ -r "$p" ]; then
+					# keep the file byte-exact (incl. its trailing newline)
+					# so View and Download match the backup on disk
+					cfg_txt=$(cat "$p" 2>/dev/null; echo x)
+					cfg_txt="${cfg_txt%x}"
 					json_init
 					json_add_boolean ok 1
 					json_add_string name "$nm"
-					json_add_string config "$(cat "$p")"
+					json_add_string config "$cfg_txt"
 					json_dump
 				else
 					json_init
