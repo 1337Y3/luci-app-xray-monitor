@@ -114,7 +114,7 @@ case "$1" in
 	fetch)
 		tmpd=$(mktemp -d); staged="$tmpd/staged.json"
 		printf '{"groups":[' > "$staged"
-		first=1; nsub=0; nok=0
+		first=1; nsub=0; nok=0; failed=""
 		for id in $(sub_ids); do
 			[ "$(uci -q get "xray-monitor.$id.enabled")" = "0" ] && continue
 			url=$(uci -q get "xray-monitor.$id.url"); [ -n "$url" ] || continue
@@ -130,7 +130,25 @@ case "$1" in
 					cat "$obs" >> "$staged"
 					printf '}' >> "$staged"
 					first=0; nok=$((nok + 1))
+				else
+					failed="$failed $prefix"
 				fi
+			else
+				failed="$failed $prefix"
+			fi
+		done
+		# A subscription that could not be refetched keeps its currently installed
+		# exits: snapshot them from the live config as extra staged groups. Disabled
+		# subscriptions are deliberately absent here - those DO get pruned on apply.
+		nsnap=0
+		for pfx in $failed; do
+			nsnap=$((nsnap + 1)); snap="$tmpd/snap.$nsnap"
+			if "$SHARE/snapshot.uc" "$CFG" "$pfx" > "$snap" 2>/dev/null && [ -s "$snap" ]; then
+				[ "$first" = 1 ] || printf ',' >> "$staged"
+				printf '{"label":"%s","outbounds":' "$pfx" >> "$staged"
+				cat "$snap" >> "$staged"
+				printf '}' >> "$staged"
+				first=0
 			fi
 		done
 		printf ']}' >> "$staged"
