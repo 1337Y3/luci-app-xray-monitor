@@ -104,8 +104,12 @@ exit 0
 EOF
 cat > "$SB/bin/uci" <<'EOF'
 #!/bin/sh
-# uci stub: keeps the sandbox off the live UCI - every query comes back empty
-# (sub_prefixes empty = legacy "all proxy outbounds are managed" mode)
+# uci stub: keeps the sandbox off the live UCI. backup_keep=3 pins the prune
+# budget so the counts below are deterministic; every other query comes back
+# empty (sub_prefixes empty = legacy "all proxy outbounds are managed" mode).
+case " $* " in
+	*" get xray-monitor.sub.backup_keep "*) echo 3; exit 0 ;;
+esac
 exit 1
 EOF
 cat > "$SB/bin/opkg" <<'EOF'
@@ -163,17 +167,22 @@ reset_cfg() {  # live config = fixture, no backups, no half-installed candidate
 	rm -f "$CFG".bak.* "$CFG.new"
 }
 seed_baks() {  # <n> aged-out backups prune_backups must drop first
+	# pipeline-shaped names (trailing timestamp): prune_backups only manages
+	# backups it recognizes - strays are covered by the apply section below
 	i=0
 	while [ "$i" -lt "$1" ]; do
 		i=$((i + 1))
-		cp "$CFG" "$CFG.bak.seed$i"
-		[ "$TOUCH_T" = 1 ] && touch -t 202001010000 "$CFG.bak.seed$i"
+		cp "$CFG" "$CFG.bak.20200101-00000$i"
+		[ "$TOUCH_T" = 1 ] && touch -t 202001010000 "$CFG.bak.20200101-00000$i"
 	done
 }
 
 echo "== apply: auto backup, candidate tested + installed, restart, hooks, prune"
 reset_cfg
 seed_baks 5
+# a stray, non-pipeline backup: prune must neither count nor ever delete it
+cp "$CFG" "$CFG.bak.not-pipeline"
+[ "$TOUCH_T" = 1 ] && touch -t 202001010000 "$CFG.bak.not-pipeline"
 cp "$CFG" "$SB/work/pre-apply.json"
 cp "$FIX/staged-clean.json" "$SB/state/staged.json"
 # expected installed content = the very transform the copy runs (no prefixes:
@@ -194,7 +203,8 @@ is "apply: candidate installed verbatim" "$(same "$CFG" "$SB/work/exp1.json")"
 is "apply: atomic rename left no \$CFG.new" "$([ ! -e "$CFG.new" ] && echo 1 || echo 0)"
 ok_eq "apply: restart invoked once" "$((r0 + 1))" "$(restarts)"
 ok_eq "apply: post_restart_hooks ran" "$((h0 + 1))" "$(hookruns)"
-[ "$TOUCH_T" = 1 ] && ok_eq "apply: prune kept 3 backups" 3 "$(baks)"
+[ "$TOUCH_T" = 1 ] && ok_eq "apply: prune kept 3 backups + the stray" 4 "$(baks)"
+[ "$TOUCH_T" = 1 ] && is "apply: non-pipeline stray survived prune" "$([ -f "$CFG.bak.not-pipeline" ] && echo 1 || echo 0)"
 ok_eq "apply: status=applied pending=0" "applied 0" "$(cat "$SB/state/status" 2>/dev/null) $(cat "$SB/state/pending" 2>/dev/null)"
 
 echo "== routing-set / balancers-set: same pipeline through the shared function"
@@ -250,13 +260,14 @@ echo "== prune failure: an undeletable old backup must not fail the write"
 if [ "$TOUCH_T" = 1 ]; then
 	reset_cfg
 	# 3 deletable old backups plus a directory with the oldest mtime: prune
-	# keeps the 3 newest, rm(1) cannot remove the directory and fails last
-	mkdir -p "$CFG.bak.olddir"
-	touch -t 202001010000 "$CFG.bak.olddir"
+	# keeps the 3 newest, rm(1) cannot remove the directory and fails last.
+	# Pipeline-shaped names, or prune_backups would (rightly) skip them all.
+	mkdir -p "$CFG.bak.20200101-000000"
+	touch -t 202001010000 "$CFG.bak.20200101-000000"
 	i=1
 	while [ "$i" -le 3 ]; do
-		cp "$CFG" "$CFG.bak.old$i"
-		touch -t 20200101010$i "$CFG.bak.old$i"
+		cp "$CFG" "$CFG.bak.20200101-00001$i"
+		touch -t 20200101010$i "$CFG.bak.20200101-00001$i"
 		i=$((i + 1))
 	done
 	cp "$CFG" "$SB/work/pre-prune.json"
@@ -266,8 +277,9 @@ if [ "$TOUCH_T" = 1 ]; then
 	ok_eq "prune-failure: rc still 0" 0 "$rc"
 	ok_eq "prune-failure: status still applied" "applied" "$(cat "$SB/state/status" 2>/dev/null)"
 	is "prune-failure: candidate installed anyway" "$(differs "$CFG" "$SB/work/pre-prune.json")"
-	is "prune-failure: rm really failed (directory kept)" "$([ -d "$CFG.bak.olddir" ] && echo 1 || echo 0)"
-	rm -rf "$CFG.bak.olddir"
+	is "prune-failure: rm really failed (directory kept)" "$([ -d "$CFG.bak.20200101-000000" ] && echo 1 || echo 0)"
+	is "prune-failure: prune did run (deletable aged backup gone)" "$([ ! -e "$CFG.bak.20200101-000011" ] && echo 1 || echo 0)"
+	rm -rf "$CFG.bak.20200101-000000"
 else
 	echo "NOTE   touch -t unavailable - prune-failure case skipped"
 fi
