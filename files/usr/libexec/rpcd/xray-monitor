@@ -78,19 +78,49 @@ get_stats() {
 }
 
 # TCP-reachability probe -> echoes "<up> <ms>"  (up: 1 reachable, 0 down, -1 no tool)
+# Backends, most precise first, detected once per call:
+#   ucode-mod-socket  bare TCP connect (no payload, no handshake) + ms latency
+#   curl ftp://       connect, then wait for a server greeting that never comes
+#                     - not a single byte is sent to the endpoint. Up is judged
+#                     by time_connect > 0 (the later timeout rc is expected);
+#                     bounded by --max-time. (telnet:// is not compiled into
+#                     OpenWrt's curl.)
+#   ncat -z           port check, no latency value
+# ucode-mod-socket is optional and only exists in the feeds from 24.10 on, so
+# 23.05 boxes transparently use the curl path. BusyBox nc has no -w and can
+# hang in connect() for minutes, so it is deliberately not used.
+have_socket=0
+if command -v ucode >/dev/null 2>&1; then
+	ucode -e 'import { create } from "socket";' >/dev/null 2>&1 && have_socket=1
+fi
+have_curl=0; command -v curl >/dev/null 2>&1 && have_curl=1
+have_ncat=0; command -v ncat >/dev/null 2>&1 && have_ncat=1
+
 probe() {
-	local a="$1" p="$2" t
-	if command -v curl >/dev/null 2>&1; then
-		t=$(curl -sk -o /dev/null --connect-timeout 3 --max-time 4 -w '%{time_connect}' "https://$a:$p" 2>/dev/null)
-		case "$t" in
-			""|0|0.0|0.000|0.000000) echo "0 0" ;;
-			*) echo "1 $(awk "BEGIN{printf \"%d\", $t*1000}")" ;;
-		esac
-	elif command -v ncat >/dev/null 2>&1; then
-		if ncat -z -w 3 "$a" "$p" >/dev/null 2>&1; then echo "1 0"; else echo "0 0"; fi
-	else
-		echo "-1 0"
+	local a="$1" p="$2" out url t rc
+	if [ "$have_socket" = 1 ]; then
+		# probe.uc aborts with empty output on refused/unreachable => down
+		out=$("$SHARE/probe.uc" "$a" "$p" 2>/dev/null)
+		[ -n "$out" ] && echo "$out" || echo "0 0"
+		return
 	fi
+	if [ "$have_curl" = 1 ]; then
+		case "$a" in *:*) url="ftp://[$a]:$p" ;; *) url="ftp://$a:$p" ;; esac
+		t=$(curl -s -o /dev/null </dev/null --connect-timeout 3 --max-time 3 \
+			-w '%{time_connect}' "$url" 2>/dev/null); rc=$?
+		if [ "$rc" -eq 1 ]; then
+			have_curl=0   # protocol unsupported by this curl build - skip it
+		else
+			t=$(awk "BEGIN{printf \"%.0f %d\", (${t:-0})*1000, (${t:-0} > 0) ? 1 : 0}")
+			[ "${t#* }" = 1 ] && echo "1 ${t% *}" || echo "0 0"
+			return
+		fi
+	fi
+	if [ "$have_ncat" = 1 ]; then
+		ncat -z -w 3 "$a" "$p" >/dev/null 2>&1 && echo "1 0" || echo "0 0"
+		return
+	fi
+	echo "-1 0"
 }
 
 # Print an IPv6 address the way /proc/net/nf_conntrack spells dst=: eight
@@ -263,7 +293,8 @@ do_reset() {
 	json_dump
 }
 
-SUB=/usr/share/xray-monitor/xray-sub
+SHARE=/usr/share/xray-monitor
+SUB=$SHARE/xray-sub
 
 run_ok() {  # run a command, emit {"ok":bool}
 	"$@" >/dev/null 2>&1

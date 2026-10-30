@@ -108,14 +108,18 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 
 It reads traffic from Xray's built-in **Stats API** over `127.0.0.1:10085`, and
 detects per-outbound connectivity with an active **TCP probe** of each endpoint
-(`curl`, falling back to `ncat`) plus a live-connection check via
-`/proc/net/nf_conntrack`. No secrets, no off-box exposure. Works with any
-xray-core setup; outbound endpoints are discovered from the config with
-`jsonfilter`, nothing is hardcoded.
+plus a live-connection check via `/proc/net/nf_conntrack` (IPv6 included). The
+probe is a **bare TCP connect — no payload, no TLS/HTTP handshake** — so it
+can't trigger an ISP reset the way a ClientHello can. Backends, most precise
+first: `ucode-mod-socket` (optional, in the feeds from OpenWrt 24.10; gives ms
+latency), then `curl` (an `ftp://` connect that never sends a byte; up is read
+off `time_connect`), then `ncat -z`. No secrets, no off-box exposure. Works
+with any xray-core setup; outbound endpoints are discovered from the config
+with `jsonfilter`, nothing is hardcoded.
 
-Tested on OpenWrt 24.10 with `xray-core` 25.x. The connectivity column needs
-`curl` or `ncat` present; without either it shows "unknown" (traffic/graphs
-still work).
+Tested on OpenWrt 24.10 and 23.05 with `xray-core` 25.x. The connectivity
+column needs one of the probe backends present; without any it shows "unknown"
+(traffic/graphs still work).
 
 ## Install / upgrade (recommended — one line)
 
@@ -238,6 +242,6 @@ Pure data package (`Architecture: all`), so the SDK isn't required.
 | `/www/luci-static/resources/view/xray/routing.js` | Routing page |
 | `/www/luci-static/resources/view/xray/balancers.js` | Balancers page |
 | `/www/luci-static/resources/view/xray/config.js` | Config editor page |
-| `/usr/share/xray-monitor/{parse,apply,diff,snapshot,status,routing,balancers,enable-api,render}.uc` | ucode JSON transforms (render = shared outbounds renderer) |
+| `/usr/share/xray-monitor/{parse,apply,diff,snapshot,status,routing,balancers,enable-api,render,probe}.uc` | ucode JSON transforms (render = shared outbounds renderer, probe = TCP probe backend) |
 | `/usr/share/xray-monitor/xray-sub` | fetch/stage/apply helper (+ hourly cron) |
 | `/etc/config/xray-monitor` | UCI config (sub URL, user-agent, cron) — conffile |
