@@ -84,6 +84,16 @@ prune_backups() {
 	done
 }
 
+# Dot-paths INSIDE an outbound whose change must not read as a diff, e.g. the
+# panel-randomized spiderX. Defaults to streamSettings.realitySettings.spiderX;
+# setting the list (uci add_list xray-monitor.sub.diff_ignore='<a.b.c>')
+# replaces the default. Apply always writes the staged outbounds in full.
+diff_ignore() {
+	local list
+	list=$(uci -q get xray-monitor.sub.diff_ignore)
+	if [ -n "$list" ]; then echo "$list"; else echo "streamSettings.realitySettings.spiderX"; fi
+}
+
 # Stats API reachability probe (rc 0 = answering on 127.0.0.1:10085).
 APISRV="127.0.0.1:10085"
 api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
@@ -167,7 +177,7 @@ case "$1" in
 			echo "no-subs" > "$STATE/status"
 		elif [ "$nok" -gt 0 ]; then
 			mv "$staged" "$STATE/staged.json"
-			"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" $(sub_prefixes) > "$STATE/diff.json" 2>/dev/null
+			"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" $(sub_prefixes) -- $(diff_ignore) > "$STATE/diff.json" 2>/dev/null
 			cnt=$(jsonfilter -i "$STATE/diff.json" -e '@.total' 2>/dev/null)
 			[ "${cnt:-0}" -gt 0 ] && echo 1 > "$STATE/pending" || echo 0 > "$STATE/pending"
 			[ "$nok" -eq "$nsub" ] && echo "ok" > "$STATE/status" || echo "partial" > "$STATE/status"

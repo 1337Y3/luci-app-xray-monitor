@@ -75,6 +75,13 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
   outbound with a subscription prefix**: anything matching one is managed and
   is replaced or pruned by the next fetch/apply. Per-tag local overrides are
   supported.
+- **Churn control**: outbound fields the panel randomizes on every fetch (by
+  default `streamSettings.realitySettings.spiderX`) are pruned from both sides
+  before the diff, so two consecutive fetches with no panel-side changes report
+  **0 pending** and auto-apply does not restart xray for nothing. The pruned set
+  can be replaced via `uci add_list xray-monitor.sub.diff_ignore='<dot.path>'`
+  (repeatable) + `uci commit xray-monitor`. Apply always writes the staged
+  outbounds in full — ignoring a field only affects change detection.
 - The server list shown is the **installed** set (from the live config); the
   diff shows what a pending fetch would change. State lives in
   `/etc/xray-monitor/` (persists across reboots/upgrades).
