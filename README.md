@@ -3,23 +3,26 @@
 A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 **Services → Xray Monitor**:
 
-> **1.20 — the 1.18/1.19 routing stack is gone.** 1.18–1.19 tried to own the
-> router's routing (lists, per-device bypass, per-list DNS, geo-rules, a tproxy
-> firewall + watchdog, geodata auto-update, the ruantiblock migration). That
-> line proved buggy and is dropped rather than patched: 1.20 is the pre-routing
-> 1.17 code, so the app is back to **monitoring + subscriptions + the
-> inbound→exit map** and leaves the firewall/routing to whatever already manages
-> it (e.g. ruantiblock).
+> **1.21 — subscriptions hardened.** Fixes the `xray -test` breakage on save
+> ("unsupported config file extension") — every temp config now lives as
+> `config.json` inside a private `mktemp -d` dir and is installed atomically.
+> A failed subscription fetch no longer deletes its exits; only outbounds
+> tagged with a subscription's `<prefix>`/`<prefix>-*` are managed (manual
+> proxies are preserved in a `// === local ===` block); panel-randomized
+> fields (`spiderX` by default, `uci ...diff_ignore`) no longer read as
+> changes; mutating commands serialize on a lock; the connectivity probe is a
+> zero-payload TCP connect with ms latency; tags are sanitized (`[a-z0-9_-]`,
+> collision suffixes) while existing tags stay stable; trojan/shadowsocks
+> endpoints and IPv6 live-connections are detected; `self-update` verifies the
+> downloaded package's SHA256. Golden tests + CI cover the ucode helpers.
 >
-> Upgrading from 1.18/1.19: the Lists / Devices / Geodata / Inbounds pages, the
-> `xray-tproxy` service and the `xray-fw` / `xray-geodat` /
-> `migrate-ruantiblock` helpers disappear. **Run `xray-fw down` and
-> `/etc/init.d/xray-tproxy stop; /etc/init.d/xray-tproxy disable` before
-> upgrading** if you had the tproxy firewall on — nothing in 1.20 can tear it
-> down for you. Your `config.json` is untouched, so the routing it already
-> contains keeps working. `/etc/xray-monitor` and the extra `/etc/config/xray-monitor`
-> sections (`fw`, `rules`, `geodat`, `inbound`, `list`, `device`) are left in
-> place, inert; delete them by hand if you want them gone.
+> **1.20 — the 1.18/1.19 routing stack is gone.** 1.18–1.19 tried to own the
+> router's routing and that line proved buggy; 1.20 returned to **monitoring +
+> subscriptions + the inbound→exit map**, leaving firewall/routing to whatever
+> already manages it. Coming from 1.18/1.19: run `xray-fw down` and stop/
+> disable `xray-tproxy` **before** upgrading; the Lists / Devices / Geodata /
+> Inbounds pages and their helpers disappear. `config.json` and
+> `/etc/xray-monitor` are untouched.
 
 **Overview**
 - Service status: running/stopped, PID, uptime, version
