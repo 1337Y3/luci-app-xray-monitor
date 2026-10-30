@@ -1,0 +1,1 @@
+{ "balancers": [ { "tag": "any-balancer", "selector": [ "proxy-" ], "strategy": "random", "fallbackTag": "" } ], "outbounds": [ "proxy-fi", "proxy-ch", "manual-vps", "direct", "block" ] }

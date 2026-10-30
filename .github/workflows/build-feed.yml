@@ -2,9 +2,13 @@ name: build-feed
 
 # Rebuild the .ipk + opkg index whenever the package source changes.
 # Skips when only the generated feed (docs/) changes, so the auto-commit
-# below can't trigger an infinite loop.
+# below can't trigger an infinite loop. PRs only run the tests job.
 on:
   push:
+    branches: [ main ]
+    paths-ignore:
+      - 'docs/**'
+  pull_request:
     branches: [ main ]
     paths-ignore:
       - 'docs/**'
@@ -14,7 +18,42 @@ permissions:
   contents: write
 
 jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libjson-c-dev
+
+      # ucode is only packaged by OpenWrt itself; build it from source with
+      # every integration module (ubus/uci/uloop/ffi/...) disabled so plain
+      # ubuntu runners can run the .uc helpers. Installing to /usr matches
+      # the #!/usr/bin/ucode shebangs of the scripts under test.
+      - name: Build ucode from source
+        run: |
+          git clone --depth 1 https://github.com/ucode-lang/ucode /tmp/ucode
+          cmake -S /tmp/ucode -B /tmp/ucode/build -DCMAKE_INSTALL_PREFIX=/usr \
+            -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF -DULOOP_SUPPORT=OFF \
+            -DFFI_SUPPORT=OFF -DRTNL_SUPPORT=OFF -DNL80211_SUPPORT=OFF
+          cmake --build /tmp/ucode/build -j"$(nproc)"
+          sudo cmake --install /tmp/ucode/build
+          ucode -e 'print("ucode ok\n")'
+
+      - name: Golden tests (parse/apply/diff/routing/balancers)
+        run: sh tests/run.sh
+
+      # Same suite, with every produced config additionally validated by a
+      # real xray-core binary (`xray -test`).
+      - name: Golden tests with xray -test validation
+        run: |
+          curl -fsSL --retry 3 -o /tmp/xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          mkdir /tmp/xray && unzip -q /tmp/xray.zip -d /tmp/xray
+          XRAY=/tmp/xray/xray sh tests/run.sh
+
   build:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
