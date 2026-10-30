@@ -129,15 +129,34 @@ api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
 # it loads every D/*.json, so a leftover `config.json.new.json` there would be
 # double-loaded. The extension-less copy keeps the final rename atomic on the
 # same filesystem while staying invisible to -confdir. Removed by the EXIT trap.
-#   stage_init        -> $STAGE_DIR created, candidate = $STAGE_DIR/config.json
-#   test_and_install <candidate> -> xray -test, then cp -> $CFG.new -> mv $CFG (atomic)
+#   stage_init      -> $STAGE_DIR created, candidate = $STAGE_DIR/config.json
+#   test_config     -> xray -test on a candidate (no writes anywhere)
+#   install_config  -> cp -> <target>.new -> mv onto the target (atomic)
+#   test_and_install <candidate> -> test_config || return; install_config
+# Writers run test_config BEFORE making the backup: a backup is only worth
+# keeping if a verified candidate actually follows it, and prune_backups keeps
+# just 3 - a series of failed attempts must not evict the meaningful ones.
 stage_init() {
 	STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xraymon.XXXXXX") || exit 1
 }
 
-test_and_install() {  # <candidate config.json> — validate, then atomically replace $CFG
-	"$XRAY" -test -format json -config "$1" >/dev/null 2>&1 || return 1
-	cp "$1" "$CFG.new" && mv "$CFG.new" "$CFG"
+test_config() {  # <candidate config.json> — validate only; no config writes
+	"$XRAY" -test -format json -config "$1" >/dev/null 2>&1
+}
+
+install_config() {  # <validated candidate> — atomically replace the live config
+	# $CFG may be a symlink (config-save used to write through it with `cat >`);
+	# cp+mv on $CFG itself would replace the LINK with a regular file. Resolve
+	# the target so the symlink survives and the rename stays atomic on it.
+	local target="$CFG" tmp
+	[ -L "$target" ] && target=$(readlink -f "$target")
+	tmp="$target.new"
+	cp "$1" "$tmp" && mv "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+}
+
+test_and_install() {  # <candidate config.json> — test, then install
+	test_config "$1" || return 1
+	install_config "$1"
 }
 
 # After a config change + restart, confirm xray came back healthy; if not,
@@ -163,19 +182,23 @@ verify_or_rollback() {
 do_apply() {
 	[ -s "$STATE/staged.json" ] || { echo "nothing staged"; return 1; }
 	api_before=0; api_up && api_before=1
-	bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 	stage_init
-	if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1 \
-		&& test_and_install "$STAGE_DIR/config.json"; then
-		/etc/init.d/xray restart >/dev/null 2>&1
-		if verify_or_rollback "$bak" "$api_before"; then
-			prune_backups
-			echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
-		else
-			echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; return 1
-		fi
+	apply_err=$("$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$STAGE_DIR/config.json" $(sub_prefixes) 2>&1 >/dev/null)
+	if [ -n "$apply_err" ]; then
+		echo "merge-failed" > "$STATE/status"
+		echo "staged merge failed - not applied: $apply_err"; return 1
+	fi
+	test_config "$STAGE_DIR/config.json" || {
+		echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1; }
+	bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
+	install_config "$STAGE_DIR/config.json" || {
+		echo "install-failed" > "$STATE/status"; echo "failed to install new config"; return 1; }
+	/etc/init.d/xray restart >/dev/null 2>&1
+	if verify_or_rollback "$bak" "$api_before"; then
+		prune_backups
+		echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
 	else
-		rm -f "$CFG.new"; echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1
+		echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; return 1
 	fi
 }
 
@@ -331,31 +354,30 @@ case "$1" in
 		[ -s "$2" ] || { echo "no input"; exit 1; }
 		case "$1" in routing-set) uc="$SHARE/routing.uc" ;; *) uc="$SHARE/balancers.uc" ;; esac
 		api_before=0; api_up && api_before=1
-		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 		stage_init
 		if "$uc" set "$CFG" "$2" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1 \
-			&& test_and_install "$STAGE_DIR/config.json"; then
+			&& test_config "$STAGE_DIR/config.json"; then
+			bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
+			install_config "$STAGE_DIR/config.json" || { echo "failed to install new config"; exit 1; }
 			/etc/init.d/xray restart >/dev/null 2>&1
 			if verify_or_rollback "$bak" "$api_before"; then prune_backups; echo ok
 			else echo "xray/api failed health check - rolled back"; exit 1; fi
 		else
-			rm -f "$CFG.new"; echo "config test failed - not applied"; exit 1
+			echo "config test failed - not applied"; exit 1
 		fi
 		;;
 
 	config-save)
 		[ -s "$2" ] || { echo "empty config"; exit 1; }
+		test_config "$2" || { echo "xray -test failed; not saved"; exit 1; }
 		bak="$CFG.bak.manual.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if test_and_install "$2"; then
-			/etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" 0; then
-				prune_backups
-				echo "saved and restarted xray"
-			else
-				echo "saved but xray failed to start - rolled back"; exit 1
-			fi
+		install_config "$2" || { echo "failed to install new config"; exit 1; }
+		/etc/init.d/xray restart >/dev/null 2>&1
+		if verify_or_rollback "$bak" 0; then
+			prune_backups
+			echo "saved and restarted xray"
 		else
-			rm -f "$CFG.new"; echo "xray -test failed; not saved"; exit 1
+			echo "saved but xray failed to start - rolled back"; exit 1
 		fi
 		;;
 
@@ -411,17 +433,15 @@ case "$1" in
 			changed)   ;;
 			*)         echo "merge failed: $res"; exit 1 ;;
 		esac
+		test_config "$STAGE_DIR/config.json" || { echo "xray -test failed on merged config; not applied"; exit 1; }
 		bak="$CFG.bak.preapi.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if test_and_install "$STAGE_DIR/config.json"; then
-			/etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" 1; then
-				prune_backups
-				echo "enabled and restarted xray ($CFG)"
-			else
-				echo "enabled but stats API did not come up - rolled back"; exit 1
-			fi
+		install_config "$STAGE_DIR/config.json" || { echo "failed to install new config"; exit 1; }
+		/etc/init.d/xray restart >/dev/null 2>&1
+		if verify_or_rollback "$bak" 1; then
+			prune_backups
+			echo "enabled and restarted xray ($CFG)"
 		else
-			rm -f "$CFG.new"; echo "xray -test failed on merged config; not applied"; exit 1
+			echo "enabled but stats API did not come up - rolled back"; exit 1
 		fi
 		;;
 
