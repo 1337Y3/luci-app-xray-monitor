@@ -1,0 +1,106 @@
+{
+  "log": {
+    "loglevel": "none"
+  },
+  "inbounds": [
+    {
+      "tag": "in-proxy-fi",
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 10801,
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      }
+    },
+    {
+      "tag": "in-proxy-ch",
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 10802,
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy-fi",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "fi1.example.org",
+            "port": 443,
+            "users": [
+              {
+                "id": "d342d11e-d424-4583-b36e-524ab1f0afa4",
+                "encryption": "none",
+                "flow": "xtls-rprx-vision"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "fi.example.org",
+          "fingerprint": "chrome",
+          "publicKey": "pbVjhWqqvXcvKZW2jH3mBa9BHuK5iOLXeiCBBB9XKA0",
+          "shortId": "0123",
+          "spiderX": "/"
+        }
+      }
+    },
+    {
+      "tag": "proxy-ch",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "ch1.example.org",
+            "port": 8443,
+            "users": [
+              {
+                "id": "e45be11f-d424-4583-b36e-524ab1f0afa4",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "ch.example.org",
+          "fingerprint": "chrome",
+          "publicKey": "pbVjhWqqvXcvKZW2jH3mBa9BHuK5iOLXeiCBBB9XKA0",
+          "shortId": "abcd",
+          "spiderX": "/api"
+        }
+      }
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "in-proxy-fi"
+        ],
+        "outboundTag": "proxy-fi"
+      },
+      {
+        "type": "field",
+        "inboundTag": [
+          "in-proxy-ch"
+        ],
+        "outboundTag": "proxy-ch"
+      }
+    ]
+  }
+}

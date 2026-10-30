@@ -182,24 +182,34 @@ function buildStatusCard() {
 	]);
 }
 
+/* Banner for missing API services. Two triggers: any of Stats/Handler/Routing
+   service absent from the config (status.api_missing, config-derived), or the
+   stats endpoint not answering although the page expected counters. Either way
+   `enable_api` (enable-api.uc) can fix it: it installs all three services. */
 function apiBanner() {
 	var s = state.status || {};
-	if (!s.running || state.apiOk !== false) return null;
-	var btn = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Enable Stats API'));
+	if (!s.running) return null;
+	var missing = (s.api_missing && s.api_missing.length) ? s.api_missing : [];
+	if (!missing.length && state.apiOk !== false) return null;
+	var btn = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Enable API services'));
 	btn.addEventListener('click', function() {
 		btn.disabled = true;
 		callEnableApi().then(function(res) {
 			btn.disabled = false;
-			if (res && res.ok) ui.addNotification(null, E('p', _('Stats API enabled: ') + (res.msg || '')), 'info');
-			else ui.addNotification(null, E('p', _('Could not enable Stats API: ') + ((res && res.msg) || _('unknown error'))), 'error');
+			if (res && res.ok) ui.addNotification(null, E('p', _('API services enabled: ') + (res.msg || '')), 'info');
+			else ui.addNotification(null, E('p', _('Could not enable API services: ') + ((res && res.msg) || _('unknown error'))), 'error');
 			return refreshStats();
 		}, function() { btn.disabled = false; ui.addNotification(null, E('p', _('Enable call failed.')), 'error'); });
 	});
+	var msg = missing.length
+		? _('Xray is running but its config is missing API services: ') + missing.join(', ') +
+		  _(' — needed for traffic stats and live routing/outbound control.')
+		: _('Xray is running but the Stats API was not detected on 127.0.0.1:10085 — monitoring needs it.');
 	return E('div', {
 		'style': 'margin:.5em 0;padding:10px;border-radius:6px;background:#fdf0d5;border:1px solid #e0b34a;color:#222;' +
 		         'display:flex;align-items:center;gap:12px;flex-wrap:wrap;'
 	}, [
-		E('span', {}, _('Xray is running but the Stats API was not detected on 127.0.0.1:10085 — monitoring needs it.')),
+		E('span', {}, msg),
 		btn
 	]);
 }
