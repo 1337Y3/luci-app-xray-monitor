@@ -8,29 +8,43 @@ let staged = json(readfile(ARGV[0]));
 let cfg = json(readfile(ARGV[1]));
 let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
 
-function key_of(o) {
-	let s = o.settings ?? {};
-	let v = (s.vnext && s.vnext[0]) ? s.vnext[0] : ((s.servers && s.servers[0]) ? s.servers[0] : {});
-	let u = (v.users && v.users[0]) ? v.users[0] : {};
-	let ss = o.streamSettings ?? {}, rs = ss.realitySettings ?? {}, xs = ss.xhttpSettings ?? {};
-	// Identity = endpoint + transport + CREDENTIALS. Without the credential
-	// fields, switching to a different account on the SAME node (new UUID/
-	// password, same address/port) reads as "no change" and never applies.
-	return sprintf('%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s',
-		o.protocol, v.address, v.port, ss.network,
-		u.id, u.flow, u.encryption, u.security,   // vless / vmess
-		v.password, v.method,                     // trojan / shadowsocks
-		rs.serverName, rs.publicKey);             // reality
+// Canonical, order-independent serialization: object keys are sorted, so a mere
+// reordering of fields in the panel output does not read as a change.
+function canonsig(v) {
+	if (type(v) == 'object') {
+		let ks = sort(keys(v)), parts = [];
+		for (let i = 0; i < length(ks); i++) push(parts, ks[i] + ':' + canonsig(v[ks[i]]));
+		return '{' + join(',', parts) + '}';
+	}
+	if (type(v) == 'array') {
+		let parts = [];
+		for (let i = 0; i < length(v); i++) push(parts, canonsig(v[i]));
+		return '[' + join(',', parts) + ']';
+	}
+	return sprintf('%J', v);
+}
+
+// Signature covers the WHOLE outbound body (minus the tag, which is the map
+// key): endpoint, transport, credentials and everything else - tlsSettings,
+// wsSettings path/host, grpc serviceName, xhttpSettings incl. its "extra"
+// object, sockopt, mux, ... The old hand-picked field list (which declared
+// xhttpSettings but never used it) missed those, so panel changes that only
+// touched e.g. xhttpSettings.extra read as "no change" and never raised
+// `pending`, silently skipping auto-apply.
+function body_of(o) {
+	let c = {};
+	for (let k in o) if (k != 'tag') c[k] = o[k];
+	return canonsig(c);
 }
 
 let cur = {}, obs = cfg.outbounds ?? [];
 for (let i = 0; i < length(obs); i++)
-	if (obs[i].protocol in proxy_protos) cur[obs[i].tag] = key_of(obs[i]);
+	if (obs[i].protocol in proxy_protos) cur[obs[i].tag] = body_of(obs[i]);
 
 let neu = {}, groups = staged.groups ?? [];
 for (let g = 0; g < length(groups); g++) {
 	let go = groups[g].outbounds ?? [];
-	for (let i = 0; i < length(go); i++) neu[go[i].tag] = key_of(go[i]);
+	for (let i = 0; i < length(go); i++) neu[go[i].tag] = body_of(go[i]);
 }
 
 let added = [], removed = [], changed = [];
