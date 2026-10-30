@@ -296,11 +296,18 @@ do_reset() {
 SHARE=/usr/share/xray-monitor
 SUB=$SHARE/xray-sub
 
-run_ok() {  # run a command, emit {"ok":bool}
-	"$@" >/dev/null 2>&1
-	local rc=$?
+# Every xray-sub call from here serves a UI click: fail fast on a busy lock
+# instead of waiting out xray-sub's ~55 s poll inside the rpcd call (the HTTP
+# session may drop while the operation would still run afterwards). The cron
+# path invokes xray-sub without this variable and keeps the bounded wait.
+export XRAYMON_NOWAIT=1
+
+sub_msg() {  # <args...> — run xray-sub, emit {"ok":bool,"msg":string}
+	local msg rc
+	msg=$("$SUB" "$@" 2>&1); rc=$?
 	json_init
 	json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+	json_add_string msg "$msg"
 	json_dump
 }
 
@@ -392,8 +399,8 @@ case "$1" in
 				json_dump
 			;;
 			sub_get)   "$SUB" status ;;
-			sub_fetch) run_ok "$SUB" fetch ;;
-			sub_apply) run_ok "$SUB" apply ;;
+			sub_fetch) sub_msg fetch ;;
+			sub_apply) sub_msg apply ;;
 			sub_setcfg)
 				input=$(cat)
 				c=$(echo "$input"  | jsonfilter -e '@.cron' 2>/dev/null)

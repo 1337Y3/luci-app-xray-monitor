@@ -66,6 +66,11 @@ take_lock() {
 			lock -u "$LOCK" </dev/null >/dev/null 2>&1
 			stale=1
 		fi
+		# XRAYMON_NOWAIT=1 (exported by the rpcd backend): a UI click must not
+		# sit out the wait inside the rpcd call - the HTTP session can time out
+		# while the operation would still run afterwards. One try (plus the
+		# stale-lock recovery above); the cron path keeps the bounded wait.
+		[ "$XRAYMON_NOWAIT" = 1 ] && [ "$stale" = 0 ] && return 1
 		tries=$((tries + 1))
 		[ "$tries" -ge 55 ] && return 1
 		[ "$stale" = 1 ] || sleep 1
@@ -251,7 +256,14 @@ do_cron_sync() {
 
 case "$1" in
 	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync)
-		take_lock || { echo "another xray-monitor operation is running"; exit 1; }
+		take_lock || {
+			if [ "$XRAYMON_NOWAIT" = 1 ]; then
+				echo "another xray-monitor operation is running, try again in a moment"
+			else
+				echo "another xray-monitor operation is running"
+			fi
+			exit 1
+		}
 		;;
 esac
 
