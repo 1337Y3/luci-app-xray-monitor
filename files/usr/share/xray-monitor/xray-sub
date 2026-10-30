@@ -4,6 +4,7 @@
 #         | sub-add <prefix> <url> | sub-del <id> | sub-edit <id> <prefix> <url> <enabled>
 #         | routing-get | routing-set <f> | balancers-get | balancers-set <f>
 #         | config-save <f> | enable-api
+#         | tmpxray start <tag>... | tmpxray stop   (short-lived per-exit test xray)
 SHARE=/usr/share/xray-monitor
 STATE=/etc/xray-monitor
 XRAY=/usr/bin/xray
@@ -27,10 +28,20 @@ mkdir -p "$STATE"
 # cap; the EXIT trap releases the lock on every path.
 LOCK=/var/lock/xray-monitor
 held=0
+# tmpxray start/stop serialize on their own mini-lock (contract B2): a tmpxray
+# session outlives the command, so holding the config LOCK for the process
+# lifetime would block fetch/apply - and taking the config LOCK at all would
+# make e2e runs (F13/F18) contend with config writes for no benefit. Only the
+# short start/stop critical sections take the mini-lock.
+TLOCK=/var/lock/xray-monitor-tmpxray
+TSTATE_DIR=/tmp/xray-monitor
+TSTATE=$TSTATE_DIR/tmpxray.json
+theld=0
 STAGE_DIR=""
 cleanup() {
 	[ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"
 	[ "$held" = 1 ] && lock -u "$LOCK" 2>/dev/null
+	[ "$theld" = 1 ] && lock -u "$TLOCK" 2>/dev/null
 	return 0
 }
 trap cleanup EXIT
@@ -177,6 +188,168 @@ do_cron_sync() {
 	[ "$cron" != "0" ] && echo "$cron_schedule /usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1" >> "$CRON"
 	/etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart 2>/dev/null
 	echo ok
+}
+
+# --- tmpxray: a short-lived per-exit test instance (contract B2) -----------
+# A second, throwaway xray built from the live config: one socks inbound on
+# 127.0.0.1 per requested exit tag, routing pinned to that exact outbound, log
+# none, no api/stats. Its lifetime is bounded by XRAYMON_TMPXRAY_TTL seconds
+# (default 120) through a detached watchdog, so a forgotten instance can never
+# linger. State (pid/ports/dir) lives in $TSTATE for F13/F18; start/stop take
+# the mini-lock only for their short critical section.
+# `start` REPLACES any live instance (one tmpxray at a time by design): the old
+# process is stopped and its files removed before the new one is spawned.
+
+tmpxray_take_lock() {
+	local lw=0
+	while ! lock -n "$TLOCK" 2>/dev/null; do
+		lw=$((lw + 1))
+		[ "$lw" -ge 10 ] && return 1
+		sleep 1
+	done
+	return 0
+}
+
+# One candidate loopback port per requested outbound, random in [11000,61000),
+# skipping ports that already listen and each other. Best effort only - the
+# actual bind is the final judge (xray exits on a taken port, readiness fails,
+# start errors out; just retry).
+tmpxray_pick_ports() {  # <count> -> one port per line
+	local want="$1" busy p got=0 tries=0 chosen=""
+	busy=$(netstat -tln 2>/dev/null | awk '$1 ~ /^tcp/ { n = split($4, a, ":"); print a[n] }' | sort -u | tr '\n' ' ')
+	while [ "$got" -lt "$want" ] && [ "$tries" -lt 40 ]; do
+		tries=$((tries + 1))
+		# srand() alone re-seeds by time only, so retries within the same second
+		# would repeat one candidate list - mix the try counter in.
+		for p in $(awk -v n=$((want - got + 2)) -v s=$(( $(date +%s) + tries )) 'BEGIN { srand(s); for (i = 0; i < n; i++) printf "%d ", 11000 + int(rand() * 50000) }'); do
+			case " $busy $chosen " in *" $p "*) continue ;; esac
+			chosen="$chosen $p"; got=$((got + 1))
+			[ "$got" -lt "$want" ] || break
+		done
+	done
+	[ "$got" -eq "$want" ] || return 1
+	echo "$chosen" | tr ' ' '\n' | sed '/^$/d'
+}
+
+# Wait until every port listens on 127.0.0.1 (max ~6 s) while xray stays alive.
+# rc 0 = all listening, 1 = timeout, 2 = process died (bind error etc).
+tmpxray_wait_ports() {  # <pid> <port> ...
+	local pid="$1"; shift
+	local i p ok
+	for i in 1 2 3 4 5 6; do
+		kill -0 "$pid" 2>/dev/null || return 2
+		ok=1
+		for p in "$@"; do
+			netstat -tln 2>/dev/null | grep -q "127.0.0.1:$p " || ok=0
+		done
+		[ "$ok" = 1 ] && return 0
+		sleep 1
+	done
+	return 1
+}
+
+# Stop the recorded instance and remove its files. Caller holds TLOCK.
+# The watchdog and the xray process both carry the temp dir in their cmdline,
+# so pgrep -f on the dir finds the watchdog even when the pid in $TSTATE is
+# stale (e.g. state file survived a reboot of the box but pids did not).
+tmpxray_kill() {
+	local pid tdir tpat wp i rc=1
+	[ -s "$TSTATE" ] || { echo "not running"; return 0; }
+	pid=$(jsonfilter -i "$TSTATE" -e '@.pid' 2>/dev/null)
+	tdir=$(jsonfilter -i "$TSTATE" -e '@.dir' 2>/dev/null)
+	[ -n "$pid" ] && kill "$pid" 2>/dev/null
+	if [ -n "$tdir" ]; then
+		tpat=$(printf '%s' "$tdir" | sed 's/\./\\./g')
+		for wp in $(pgrep -f "$tpat" 2>/dev/null); do
+			[ "$wp" = "$pid" ] && continue
+			kill "$wp" 2>/dev/null
+		done
+	fi
+	for i in 1 2 3; do
+		kill -0 "$pid" 2>/dev/null || { rc=0; break; }
+		sleep 1
+	done
+	if [ "$rc" != 0 ]; then
+		kill -9 "$pid" 2>/dev/null
+		[ -n "$tdir" ] && for wp in $(pgrep -f "$tpat" 2>/dev/null); do kill -9 "$wp" 2>/dev/null; done
+	fi
+	case "$tdir" in /tmp/*) rm -rf "$tdir" ;; esac
+	rm -f "$TSTATE"
+	echo "stopped"
+	return 0
+}
+
+do_tmpxray_start() {  # <tag> ...
+	local tags="$*" ttl n=0 t i p pid tdir pports uargs pjson first=1 msg
+	[ -n "$tags" ] || { echo "no tags given"; return 1; }
+	for t in $tags; do
+		case "$t" in *[!A-Za-z0-9._-]*) echo "invalid tag: $t"; return 1 ;; esac
+		n=$((n + 1))
+	done
+	ttl=${XRAYMON_TMPXRAY_TTL:-120}
+	case "$ttl" in ''|*[!0-9]*|0) echo "invalid XRAYMON_TMPXRAY_TTL"; return 1 ;; esac
+	command -v ucode >/dev/null 2>&1 || { echo "ucode not installed"; return 1; }
+	[ -f "$CFG" ] || { echo "xray config not found at $CFG"; return 1; }
+	tmpxray_take_lock || { echo "another tmpxray operation is running"; return 1; }
+	theld=1
+
+	tmpxray_kill >/dev/null   # replace semantics: one instance at a time
+
+	tdir=$(mktemp -d "${TMPDIR:-/tmp}/tmpxray.XXXXXX") || { echo "mktemp failed"; return 1; }
+	pports=$(tmpxray_pick_ports "$n") || { rm -rf "$tdir"; echo "no free ports"; return 1; }
+	set -- $pports
+	for t in $tags; do
+		p=$1; shift
+		uargs="$uargs $t $p"
+		[ "$first" = 1 ] || pjson="$pjson,"
+		first=0
+		pjson="$pjson\"$t\":$p"
+	done
+
+	msg=$("$SHARE/tmpxray.uc" "$CFG" "$tdir/config.json" $uargs 2>&1)
+	if [ -n "$msg" ]; then
+		rm -rf "$tdir"; echo "tmpxray config build failed: $msg"; return 1
+	fi
+	if ! "$XRAY" -test -format json -config "$tdir/config.json" >"$tdir/test.log" 2>&1; then
+		msg=$(tr -s '\r\n\t ' ' ' < "$tdir/test.log")
+		rm -rf "$tdir"; echo "xray -test failed on tmpxray config: $msg"; return 1
+	fi
+
+	# Not setsid: $! must be the xray pid itself, and a plain background child
+	# survives this script's exit. If the parent shell is ever killed by group
+	# signal the TTL watchdog still reaps the instance.
+	"$XRAY" run -config "$tdir/config.json" >/dev/null 2>&1 &
+	pid=$!
+	if ! tmpxray_wait_ports "$pid" $pports; then
+		kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null
+		rm -rf "$tdir"; rm -f "$TSTATE"
+		echo "tmpxray did not come up (port bind failed or timed out)"
+		return 1
+	fi
+
+	mkdir -p "$TSTATE_DIR"
+	printf '{"pid":%s,"ports":{%s},"dir":"%s","ttl":%s,"ts":%s}\n' \
+		"$pid" "$pjson" "$tdir" "$ttl" "$(date +%s)" > "$TSTATE.new"
+	mv "$TSTATE.new" "$TSTATE"
+
+	# TTL watchdog, detached so it survives this command and its caller. It only
+	# removes $TSTATE while that file still records OUR pid, so it can never
+	# clean up a replacement instance started later. setsid is used when present
+	# (23.05 busybox builds ship without it); the HUP-ignoring trap covers the
+	# plain-background fallback on those boxes.
+	watchdog='trap "" HUP; sleep "$2"; kill "$1" 2>/dev/null; sleep 5; kill -9 "$1" 2>/dev/null; rm -rf "$3"; [ "$(jsonfilter -i "$4" -e "@.pid" 2>/dev/null)" = "$1" ] && rm -f "$4"'
+	detach=""
+	command -v setsid >/dev/null 2>&1 && detach="setsid"
+	$detach sh -c "$watchdog" tmpxray "$pid" "$ttl" "$tdir" "$TSTATE" >/dev/null 2>&1 &
+
+	printf '{"pid":%s,"ports":{%s}}\n' "$pid" "$pjson"
+}
+
+do_tmpxray_stop() {
+	tmpxray_take_lock || { echo "another tmpxray operation is running"; return 1; }
+	theld=1
+	tmpxray_kill
+	return 0
 }
 
 case "$1" in
@@ -415,6 +588,14 @@ case "$1" in
 		fi
 		;;
 
+	tmpxray)
+		case "$2" in
+			start) shift 2; do_tmpxray_start "$@" ;;
+			stop)  do_tmpxray_stop ;;
+			*)     echo "usage: xray-sub tmpxray start <tag>... | tmpxray stop"; exit 1 ;;
+		esac
+		;;
+
 	*)
-		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api"; exit 1 ;;
+		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api|tmpxray start <tag>...|tmpxray stop"; exit 1 ;;
 esac
