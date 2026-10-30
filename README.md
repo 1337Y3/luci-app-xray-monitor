@@ -53,7 +53,8 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 - Add multiple subscriptions, each with a **prefix** and enable toggle. Every
   enabled subscription's servers are **combined** into the outbounds, written as
   its own block with a `// === subscription: <prefix> ===` header (a final
-  `// === local ===` block holds `direct`/freedom). Tags are `<prefix>-<location>`
+  `// === local ===` block holds `direct`/freedom and everything not owned by a
+  subscription). Tags are `<prefix>-<location>`
   (e.g. `proxy-de-1`, `work-fi`); keep prefix `proxy` for your original sub so
   existing routing/balancers keep working. (xray and ucode both tolerate the
   `//` comments.)
@@ -66,8 +67,14 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 - **Auto-apply** (opt-in): when a scheduled/manual fetch finds changes, it
   applies them and restarts xray automatically (same backup + test + rollback).
   All settings (URL, schedule, scheduled-fetch toggle, auto-apply) are on the tab.
-- Splices only the proxy outbounds; `direct`/freedom, inbounds, routing and
-  balancers are left untouched. Per-tag local overrides are supported.
+- Only the subscription-managed proxy outbounds are spliced: tags equal to or
+  under a configured subscription's `<prefix>` (`<prefix>-*`), for **all**
+  subscriptions — enabled or disabled. Everything else — `direct`/freedom,
+  inbounds, routing, balancers and proxy outbounds you added by hand — is left
+  untouched and kept in the `// === local ===` block. **Never tag a manual
+  outbound with a subscription prefix**: anything matching one is managed and
+  is replaced or pruned by the next fetch/apply. Per-tag local overrides are
+  supported.
 - The server list shown is the **installed** set (from the live config); the
   diff shows what a pending fetch would change. State lives in
   `/etc/xray-monitor/` (persists across reboots/upgrades).

@@ -1,12 +1,25 @@
 #!/usr/bin/ucode
 // Diff staged (grouped) proxy outbounds against the proxies currently in config.json.
-// argv: <staged-groups.json> <config.json>  ->  { added, removed, changed, total }
+// argv: <staged-groups.json> <config.json> [prefix ...]  ->  { added, removed, changed, total }
+// With prefixes, only outbounds tagged <prefix> or <prefix>-* (the subscriptions'
+// own exits) are managed; proxy outbounds added by hand are left alone. Without
+// prefixes every proxy outbound is managed (legacy behavior).
 'use strict';
 import { readfile } from 'fs';
 
 let staged = json(readfile(ARGV[0]));
 let cfg = json(readfile(ARGV[1]));
+let prefixes = [];
+for (let i = 2; i < length(ARGV); i++) push(prefixes, ARGV[i]);
 let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
+
+function is_managed(tag) {
+	if (!tag) return false;
+	if (!length(prefixes)) return true;
+	for (let i = 0; i < length(prefixes); i++)
+		if (tag == prefixes[i] || substr(tag, 0, length(prefixes[i]) + 1) == prefixes[i] + '-') return true;
+	return false;
+}
 
 // Canonical, order-independent serialization: object keys are sorted, so a mere
 // reordering of fields in the panel output does not read as a change.
@@ -39,7 +52,7 @@ function body_of(o) {
 
 let cur = {}, obs = cfg.outbounds ?? [];
 for (let i = 0; i < length(obs); i++)
-	if (obs[i].protocol in proxy_protos) cur[obs[i].tag] = body_of(obs[i]);
+	if (obs[i].protocol in proxy_protos && is_managed(obs[i].tag)) cur[obs[i].tag] = body_of(obs[i]);
 
 let neu = {}, groups = staged.groups ?? [];
 for (let g = 0; g < length(groups); g++) {

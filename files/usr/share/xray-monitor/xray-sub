@@ -53,6 +53,17 @@ store_usage() {  # <key> <header-file>   key = subscription prefix (stable in bo
 }
 
 sub_ids() { uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=subscription$/\1/p'; }
+# Prefixes of ALL configured subscriptions, enabled or disabled. Everything
+# tagged <prefix> or <prefix>-* in config.json is "managed": fetch/apply may
+# replace or prune it. Proxy outbounds the user added by hand must therefore
+# never use one of these prefixes - they are preserved in the local block.
+sub_prefixes() {
+	local id p
+	for id in $(sub_ids); do
+		p=$(uci -q get "xray-monitor.$id.prefix")
+		printf '%s ' "${p:-proxy}"
+	done
+}
 valid_prefix() { echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'; }
 prefix_in_use() {  # <prefix> <exclude-id>
 	local id; for id in $(sub_ids); do
@@ -156,7 +167,7 @@ case "$1" in
 			echo "no-subs" > "$STATE/status"
 		elif [ "$nok" -gt 0 ]; then
 			mv "$staged" "$STATE/staged.json"
-			"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" > "$STATE/diff.json" 2>/dev/null
+			"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" $(sub_prefixes) > "$STATE/diff.json" 2>/dev/null
 			cnt=$(jsonfilter -i "$STATE/diff.json" -e '@.total' 2>/dev/null)
 			[ "${cnt:-0}" -gt 0 ] && echo 1 > "$STATE/pending" || echo 0 > "$STATE/pending"
 			[ "$nok" -eq "$nsub" ] && echo "ok" > "$STATE/status" || echo "partial" > "$STATE/status"
@@ -174,7 +185,7 @@ case "$1" in
 		api_before=0; api_up && api_before=1
 		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 		stage_init
-		if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$STAGE_DIR/config.json" >/dev/null 2>&1 \
+		if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1 \
 			&& test_and_install "$STAGE_DIR/config.json"; then
 			/etc/init.d/xray restart >/dev/null 2>&1
 			if verify_or_rollback "$bak" "$api_before"; then
