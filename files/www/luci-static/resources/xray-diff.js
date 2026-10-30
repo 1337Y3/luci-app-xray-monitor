@@ -1,4 +1,5 @@
 'use strict';
+'require baseclass';
 /* Xray Monitor diff helpers, shared by the views (Backups tab today).
  * Loaded with 'require xray-diff'. Two independent pieces:
  *  - a line-based unified diff (Myers O(ND) greedy algorithm, common
@@ -6,7 +7,8 @@
  *    as colored hunks in a <pre>-style block
  *  - a renderer for the semantic (JSON dot-path) diff produced by the rpcd
  *    config_diff method (jsondiff.uc paths_diff)
- * No dependencies besides the luci-base globals E() and _(). */
+ * Depends only on luci.js built-ins: the baseclass module and the
+ * globals E() and _(). *
 
 var MAX_COST = 1024;   /* Myers edit-distance cap per input pair; beyond it the
                           fallback emits one delete+add block for the whole
@@ -179,8 +181,11 @@ function renderSemantic(diff) {
 	return E('table', { 'class': 'table' }, rows);
 }
 
-return {
+/* luci.js require() only accepts Class subclasses (Class.isSubclass), so the
+ * module must extend baseclass; callers get the instantiated module and use
+ * the three methods off its prototype. */
+return baseclass.extend({
 	unifiedDiff: unifiedDiff,
 	renderUnified: renderUnified,
 	renderSemantic: renderSemantic
-};
+});
