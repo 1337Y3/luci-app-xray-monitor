@@ -71,7 +71,12 @@ if (!has_rule) {
 	cfg.routing.rules = nr;
 }
 
-// plain %.2J would drop the outbounds' // group comments - re-render them
+// plain %.2J would drop the outbounds' // group comments - re-render them.
+// The verdict must be taken BEFORE render_config(): it mutates cfg (outbounds
+// placeholder), which would make the before/after comparison "changed" even
+// for an untouched config - the base script never printed "unchanged" because
+// of exactly that.
+let changed = (before != sprintf('%J', cfg));
 let so = split_outbounds(cfg, prefixes);
 writefile(out_path, render_config(cfg, so.groups, so.locals));
-print((before != sprintf('%J', cfg)) ? 'changed\n' : 'unchanged\n');
+print(changed ? 'changed\n' : 'unchanged\n');
