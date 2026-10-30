@@ -38,7 +38,7 @@ jobs:
             git push
           fi
 
-      - name: Publish GitHub Release (stable-named asset)
+      - name: Publish GitHub Release (stable-named asset + sha256 sidecar)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -46,10 +46,13 @@ jobs:
           tag="v${ver}"
           # stable asset name so /releases/latest/download/<name> is constant
           cp "docs/luci-app-xray-monitor_${ver}_all.ipk" luci-app-xray-monitor.ipk
+          # sidecar consumed by `xray-sub self-update` before handing the
+          # package to opkg (fallback: the SHA256sum in docs/Packages)
+          sha256sum luci-app-xray-monitor.ipk > luci-app-xray-monitor.ipk.sha256
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" luci-app-xray-monitor.ipk --clobber
+            gh release upload "$tag" luci-app-xray-monitor.ipk luci-app-xray-monitor.ipk.sha256 --clobber
             gh release edit "$tag" --latest
           else
-            gh release create "$tag" luci-app-xray-monitor.ipk \
+            gh release create "$tag" luci-app-xray-monitor.ipk luci-app-xray-monitor.ipk.sha256 \
               --title "$tag" --notes "Automated build of ${ver}. Install/upgrade: see README." --latest
           fi

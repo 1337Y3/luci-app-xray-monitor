@@ -356,13 +356,35 @@ case "$1" in
 	self-update)
 		tmp="/tmp/luci-app-xray-monitor.ipk"
 		# 1) preferred: stable GitHub Release asset (single redirect, robust)
-		if ! { curl -fsSL --max-time 60 -o "$tmp" "$REL" 2>/dev/null && tar -tzf "$tmp" >/dev/null 2>&1; }; then
+		if curl -fsSL --max-time 60 -o "$tmp" "$REL" 2>/dev/null && tar -tzf "$tmp" >/dev/null 2>&1; then
+			src=release
+		else
 			# 2) fallback: the opkg feed
 			ipk=$(curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
 			[ -n "$ipk" ] || { rm -f "$tmp"; echo "cannot reach Releases or feed"; exit 1; }
 			curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { rm -f "$tmp"; echo "download failed"; exit 1; }
 			tar -tzf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "downloaded file is not a valid package (feed may be updating)"; exit 1; }
+			src=feed
 		fi
+		# Integrity gate: verify the download against a published checksum
+		# before handing it to opkg. Preferred: the .sha256 sidecar next to
+		# the Release asset; else the SHA256sum of the matching Version
+		# stanza in the feed index. Neither available, or mismatch => refuse.
+		exp=""
+		if [ "$src" = release ]; then
+			exp=$(curl -fsSL --max-time 20 "$REL.sha256" 2>/dev/null | awk 'NR==1 { print $1 }')
+		fi
+		if [ -z "$exp" ]; then
+			ver=$(tar -xzOf "$tmp" ./control.tar.gz 2>/dev/null | tar -xzO ./control 2>/dev/null | sed -n 's/^Version: //p' | head -n1)
+			[ -n "$ver" ] || { rm -f "$tmp"; echo "cannot read package version - refusing to install"; exit 1; }
+			exp=$(curl -s --max-time 20 "$FEED/Packages" 2>/dev/null | awk -v want="$ver" '
+				/^Package: /    { ok = ($2 == PKG) }
+				/^Version: /    { ok = ok && ($2 == want) }
+				/^SHA256sum: /  { if (ok) { print $2; exit } }' PKG="$PKG")
+		fi
+		[ -n "$exp" ] || { rm -f "$tmp"; echo "no published SHA256 for this package version - refusing to install"; exit 1; }
+		got=$(sha256sum "$tmp" 2>/dev/null | awk '{ print $1 }')
+		[ "$got" = "$exp" ] || { rm -f "$tmp"; echo "SHA256 mismatch (expected $exp, got $got) - refusing to install"; exit 1; }
 		opkg install --force-reinstall "$tmp"; rc=$?
 		rm -f "$tmp"
 		[ "$rc" -eq 0 ] && echo "updated" || { echo "opkg install failed"; exit 1; }
