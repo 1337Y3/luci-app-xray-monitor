@@ -296,6 +296,24 @@ do_reset() {
 SHARE=/usr/share/xray-monitor
 SUB=$SHARE/xray-sub
 
+# --- config.json backups (xray-sub backups-*) --------------------------------
+# The client sends only a backup basename. It must be a plain basename AND be
+# present in the real listing of $CFG.bak.* files; the path is always rebuilt
+# from the config file's own directory, so no client path ever reaches the
+# filesystem. Mirrors backup_path() in xray-sub (defense in depth).
+backup_check() {  # <basename> -> prints path, rc 1 = rejected
+	local cfg d b
+	case "$1" in
+		''|*[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	cfg=$(config_file)
+	d=$(dirname "$cfg")
+	for b in $(ls -t "$d/$(basename "$cfg").bak."* 2>/dev/null); do
+		if [ "${b##*/}" = "$1" ]; then echo "$d/$1"; return 0; fi
+	done
+	return 1
+}
+
 run_ok() {  # run a command, emit {"ok":bool}
 	"$@" >/dev/null 2>&1
 	local rc=$?
@@ -350,6 +368,12 @@ case "$1" in
 		json_add_object "config_save"; json_add_string "config" ""; json_close_object
 		json_add_object "update_check"; json_close_object
 		json_add_object "update_apply"; json_close_object
+		json_add_object "backups_list"; json_close_object
+		json_add_object "backups_get"; json_add_string "name" ""; json_close_object
+		json_add_object "backups_delete"; json_add_string "name" ""; json_close_object
+		json_add_object "backups_pin"; json_add_string "name" ""; json_add_string "pinned" ""; json_close_object
+		json_add_object "backups_restore"; json_add_string "name" ""; json_close_object
+		json_add_object "config_diff"; json_add_string "name" ""; json_close_object
 		json_dump
 	;;
 	call)
@@ -472,6 +496,77 @@ case "$1" in
 				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
 				json_add_string msg "$msg"
 				json_dump
+			;;
+			backups_list) "$SUB" backups-list ;;
+			backups_get)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if p=$(backup_check "$nm"); then
+					json_init
+					json_add_boolean ok 1
+					json_add_string name "$nm"
+					json_add_string config "$(cat "$p")"
+					json_dump
+				else
+					json_init
+					json_add_boolean ok 0
+					json_add_string msg "no such backup"
+					json_dump
+				fi
+			;;
+			backups_delete)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if backup_check "$nm" >/dev/null; then
+					msg=$("$SUB" backups-delete "$nm" 2>&1); rc=$?
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				else
+					json_init; json_add_boolean ok 0; json_add_string msg "no such backup"; json_dump
+				fi
+			;;
+			backups_pin)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				pin=$(echo "$input" | jsonfilter -e '@.pinned' 2>/dev/null)
+				case "$pin" in 0|1) ;; *) pin="" ;; esac
+				if backup_check "$nm" >/dev/null && [ -n "$pin" ]; then
+					msg=$("$SUB" backups-pin "$nm" "$pin" 2>&1); rc=$?
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"   # msg = the new (renamed) basename on success
+					json_dump
+				else
+					json_init; json_add_boolean ok 0; json_add_string msg "no such backup"; json_dump
+				fi
+			;;
+			backups_restore)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if backup_check "$nm" >/dev/null; then
+					msg=$("$SUB" backups-restore "$nm" 2>&1); rc=$?
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				else
+					json_init; json_add_boolean ok 0; json_add_string msg "no such backup"; json_dump
+				fi
+			;;
+			# Semantic diff of the current config vs a backup, as
+			# paths_diff(current, backup): added = restore would add it,
+			# removed = restore would drop it, changed = differs either way.
+			config_diff)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if p=$(backup_check "$nm"); then
+					"$SHARE/jsondiff-cli.uc" "$(config_file)" "$p" 2>/dev/null \
+						|| { printf '{"added":[],"removed":[],"changed":[],"error":"diff failed"}'; }
+				else
+					printf '{"added":[],"removed":[],"changed":[],"error":"no such backup"}'
+				fi
 			;;
 			*)         printf '{}' ;;
 		esac

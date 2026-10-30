@@ -74,5 +74,16 @@
 		"depends": {
 			"acl": [ "luci-app-xray-monitor" ]
 		}
+	},
+	"admin/services/xray-monitor/backups": {
+		"title": "Backups",
+		"order": 7,
+		"action": {
+			"type": "view",
+			"path": "xray/backups"
+		},
+		"depends": {
+			"acl": [ "luci-app-xray-monitor" ]
+		}
 	}
 }
