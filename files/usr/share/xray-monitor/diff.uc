@@ -9,6 +9,7 @@
 // streamSettings.realitySettings.spiderX, which the panel randomizes per fetch).
 'use strict';
 import { readfile } from 'fs';
+import { owner_prefix } from 'render';
 
 let staged = json(readfile(ARGV[0]));
 let cfg = json(readfile(ARGV[1]));
@@ -23,9 +24,7 @@ let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
 function is_managed(tag) {
 	if (!tag) return false;
 	if (!length(prefixes)) return true;
-	for (let i = 0; i < length(prefixes); i++)
-		if (tag == prefixes[i] || substr(tag, 0, length(prefixes[i]) + 1) == prefixes[i] + '-') return true;
-	return false;
+	return owner_prefix(tag, prefixes) != null;
 }
 
 // Canonical, order-independent serialization: object keys are sorted, so a mere

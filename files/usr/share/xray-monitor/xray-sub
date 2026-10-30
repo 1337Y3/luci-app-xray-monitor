@@ -81,11 +81,21 @@ sub_prefixes() {
 	done
 }
 valid_prefix() { echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'; }
-prefix_in_use() {  # <prefix> <exclude-id>
-	local id; for id in $(sub_ids); do
+# A new prefix must not OVERLAP an existing one: "proxy" vs "proxy-work" (either
+# direction, or equality) makes the managed-tag rule "<prefix> or <prefix>-*"
+# ambiguous - ownership would depend on argument order and staged groups could
+# carry the same outbound tag twice, which xray -test rejects. Prints the
+# conflicting existing prefix and returns 0 when <new> overlaps, 1 otherwise.
+prefix_conflict() {  # <new-prefix> <exclude-id>
+	local id e
+	for id in $(sub_ids); do
 		[ "$id" = "$2" ] && continue
-		[ "$(uci -q get "xray-monitor.$id.prefix")" = "$1" ] && return 0
-	done; return 1
+		e=$(uci -q get "xray-monitor.$id.prefix"); [ -n "$e" ] || e=proxy
+		if [ "$1" = "$e" ]; then printf '%s\n' "$e"; return 0; fi
+		case "$1" in "$e"-*) printf '%s\n' "$e"; return 0 ;; esac   # new nests under existing
+		case "$e" in "$1"-*) printf '%s\n' "$e"; return 0 ;; esac   # existing nests under new
+	done
+	return 1
 }
 
 # Keep the newest $1 (default 3) "$CFG.bak.*" backups, delete the rest.
@@ -224,7 +234,7 @@ case "$1" in
 		nsnap=0
 		for pfx in $failed; do
 			nsnap=$((nsnap + 1)); snap="$tmpd/snap.$nsnap"
-			if "$SHARE/snapshot.uc" "$CFG" "$pfx" > "$snap" 2>/dev/null && [ -s "$snap" ]; then
+			if "$SHARE/snapshot.uc" "$CFG" "$pfx" $(sub_prefixes) > "$snap" 2>/dev/null && [ -s "$snap" ]; then
 				[ "$first" = 1 ] || printf ',' >> "$staged"
 				printf '{"label":"%s","outbounds":' "$pfx" >> "$staged"
 				cat "$snap" >> "$staged"
@@ -266,7 +276,7 @@ case "$1" in
 	sub-add)
 		valid_prefix "$2" || { echo "invalid prefix"; exit 1; }
 		case "$3" in http://*|https://*) ;; *) echo "invalid url"; exit 1 ;; esac
-		prefix_in_use "$2" "" && { echo "prefix already used"; exit 1; }
+		conf=$(prefix_conflict "$2" "") && { echo "prefix overlaps with prefix '$conf'"; exit 1; }
 		sec=$(uci add xray-monitor subscription 2>/dev/null)
 		uci set "xray-monitor.$sec.prefix"="$2"
 		uci set "xray-monitor.$sec.url"="$3"
@@ -285,7 +295,7 @@ case "$1" in
 		uci -q get "xray-monitor.$2" >/dev/null 2>&1 || { echo "no such subscription"; exit 1; }
 		if [ -n "$3" ]; then
 			valid_prefix "$3" || { echo "invalid prefix"; exit 1; }
-			prefix_in_use "$3" "$2" && { echo "prefix already used"; exit 1; }
+			conf=$(prefix_conflict "$3" "$2") && { echo "prefix overlaps with prefix '$conf'"; exit 1; }
 			uci set "xray-monitor.$2.prefix"="$3"
 		fi
 		if [ -n "$4" ]; then

@@ -45,26 +45,41 @@ function render_config(cfg, groups, locals) {
 	return replace(full, '"outbounds": "__OB__"', '"outbounds": ' + render_outbounds(groups, locals));
 }
 
+// The subscription prefix that OWNS a tag: the tag equals the prefix or starts
+// with "<prefix>-". Prefixes may nest ("proxy" and "proxy-work" are both legal
+// subscriptions), so on overlap the LONGEST match owns the tag - "proxy-work-fi"
+// belongs to "proxy-work", never to "proxy". First-match-wins (the old rule)
+// made ownership depend on argument order and let a failed "proxy" fetch
+// snapshot another subscription's exits, producing duplicate outbound tags.
+// Returns null when no prefix owns the tag.
+function owner_prefix(tag, prefixes) {
+	if (tag == null) tag = '';
+	let owner = null;
+	for (let i = 0; i < length(prefixes); i++) {
+		let p = prefixes[i];
+		if (tag == p || substr(tag, 0, length(p) + 1) == p + '-') {
+			if (owner == null || length(p) > length(owner)) owner = p;
+		}
+	}
+	return owner;
+}
+
 // Group an existing config's outbounds for re-emission by writers that do not
-// touch outbounds themselves (routing/balancers): proxies tagged <prefix> or
-// <prefix>-* go to their subscription's group (config order preserved), the
-// rest to locals. Without prefixes every outbound is local.
+// touch outbounds themselves (routing/balancers): each proxy outbound goes to
+// the group of the prefix that owns it (longest match, config order preserved),
+// the rest to locals. Without prefixes every outbound is local.
 function split_outbounds(cfg, prefixes) {
-	let groups = [];
-	for (let i = 0; i < length(prefixes); i++) push(groups, { label: prefixes[i], outbounds: [] });
+	let groups = [], by_label = {};
+	for (let i = 0; i < length(prefixes); i++) {
+		let grp = { label: prefixes[i], outbounds: [] };
+		push(groups, grp);
+		by_label[prefixes[i]] = grp;
+	}
 	let locals = [], obs = cfg.outbounds ?? [];
 	for (let i = 0; i < length(obs); i++) {
-		let placed = false;
-		if (obs[i].protocol in proxy_protos)
-			for (let g = 0; g < length(groups); g++) {
-				let p = groups[g].label;
-				if (obs[i].tag == p || substr(obs[i].tag, 0, length(p) + 1) == p + '-') {
-					push(groups[g].outbounds, obs[i]);
-					placed = true;
-					break;
-				}
-			}
-		if (!placed) push(locals, obs[i]);
+		let owner = (obs[i].protocol in proxy_protos) ? owner_prefix(obs[i].tag, prefixes) : null;
+		if (owner != null && exists(by_label, owner)) push(by_label[owner].outbounds, obs[i]);
+		else push(locals, obs[i]);
 	}
 	return { groups: groups, locals: locals };
 }
@@ -76,4 +91,4 @@ function emit(cfg, groups, locals, out_path) {
 	else printf('%s\n', render_config(cfg, groups, locals));
 }
 
-export { render_outbounds, render_config, split_outbounds, emit };
+export { render_outbounds, render_config, split_outbounds, owner_prefix, emit };
