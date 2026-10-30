@@ -26,14 +26,56 @@ mkdir -p "$STATE"
 # (`-w` waits but does not acquire), so poll the non-blocking `-n` try with a
 # cap; the EXIT trap releases the lock on every path.
 LOCK=/var/lock/xray-monitor
+LOCK_OWNER="$LOCK.owner"
 held=0
 STAGE_DIR=""
 cleanup() {
 	[ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"
-	[ "$held" = 1 ] && lock -u "$LOCK" 2>/dev/null
+	if [ "$held" = 1 ]; then
+		rm -f "$LOCK_OWNER"
+		lock -u "$LOCK" </dev/null >/dev/null 2>&1
+	fi
 	return 0
 }
 trap cleanup EXIT
+# cleanup runs on normal exits only; route the termination signals through
+# exit(1) so a signalled run still releases the lock and removes $STAGE_DIR.
+trap 'exit 1' INT TERM HUP
+
+# Take the mutation lock: bounded poll of the non-blocking try (~55 x 1 s).
+# The lock(1) holder is a lingering child process with ALL fds redirected to
+# /dev/null - inheriting this script's stdout would keep an rpcd command
+# substitution open (no EOF) until the rpcd timeout, long after this exit.
+# A run killed by SIGKILL/OOM cannot run its EXIT trap: its holder child
+# survives as an orphan and keeps the flock until reboot. $LOCK_OWNER records
+# the holder run's PID; when that process is gone, break the orphaned lock
+# (lock -u releases even an orphaned holder) and retry at once - still inside
+# the same overall budget, so a permanently stuck lock still fails in ~55 s.
+take_lock() {
+	local tries=0 stale opid
+	while :; do
+		if lock -n "$LOCK" </dev/null >/dev/null 2>&1; then
+			held=1
+			printf '%s\n' "$$" > "$LOCK_OWNER"
+			return 0
+		fi
+		stale=0
+		opid=$(cat "$LOCK_OWNER" 2>/dev/null)
+		if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then
+			rm -f "$LOCK_OWNER"          # before lock -u: past it a waiter may win the race and write a fresh one
+			lock -u "$LOCK" </dev/null >/dev/null 2>&1
+			stale=1
+		fi
+		# XRAYMON_NOWAIT=1 (exported by the rpcd backend): a UI click must not
+		# sit out the wait inside the rpcd call - the HTTP session can time out
+		# while the operation would still run afterwards. One try (plus the
+		# stale-lock recovery above); the cron path keeps the bounded wait.
+		[ "$XRAYMON_NOWAIT" = 1 ] && [ "$stale" = 0 ] && return 1
+		tries=$((tries + 1))
+		[ "$tries" -ge 55 ] && return 1
+		[ "$stale" = 1 ] || sleep 1
+	done
+}
 
 ua_default=$(uci -q get xray-monitor.sub.user_agent); [ -n "$ua_default" ] || ua_default="v2rayNG/1.8.0"
 cron=$(uci -q get xray-monitor.sub.cron); [ -n "$cron" ] || cron=1
@@ -81,11 +123,21 @@ sub_prefixes() {
 	done
 }
 valid_prefix() { echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'; }
-prefix_in_use() {  # <prefix> <exclude-id>
-	local id; for id in $(sub_ids); do
+# A new prefix must not OVERLAP an existing one: "proxy" vs "proxy-work" (either
+# direction, or equality) makes the managed-tag rule "<prefix> or <prefix>-*"
+# ambiguous - ownership would depend on argument order and staged groups could
+# carry the same outbound tag twice, which xray -test rejects. Prints the
+# conflicting existing prefix and returns 0 when <new> overlaps, 1 otherwise.
+prefix_conflict() {  # <new-prefix> <exclude-id>
+	local id e
+	for id in $(sub_ids); do
 		[ "$id" = "$2" ] && continue
-		[ "$(uci -q get "xray-monitor.$id.prefix")" = "$1" ] && return 0
-	done; return 1
+		e=$(uci -q get "xray-monitor.$id.prefix"); [ -n "$e" ] || e=proxy
+		if [ "$1" = "$e" ]; then printf '%s\n' "$e"; return 0; fi
+		case "$1" in "$e"-*) printf '%s\n' "$e"; return 0 ;; esac   # new nests under existing
+		case "$e" in "$1"-*) printf '%s\n' "$e"; return 0 ;; esac   # existing nests under new
+	done
+	return 1
 }
 
 # Keep the newest $1 (default 3) "$CFG.bak.*" backups, delete the rest.
@@ -119,15 +171,34 @@ api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
 # it loads every D/*.json, so a leftover `config.json.new.json` there would be
 # double-loaded. The extension-less copy keeps the final rename atomic on the
 # same filesystem while staying invisible to -confdir. Removed by the EXIT trap.
-#   stage_init        -> $STAGE_DIR created, candidate = $STAGE_DIR/config.json
-#   test_and_install <candidate> -> xray -test, then cp -> $CFG.new -> mv $CFG (atomic)
+#   stage_init      -> $STAGE_DIR created, candidate = $STAGE_DIR/config.json
+#   test_config     -> xray -test on a candidate (no writes anywhere)
+#   install_config  -> cp -> <target>.new -> mv onto the target (atomic)
+#   test_and_install <candidate> -> test_config || return; install_config
+# Writers run test_config BEFORE making the backup: a backup is only worth
+# keeping if a verified candidate actually follows it, and prune_backups keeps
+# just 3 - a series of failed attempts must not evict the meaningful ones.
 stage_init() {
 	STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xraymon.XXXXXX") || exit 1
 }
 
-test_and_install() {  # <candidate config.json> — validate, then atomically replace $CFG
-	"$XRAY" -test -format json -config "$1" >/dev/null 2>&1 || return 1
-	cp "$1" "$CFG.new" && mv "$CFG.new" "$CFG"
+test_config() {  # <candidate config.json> — validate only; no config writes
+	"$XRAY" -test -format json -config "$1" >/dev/null 2>&1
+}
+
+install_config() {  # <validated candidate> — atomically replace the live config
+	# $CFG may be a symlink (config-save used to write through it with `cat >`);
+	# cp+mv on $CFG itself would replace the LINK with a regular file. Resolve
+	# the target so the symlink survives and the rename stays atomic on it.
+	local target="$CFG" tmp
+	[ -L "$target" ] && target=$(readlink -f "$target")
+	tmp="$target.new"
+	cp "$1" "$tmp" && mv "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+}
+
+test_and_install() {  # <candidate config.json> — test, then install
+	test_config "$1" || return 1
+	install_config "$1"
 }
 
 # After a config change + restart, confirm xray came back healthy; if not,
@@ -153,19 +224,23 @@ verify_or_rollback() {
 do_apply() {
 	[ -s "$STATE/staged.json" ] || { echo "nothing staged"; return 1; }
 	api_before=0; api_up && api_before=1
-	bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 	stage_init
-	if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1 \
-		&& test_and_install "$STAGE_DIR/config.json"; then
-		/etc/init.d/xray restart >/dev/null 2>&1
-		if verify_or_rollback "$bak" "$api_before"; then
-			prune_backups
-			echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
-		else
-			echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; return 1
-		fi
+	apply_err=$("$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$STAGE_DIR/config.json" $(sub_prefixes) 2>&1 >/dev/null)
+	if [ -n "$apply_err" ]; then
+		echo "merge-failed" > "$STATE/status"
+		echo "staged merge failed - not applied: $apply_err"; return 1
+	fi
+	test_config "$STAGE_DIR/config.json" || {
+		echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1; }
+	bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
+	install_config "$STAGE_DIR/config.json" || {
+		echo "install-failed" > "$STATE/status"; echo "failed to install new config"; return 1; }
+	/etc/init.d/xray restart >/dev/null 2>&1
+	if verify_or_rollback "$bak" "$api_before"; then
+		prune_backups
+		echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
 	else
-		rm -f "$CFG.new"; echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1
+		echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; return 1
 	fi
 }
 
@@ -181,13 +256,14 @@ do_cron_sync() {
 
 case "$1" in
 	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync)
-		lw=0
-		while ! lock -n "$LOCK" 2>/dev/null; do
-			lw=$((lw + 1))
-			[ "$lw" -ge 55 ] && { echo "another xray-monitor operation is running"; exit 1; }
-			sleep 1
-		done
-		held=1
+		take_lock || {
+			if [ "$XRAYMON_NOWAIT" = 1 ]; then
+				echo "another xray-monitor operation is running, try again in a moment"
+			else
+				echo "another xray-monitor operation is running"
+			fi
+			exit 1
+		}
 		;;
 esac
 
@@ -224,7 +300,7 @@ case "$1" in
 		nsnap=0
 		for pfx in $failed; do
 			nsnap=$((nsnap + 1)); snap="$tmpd/snap.$nsnap"
-			if "$SHARE/snapshot.uc" "$CFG" "$pfx" > "$snap" 2>/dev/null && [ -s "$snap" ]; then
+			if "$SHARE/snapshot.uc" "$CFG" "$pfx" $(sub_prefixes) > "$snap" 2>/dev/null && [ -s "$snap" ]; then
 				[ "$first" = 1 ] || printf ',' >> "$staged"
 				printf '{"label":"%s","outbounds":' "$pfx" >> "$staged"
 				cat "$snap" >> "$staged"
@@ -247,9 +323,17 @@ case "$1" in
 		date +%s > "$STATE/last_fetch"
 		rm -rf "$tmpd"
 		case "$(cat "$STATE/status" 2>/dev/null)" in ok|partial) frc=0 ;; *) frc=1 ;; esac
-		# auto-apply runs in-process (fetch already holds the lock)
+		# auto-apply runs in-process (fetch already holds the lock). A failed
+		# apply must NOT read as a failed fetch: the fresh exits ARE staged
+		# (pending stays 1, the UI offers Apply again) - only swapping the
+		# config failed. Mark that explicitly instead of letting apply's
+		# test-failed/rolled-back stand in for the fetch's own state.
 		if [ "$auto_apply" = "1" ] && [ "$(cat "$STATE/pending" 2>/dev/null)" = "1" ]; then
-			do_apply >/dev/null 2>&1 || frc=1
+			apply_msg=$(do_apply 2>&1) || {
+				frc=1
+				echo "fetched-apply-failed" > "$STATE/status"
+				[ -n "$apply_msg" ] && echo "$apply_msg" >&2
+			}
 		fi
 		exit "$frc"
 		;;
@@ -266,7 +350,7 @@ case "$1" in
 	sub-add)
 		valid_prefix "$2" || { echo "invalid prefix"; exit 1; }
 		case "$3" in http://*|https://*) ;; *) echo "invalid url"; exit 1 ;; esac
-		prefix_in_use "$2" "" && { echo "prefix already used"; exit 1; }
+		conf=$(prefix_conflict "$2" "") && { echo "prefix overlaps with prefix '$conf'"; exit 1; }
 		sec=$(uci add xray-monitor subscription 2>/dev/null)
 		uci set "xray-monitor.$sec.prefix"="$2"
 		uci set "xray-monitor.$sec.url"="$3"
@@ -285,7 +369,7 @@ case "$1" in
 		uci -q get "xray-monitor.$2" >/dev/null 2>&1 || { echo "no such subscription"; exit 1; }
 		if [ -n "$3" ]; then
 			valid_prefix "$3" || { echo "invalid prefix"; exit 1; }
-			prefix_in_use "$3" "$2" && { echo "prefix already used"; exit 1; }
+			conf=$(prefix_conflict "$3" "$2") && { echo "prefix overlaps with prefix '$conf'"; exit 1; }
 			uci set "xray-monitor.$2.prefix"="$3"
 		fi
 		if [ -n "$4" ]; then
@@ -321,31 +405,30 @@ case "$1" in
 		[ -s "$2" ] || { echo "no input"; exit 1; }
 		case "$1" in routing-set) uc="$SHARE/routing.uc" ;; *) uc="$SHARE/balancers.uc" ;; esac
 		api_before=0; api_up && api_before=1
-		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
 		stage_init
 		if "$uc" set "$CFG" "$2" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1 \
-			&& test_and_install "$STAGE_DIR/config.json"; then
+			&& test_config "$STAGE_DIR/config.json"; then
+			bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
+			install_config "$STAGE_DIR/config.json" || { echo "failed to install new config"; exit 1; }
 			/etc/init.d/xray restart >/dev/null 2>&1
 			if verify_or_rollback "$bak" "$api_before"; then prune_backups; echo ok
 			else echo "xray/api failed health check - rolled back"; exit 1; fi
 		else
-			rm -f "$CFG.new"; echo "config test failed - not applied"; exit 1
+			echo "config test failed - not applied"; exit 1
 		fi
 		;;
 
 	config-save)
 		[ -s "$2" ] || { echo "empty config"; exit 1; }
+		test_config "$2" || { echo "xray -test failed; not saved"; exit 1; }
 		bak="$CFG.bak.manual.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if test_and_install "$2"; then
-			/etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" 0; then
-				prune_backups
-				echo "saved and restarted xray"
-			else
-				echo "saved but xray failed to start - rolled back"; exit 1
-			fi
+		install_config "$2" || { echo "failed to install new config"; exit 1; }
+		/etc/init.d/xray restart >/dev/null 2>&1
+		if verify_or_rollback "$bak" 0; then
+			prune_backups
+			echo "saved and restarted xray"
 		else
-			rm -f "$CFG.new"; echo "xray -test failed; not saved"; exit 1
+			echo "saved but xray failed to start - rolled back"; exit 1
 		fi
 		;;
 
@@ -401,17 +484,15 @@ case "$1" in
 			changed)   ;;
 			*)         echo "merge failed: $res"; exit 1 ;;
 		esac
+		test_config "$STAGE_DIR/config.json" || { echo "xray -test failed on merged config; not applied"; exit 1; }
 		bak="$CFG.bak.preapi.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if test_and_install "$STAGE_DIR/config.json"; then
-			/etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" 1; then
-				prune_backups
-				echo "enabled and restarted xray ($CFG)"
-			else
-				echo "enabled but stats API did not come up - rolled back"; exit 1
-			fi
+		install_config "$STAGE_DIR/config.json" || { echo "failed to install new config"; exit 1; }
+		/etc/init.d/xray restart >/dev/null 2>&1
+		if verify_or_rollback "$bak" 1; then
+			prune_backups
+			echo "enabled and restarted xray ($CFG)"
 		else
-			rm -f "$CFG.new"; echo "xray -test failed on merged config; not applied"; exit 1
+			echo "enabled but stats API did not come up - rolled back"; exit 1
 		fi
 		;;
 

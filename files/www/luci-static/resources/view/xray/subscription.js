@@ -61,7 +61,11 @@ function statusBadge(st) {
 	var m = ({ ok: ['#46a546', _('fetched OK')], applied: ['#46a546', _('applied')],
 		partial: ['#cc7a00', _('partial — some failed')], never: ['#888', _('never fetched')],
 		'no-subs': ['#888', _('no subscriptions')], 'fetch-error': ['#cc3300', _('fetch error')],
-		'test-failed': ['#cc3300', _('config test failed')] })[st] || ['#888', st];
+		'test-failed': ['#cc3300', _('config test failed')],
+		'merge-failed': ['#cc3300', _('staged merge failed')],
+		'install-failed': ['#cc3300', _('config install failed')],
+		'fetched-apply-failed': ['#cc3300', _('fetched — apply failed, changes stay staged')],
+		'rolled-back': ['#cc3300', _('applied but rolled back — xray unhealthy')] })[st] || ['#888', st];
 	return E('span', { 'style': 'background:' + m[0] + ';color:#fff;padding:2px 8px;border-radius:3px;' }, m[1]);
 }
 function tagList(a, c) {
@@ -74,6 +78,11 @@ function row(k, v) { return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td 
 function notify(res, okMsg) {
 	if (res && res.ok) ui.addNotification(null, E('p', okMsg), 'info');
 	else ui.addNotification(null, E('p', [ E('strong', {}, _('Failed: ')), document.createTextNode((res && res.msg) || _('error')) ]), 'error');
+	return refresh();
+}
+function rpcFail(e) {  // rpc-level failure (timeout, rpcd gone): still explain, then resync
+	ui.addNotification(null, E('p', [ E('strong', {}, _('Failed: ')),
+		document.createTextNode((e && (e.message || e.msg)) || _('error')) ]), 'error');
 	return refresh();
 }
 
@@ -186,7 +195,9 @@ function buildSettings() {
 function redraw() {
 	if (!root) return;
 	var fetchBtn = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Fetch now'));
-	fetchBtn.addEventListener('click', function() { busy(fetchBtn, callFetch().then(function() { return refresh(); })); });
+	fetchBtn.addEventListener('click', function() {
+		busy(fetchBtn, callFetch().then(function(r) { return notify(r, _('Fetched.')); }, rpcFail));
+	});
 	var applyBtn = E('button', { 'class': 'cbi-button cbi-button-positive', 'disabled': state.pending ? null : 'disabled' }, _('Apply & restart xray'));
 	applyBtn.addEventListener('click', function() {
 		if (!confirm(_('Apply staged outbounds to config.json and restart xray now?'))) return;

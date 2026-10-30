@@ -1,0 +1,9 @@
+{"groups":[
+ {"label":"proxy","outbounds":[
+  {"tag":"proxy-de","protocol":"vless","settings":{"vnext":[{"address":"de1.example.org","port":443,"users":[{"id":"a342d11e-d424-4583-b36e-524ab1f0afa4","encryption":"none"}]}]}},
+  {"tag":"proxy-work-fi","protocol":"vless","settings":{"vnext":[{"address":"fiwork1.example.org","port":8443,"users":[{"id":"b45be11f-d424-4583-b36e-524ab1f0afa4","encryption":"none"}]}]}}
+ ]},
+ {"label":"proxy-work","outbounds":[
+  {"tag":"proxy-work-fi","protocol":"vless","settings":{"vnext":[{"address":"fiwork2.example.org","port":9443,"users":[{"id":"c45be11f-d424-4583-b36e-524ab1f0afa4","encryption":"none"}]}]}}
+ ]}
+]}
