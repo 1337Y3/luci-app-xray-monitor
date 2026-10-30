@@ -43,6 +43,25 @@ EOF
 	return 1
 }
 
+# Which API services the CONFIG declares, so the UI can tell "not enabled"
+# from "enabled but down" without poking the API. Keep the required list in
+# sync with enable-api.uc. Sets api_services (config order, deduped) and
+# api_missing (required services absent from the config).
+API_SERVICES="StatsService HandlerService RoutingService"
+get_api_services() {  # -> api_services, api_missing
+	local cfg s x
+	api_services=""; api_missing=""
+	cfg=$(config_file)
+	[ -s "$cfg" ] || { api_missing="$API_SERVICES"; return; }
+	s=$(jsonfilter -i "$cfg" -e '@.api.services[*]' 2>/dev/null)
+	for x in $s; do
+		case " $api_services " in *" $x "*) ;; *) api_services="$api_services $x" ;; esac
+	done
+	for x in $API_SERVICES; do
+		case " $s " in *" $x "*) ;; *) api_missing="$api_missing $x" ;; esac
+	done
+}
+
 get_status() {
 	local pid hz starttime sysuptime up=0 running=0 version
 	pid=$(pgrep -f "$XRAY run" | head -n1)
@@ -58,6 +77,7 @@ get_status() {
 			[ "$up" -lt 0 ] && up=0
 		fi
 	fi
+	get_api_services
 	json_init
 	json_add_boolean running "$running"
 	json_add_int pid "${pid:-0}"
@@ -65,6 +85,12 @@ get_status() {
 	json_add_string version "${version:-unknown}"
 	json_add_string app_version "$(opkg status luci-app-xray-monitor 2>/dev/null | sed -n 's/^Version: //p' | head -n1)"
 	json_add_boolean confdir_dup "$(confdir_dup "$pid" && echo 1 || echo 0)"
+	json_add_array "api_services"
+	for x in $api_services; do json_add_string "" "$x"; done
+	json_close_array
+	json_add_array "api_missing"
+	for x in $api_missing; do json_add_string "" "$x"; done
+	json_close_array
 	json_dump
 }
 
