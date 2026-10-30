@@ -93,13 +93,47 @@ probe() {
 	fi
 }
 
+# Print an IPv6 address the way /proc/net/nf_conntrack spells dst=: eight
+# groups of 4 zero-padded hex digits, no "::" compression, e.g.
+# 2a01:4f8::1 -> 2a01:04f8:0000:0000:0000:0000:0000:0001. grep needs that
+# exact form - the compressed spelling never matches a conntrack line.
+expand6() {  # <ipv6>
+	local a="$1" pre post g n=0 preout="" postout=""
+	case "$a" in
+		*.*)  echo "$a"; return ;;   # IPv4-mapped/junk - leave as-is
+		*::*) pre="${a%%::*}"; post="${a##*::}" ;;
+		*)    pre="$a"; post="" ;;
+	esac
+	local IFS=:
+	for g in $pre; do
+		case "$g" in *[!0-9a-fA-F]*|'') echo "$a"; return ;; esac
+		preout="$preout$(printf '%04x:' $(( 0x$g )))"; n=$((n + 1))
+	done
+	for g in $post; do
+		case "$g" in *[!0-9a-fA-F]*|'') echo "$a"; return ;; esac
+		postout="$postout$(printf '%04x:' $(( 0x$g )))"; n=$((n + 1))
+	done
+	[ "$n" -gt 8 ] && { echo "$a"; return; }   # not 8-expandable - keep as-is
+	while [ "$n" -lt 8 ]; do postout="0000:$postout"; n=$((n + 1)); done
+	local out="${preout}${postout}"
+	echo "${out%:}"
+}
+
 # Is there a live (ESTABLISHED) connection to addr:port right now?
-# Resolves hostnames to IPs (subscription servers use hostnames).
+# Resolves hostnames to IPs (subscription servers use hostnames), preferring
+# A over AAAA; IPv6 literals and AAAA results are normalized via expand6().
 is_active() {
 	local addr="$1" port="$2" ips ip
 	case "$addr" in
-		*[!0-9.]*) ips=$(resolveip -4 -t 2 "$addr" 2>/dev/null) ;;  # contains non-IPv4 chars => hostname
-		*)         ips="$addr" ;;
+		*:*)        ips=$(expand6 "$addr") ;;                 # IPv6 literal
+		*[!0-9.]*)                                              # hostname
+			ips=$(resolveip -4 -t 2 "$addr" 2>/dev/null)
+			if [ -z "$ips" ]; then
+				ips=$(resolveip -6 -t 2 "$addr" 2>/dev/null \
+					| while IFS= read -r ip; do expand6 "$ip"; done)
+			fi
+			;;
+		*)          ips="$addr" ;;
 	esac
 	[ -n "$ips" ] || ips="$addr"
 	for ip in $ips; do

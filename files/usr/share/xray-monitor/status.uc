@@ -39,7 +39,11 @@ let servers = [], obs = cfg.outbounds ?? [];
 for (let i = 0; i < length(obs); i++) {
 	let o = obs[i];
 	if (!(o.protocol in proxy_protos)) continue;
-	let s = o.settings ?? {}, v = (s.vnext && s.vnext[0]) ? s.vnext[0] : {};
+	// vless/vmess keep the endpoint in settings.vnext[0]; trojan/shadowsocks
+	// (and anything else without vnext) in settings.servers[0].
+	let s = o.settings ?? {};
+	let v = (s.vnext && s.vnext[0]) ? s.vnext[0] :
+	        (s.servers && s.servers[0]) ? s.servers[0] : {};
 	let ss = o.streamSettings ?? {}, rs = ss.realitySettings ?? {}, xs = ss.xhttpSettings ?? {};
 	push(servers, { tag: o.tag, address: v.address, port: v.port, network: ss.network, mode: xs.mode, sni: rs.serverName });
 }
