@@ -26,14 +26,51 @@ mkdir -p "$STATE"
 # (`-w` waits but does not acquire), so poll the non-blocking `-n` try with a
 # cap; the EXIT trap releases the lock on every path.
 LOCK=/var/lock/xray-monitor
+LOCK_OWNER="$LOCK.owner"
 held=0
 STAGE_DIR=""
 cleanup() {
 	[ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"
-	[ "$held" = 1 ] && lock -u "$LOCK" </dev/null >/dev/null 2>&1
+	if [ "$held" = 1 ]; then
+		rm -f "$LOCK_OWNER"
+		lock -u "$LOCK" </dev/null >/dev/null 2>&1
+	fi
 	return 0
 }
 trap cleanup EXIT
+# cleanup runs on normal exits only; route the termination signals through
+# exit(1) so a signalled run still releases the lock and removes $STAGE_DIR.
+trap 'exit 1' INT TERM HUP
+
+# Take the mutation lock: bounded poll of the non-blocking try (~55 x 1 s).
+# The lock(1) holder is a lingering child process with ALL fds redirected to
+# /dev/null - inheriting this script's stdout would keep an rpcd command
+# substitution open (no EOF) until the rpcd timeout, long after this exit.
+# A run killed by SIGKILL/OOM cannot run its EXIT trap: its holder child
+# survives as an orphan and keeps the flock until reboot. $LOCK_OWNER records
+# the holder run's PID; when that process is gone, break the orphaned lock
+# (lock -u releases even an orphaned holder) and retry at once - still inside
+# the same overall budget, so a permanently stuck lock still fails in ~55 s.
+take_lock() {
+	local tries=0 stale opid
+	while :; do
+		if lock -n "$LOCK" </dev/null >/dev/null 2>&1; then
+			held=1
+			printf '%s\n' "$$" > "$LOCK_OWNER"
+			return 0
+		fi
+		stale=0
+		opid=$(cat "$LOCK_OWNER" 2>/dev/null)
+		if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then
+			rm -f "$LOCK_OWNER"          # before lock -u: past it a waiter may win the race and write a fresh one
+			lock -u "$LOCK" </dev/null >/dev/null 2>&1
+			stale=1
+		fi
+		tries=$((tries + 1))
+		[ "$tries" -ge 55 ] && return 1
+		[ "$stale" = 1 ] || sleep 1
+	done
+}
 
 ua_default=$(uci -q get xray-monitor.sub.user_agent); [ -n "$ua_default" ] || ua_default="v2rayNG/1.8.0"
 cron=$(uci -q get xray-monitor.sub.cron); [ -n "$cron" ] || cron=1
@@ -214,17 +251,7 @@ do_cron_sync() {
 
 case "$1" in
 	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync)
-		lw=0
-		# The lock(1) holder is a lingering child process: redirect ALL its fds,
-		# or it inherits this script's stdout - under rpcd that is the command
-		# substitution pipe, which then never sees EOF and the call hangs until
-		# the rpcd timeout long after this script has exited.
-		while ! lock -n "$LOCK" </dev/null >/dev/null 2>&1; do
-			lw=$((lw + 1))
-			[ "$lw" -ge 55 ] && { echo "another xray-monitor operation is running"; exit 1; }
-			sleep 1
-		done
-		held=1
+		take_lock || { echo "another xray-monitor operation is running"; exit 1; }
 		;;
 esac
 
