@@ -19,6 +19,22 @@ config_file() {
 CFG=$(config_file)
 mkdir -p "$STATE"
 
+# Mutating commands (fetch/apply/sub-*/set-cfg/routing-set/balancers-set/
+# config-save/enable-api/cron-sync) serialize on this lock so concurrent cron
+# fetches and UI/RPC clicks can't interleave uci commits, staging and config
+# renames. Read-only commands skip it. OpenWrt's lock(1) has no bounded wait
+# (`-w` waits but does not acquire), so poll the non-blocking `-n` try with a
+# cap; the EXIT trap releases the lock on every path.
+LOCK=/var/lock/xray-monitor
+held=0
+STAGE_DIR=""
+cleanup() {
+	[ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"
+	[ "$held" = 1 ] && lock -u "$LOCK" 2>/dev/null
+	return 0
+}
+trap cleanup EXIT
+
 ua_default=$(uci -q get xray-monitor.sub.user_agent); [ -n "$ua_default" ] || ua_default="v2rayNG/1.8.0"
 cron=$(uci -q get xray-monitor.sub.cron); [ -n "$cron" ] || cron=1
 cron_schedule=$(uci -q get xray-monitor.sub.cron_schedule); [ -n "$cron_schedule" ] || cron_schedule="0 * * * *"
@@ -102,12 +118,11 @@ api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
 # own mktemp(1) directory, never next to $CFG: when xray runs with `-confdir D`
 # it loads every D/*.json, so a leftover `config.json.new.json` there would be
 # double-loaded. The extension-less copy keeps the final rename atomic on the
-# same filesystem while staying invisible to -confdir.
-#   stage_init        -> $STAGE_DIR created (traps cleanup), candidate = $STAGE_DIR/config.json
+# same filesystem while staying invisible to -confdir. Removed by the EXIT trap.
+#   stage_init        -> $STAGE_DIR created, candidate = $STAGE_DIR/config.json
 #   test_and_install <candidate> -> xray -test, then cp -> $CFG.new -> mv $CFG (atomic)
 stage_init() {
 	STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xraymon.XXXXXX") || exit 1
-	trap 'rm -rf "$STAGE_DIR"' EXIT
 }
 
 test_and_install() {  # <candidate config.json> — validate, then atomically replace $CFG
@@ -130,6 +145,51 @@ verify_or_rollback() {
 	/etc/init.d/xray restart >/dev/null 2>&1
 	return 1
 }
+
+# `apply` as a function: the command runs it under the lock, and fetch's
+# auto-apply calls it in-process - re-running `"$0" apply` would deadlock on
+# the very lock fetch already holds. Non-zero return (and state files) on any
+# failure; rc propagates to the caller.
+do_apply() {
+	[ -s "$STATE/staged.json" ] || { echo "nothing staged"; return 1; }
+	api_before=0; api_up && api_before=1
+	bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
+	stage_init
+	if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1 \
+		&& test_and_install "$STAGE_DIR/config.json"; then
+		/etc/init.d/xray restart >/dev/null 2>&1
+		if verify_or_rollback "$bak" "$api_before"; then
+			prune_backups
+			echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
+		else
+			echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; return 1
+		fi
+	else
+		rm -f "$CFG.new"; echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1
+	fi
+}
+
+# cron-sync likewise: set-cfg calls it in-process instead of `"$0" cron-sync`.
+do_cron_sync() {
+	CRON=/etc/crontabs/root
+	mkdir -p /etc/crontabs; touch "$CRON"
+	sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
+	[ "$cron" != "0" ] && echo "$cron_schedule /usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1" >> "$CRON"
+	/etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart 2>/dev/null
+	echo ok
+}
+
+case "$1" in
+	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync)
+		lw=0
+		while ! lock -n "$LOCK" 2>/dev/null; do
+			lw=$((lw + 1))
+			[ "$lw" -ge 55 ] && { echo "another xray-monitor operation is running"; exit 1; }
+			sleep 1
+		done
+		held=1
+		;;
+esac
 
 case "$1" in
 	fetch)
@@ -186,27 +246,16 @@ case "$1" in
 		fi
 		date +%s > "$STATE/last_fetch"
 		rm -rf "$tmpd"
-		if [ "$auto_apply" = "1" ] && [ "$(cat "$STATE/pending" 2>/dev/null)" = "1" ]; then "$0" apply >/dev/null 2>&1; fi
-		case "$(cat "$STATE/status" 2>/dev/null)" in ok|partial) exit 0 ;; *) exit 1 ;; esac
+		case "$(cat "$STATE/status" 2>/dev/null)" in ok|partial) frc=0 ;; *) frc=1 ;; esac
+		# auto-apply runs in-process (fetch already holds the lock)
+		if [ "$auto_apply" = "1" ] && [ "$(cat "$STATE/pending" 2>/dev/null)" = "1" ]; then
+			do_apply >/dev/null 2>&1 || frc=1
+		fi
+		exit "$frc"
 		;;
 
 	apply)
-		[ -s "$STATE/staged.json" ] || { echo "nothing staged"; exit 1; }
-		api_before=0; api_up && api_before=1
-		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		stage_init
-		if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1 \
-			&& test_and_install "$STAGE_DIR/config.json"; then
-			/etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" "$api_before"; then
-				prune_backups
-				echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
-			else
-				echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; exit 1
-			fi
-		else
-			rm -f "$CFG.new"; echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; exit 1
-		fi
+		do_apply
 		;;
 
 	status)
@@ -257,17 +306,12 @@ case "$1" in
 		[ -n "$4" ] && uci set xray-monitor.sub.auto_apply="$4"
 		[ -n "$5" ] && uci set xray-monitor.sub.user_agent="$5"
 		uci commit xray-monitor
-		"$0" cron-sync >/dev/null 2>&1
+		do_cron_sync >/dev/null 2>&1
 		echo ok
 		;;
 
 	cron-sync)
-		CRON=/etc/crontabs/root
-		mkdir -p /etc/crontabs; touch "$CRON"
-		sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
-		[ "$cron" != "0" ] && echo "$cron_schedule /usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1" >> "$CRON"
-		/etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart 2>/dev/null
-		echo ok
+		do_cron_sync
 		;;
 
 	routing-get)   "$SHARE/routing.uc" get "$CFG" ;;
