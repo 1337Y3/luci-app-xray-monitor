@@ -57,8 +57,11 @@ get_api_services() {  # -> api_services, api_missing
 	for x in $s; do
 		case " $api_services " in *" $x "*) ;; *) api_services="$api_services $x" ;; esac
 	done
+	# compare against the deduped, space-separated api_services, not $s:
+	# jsonfilter prints one service per line, so a " $s " pattern match would
+	# never see the space after a name and every service would read "missing"
 	for x in $API_SERVICES; do
-		case " $s " in *" $x "*) ;; *) api_missing="$api_missing $x" ;; esac
+		case " $api_services " in *" $x "*) ;; *) api_missing="$api_missing $x" ;; esac
 	done
 }
 
