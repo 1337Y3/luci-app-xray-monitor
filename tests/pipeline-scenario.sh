@@ -1,16 +1,19 @@
 #!/bin/sh
 # Sandbox scenario for the config write pipeline in xray-sub (F-prep:
 # commit_config + post_restart_hooks + no-restart mode). Everything runs inside
-# a throwaway sandbox: a copy of xray-sub with its paths rewritten, the real
-# .uc transforms, and stubs for xray / pgrep / uci / /etc/init.d/xray that only
-# log. The live router is never touched - no service restart, nothing outside
-# the sandbox is written.
+# a throwaway sandbox: a copy of xray-sub with EVERY writable path it mentions
+# rewritten into the sandbox (config, state, backups, staging, lock, crontab,
+# init scripts, /tmp downloads), the real .uc transforms, and stubs for xray /
+# pgrep / uci / opkg / the init scripts that only log. The live router is never
+# touched - no service restart, nothing outside the sandbox is written; a setup
+# safety net aborts if any live writable path is still reachable in the copy.
 #   sh tests/pipeline-scenario.sh [sandbox-dir]     (needs ucode + ucode-mod-fs)
 #   KEEP_SB=1 sh tests/pipeline-scenario.sh ...     keep the sandbox for review
 # Covered, per write path (apply / routing-set / balancers-set / config-save /
 # enable-api): backup name+kind, candidate validated then installed, restart
 # invoked, post_restart_hooks fired, prune_backups run; plus the test-failed
-# path, the verify-failed (rollback) path, and no-restart (install only).
+# path, the verify-failed (rollback) path, no-restart (install only), and a
+# prune failure that must not fail the write.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -34,9 +37,10 @@ mkdir -p "$SB/bin" "$SB/etc/init.d" "$SB/etc/xray" "$SB/state" "$SB/lock" "$SB/l
 	"$SB/work" "$SB/tmp" "$SB/share" "$SB/flags"
 cp -a "$SHARESRC" "$SB/share/xray-monitor"
 
-# The sandboxed copy: same code, every path pointed into the sandbox.
-# post_restart_hooks gets a logging body so the scenario can observe it;
-# everything else is byte-identical to the installed script.
+# The sandboxed copy: same code, every writable path pointed into the sandbox
+# (write pipeline, cron-sync, self-update's download). post_restart_hooks gets
+# a logging body so the scenario can observe it; everything else is
+# byte-identical to the installed script.
 sed \
 	-e "s|^SHARE=.*|SHARE=$SB/share/xray-monitor|" \
 	-e "s|^STATE=.*|STATE=$SB/state|" \
@@ -44,17 +48,23 @@ sed \
 	-e "s|^LOCK=.*|LOCK=$SB/lock/xray-monitor|" \
 	-e "s|echo \"/etc/xray/config.json\"|echo \"$SB/etc/xray/config.json\"|" \
 	-e "s|/etc/init\.d/xray|$SB/etc/init.d/xray|g" \
+	-e "s|/etc/init\.d/cron|$SB/etc/init.d/cron|g" \
+	-e "s|/etc/crontabs|$SB/etc/crontabs|g" \
+	-e "s|/usr/share/xray-monitor/xray-sub|$SB/sub|g" \
+	-e "s|/tmp/luci-app-xray-monitor\.ipk|$SB/tmp/luci-app-xray-monitor.ipk|g" \
 	-e 's|post_restart_hooks() { return 0; }|post_restart_hooks() { echo hook >> "${STUB_HOOK_LOG:-/dev/null}"; return 0; }|' \
 	"$SHARESRC/xray-sub" > "$SB/sub"
-for pat in "SHARE=$SB" "STATE=$SB" "XRAY=$SB" "LOCK=$SB" "$SB/etc/xray/config.json" "STUB_HOOK_LOG"; do
+for pat in "SHARE=$SB" "STATE=$SB" "XRAY=$SB" "LOCK=$SB" "$SB/etc/xray/config.json" \
+	"$SB/etc/init.d/xray" "$SB/etc/crontabs/root" "$SB/etc/init.d/cron" "STUB_HOOK_LOG"; do
 	grep -q -- "$pat" "$SB/sub" || { echo "scenario setup failed, rewrite missed: $pat"; exit 1; }
 done
-# safety net: the copy must not reach the live config or the real init script.
-# ($SB itself contains "/etc/init.d/xray", so compare occurrence counts.)
-n_all=$(grep -o '/etc/init\.d/xray' "$SB/sub" | wc -l | tr -d ' ')
-n_sbx=$(grep -o "$SB/etc/init\.d/xray" "$SB/sub" | wc -l | tr -d ' ')
-if grep -q 'echo "/etc/xray' "$SB/sub" || [ "$n_all" != "$n_sbx" ]; then
-	echo "scenario setup failed: live /etc still reachable in the copy"; exit 1
+# safety net: mask the sandbox references (and the /etc, /tmp they cover),
+# then no live writable path may remain in the copy
+sed -e "s|$SB|<SB>|g" -e 's|<SB>/etc||g' -e 's|<SB>/tmp||g' "$SB/sub" > "$SB/work/sub-check.txt"
+if grep -q 'echo "/etc/xray' "$SB/work/sub-check.txt" \
+	|| grep -Eq '/etc/(init\.d|xray|crontabs)' "$SB/work/sub-check.txt" \
+	|| grep -q '/tmp/luci-app' "$SB/work/sub-check.txt"; then
+	echo "scenario setup failed: a live writable path is still reachable in the copy"; exit 1
 fi
 
 # OpenWrt's lock(1) is what actually serializes writers; elsewhere (dev boxes)
@@ -98,13 +108,21 @@ cat > "$SB/bin/uci" <<'EOF'
 # (sub_prefixes empty = legacy "all proxy outbounds are managed" mode)
 exit 1
 EOF
+cat > "$SB/bin/opkg" <<'EOF'
+#!/bin/sh
+# opkg stub: even if a future case reaches self-update, nothing gets installed
+echo "opkg $*" >> "${STUB_OPKG_LOG:-/dev/null}"
+exit 0
+EOF
 cat > "$SB/etc/init.d/xray" <<'EOF'
 #!/bin/sh
 # init script stub: records what it was asked to do instead of restarting xray
 echo "$*" >> "${STUB_INITD_LOG:-/dev/null}"
 exit 0
 EOF
-chmod 0755 "$SB/bin/xray" "$SB/bin/pgrep" "$SB/bin/uci" "$SB/etc/init.d/xray" "$SB/sub"
+cp "$SB/etc/init.d/xray" "$SB/etc/init.d/cron"
+chmod 0755 "$SB/bin/xray" "$SB/bin/pgrep" "$SB/bin/uci" "$SB/bin/opkg" \
+	"$SB/etc/init.d/xray" "$SB/etc/init.d/cron" "$SB/sub"
 touch "$SB/lock/xray-monitor"
 
 export TMPDIR="$SB/tmp"
@@ -112,7 +130,8 @@ export STUB_LOG="$SB/log/xray-test.log"
 export STUB_HOOK_LOG="$SB/log/hooks.log"
 export STUB_INITD_LOG="$SB/log/initd.log"
 export STUB_PGREP_DOWN="$SB/flags/xray-down"
-: > "$STUB_LOG"; : > "$STUB_HOOK_LOG"; : > "$STUB_INITD_LOG"
+export STUB_OPKG_LOG="$SB/log/opkg.log"
+: > "$STUB_LOG"; : > "$STUB_HOOK_LOG"; : > "$STUB_INITD_LOG"; : > "$STUB_OPKG_LOG"
 
 CFG="$SB/etc/xray/config.json"
 fails=0
@@ -227,6 +246,32 @@ is "enable-api: merged config has StatsService" "$(grep -q StatsService "$CFG" &
 ok_eq "enable-api: restart invoked once" "$((r0 + 1))" "$(restarts)"
 ok_eq "enable-api: post_restart_hooks ran" "$((h0 + 1))" "$(hookruns)"
 
+echo "== prune failure: an undeletable old backup must not fail the write"
+if [ "$TOUCH_T" = 1 ]; then
+	reset_cfg
+	# 3 deletable old backups plus a directory with the oldest mtime: prune
+	# keeps the 3 newest, rm(1) cannot remove the directory and fails last
+	mkdir -p "$CFG.bak.olddir"
+	touch -t 202001010000 "$CFG.bak.olddir"
+	i=1
+	while [ "$i" -le 3 ]; do
+		cp "$CFG" "$CFG.bak.old$i"
+		touch -t 20200101010$i "$CFG.bak.old$i"
+		i=$((i + 1))
+	done
+	cp "$CFG" "$SB/work/pre-prune.json"
+	cp "$FIX/staged-clean.json" "$SB/state/staged.json"
+	out=$(runsub apply 2>/dev/null); rc=$?
+	ok_eq "prune-failure: stdout still ok" "ok" "$out"
+	ok_eq "prune-failure: rc still 0" 0 "$rc"
+	ok_eq "prune-failure: status still applied" "applied" "$(cat "$SB/state/status" 2>/dev/null)"
+	is "prune-failure: candidate installed anyway" "$(differs "$CFG" "$SB/work/pre-prune.json")"
+	is "prune-failure: rm really failed (directory kept)" "$([ -d "$CFG.bak.olddir" ] && echo 1 || echo 0)"
+	rm -rf "$CFG.bak.olddir"
+else
+	echo "NOTE   touch -t unavailable - prune-failure case skipped"
+fi
+
 echo "== test-failed: a rejected candidate leaves the live config alone"
 reset_cfg
 cp "$CFG" "$SB/work/pre-fail.json"
@@ -297,15 +342,22 @@ ok_eq "no-restart: no hooks" "$h0" "$(hookruns)"
 
 printf '{"outbounds":[]}\nSTUB_TEST_FAIL\n' > "$SB/work/nr-bad.json"
 cat > "$SB/work/nrbad-driver.sh" <<EOF
+COMMIT_BAK="stale-from-a-previous-call"
 stage_init
 cp "$SB/work/nr-bad.json" "\$STAGE_DIR/config.json"
 commit_config "" 0 "\$STAGE_DIR/config.json" no-restart
 echo "rc=\$?"
+echo "bak=[\$COMMIT_BAK]"
 EOF
 cat "$SB/lib.sh" "$SB/work/nrbad-driver.sh" > "$SB/work/nrbad-run.sh"
+nb0=$(baks)
 nr2=$(PATH="$SB/bin:$PATH" sh "$SB/work/nrbad-run.sh" 2>/dev/null); nr2rc=$?
 ok_eq "no-restart(bad candidate): commit_config rc=1" 1 "$(printf '%s\n' "$nr2" | sed -n 's/^rc=//p')"
 ok_eq "no-restart(bad candidate): driver rc" 0 "$nr2rc"
+ok_eq "no-restart(bad candidate): \$COMMIT_BAK empty (reset per call)" "bak=[]" \
+	"$(printf '%s\n' "$nr2" | grep '^bak=')"
+ok_eq "no-restart(bad candidate): no snapshot left behind" "$nb0" "$(baks)"
+ok_eq "no-restart(bad candidate): last xray -test verdict" "fail" "$(last_test)"
 is "no-restart(bad candidate): live config untouched" "$(same "$CFG" "$SB/work/nr-cand.json")"
 
 echo "== no-restart + fallback: the documented F14 recipe (restore + restart + verify)"
