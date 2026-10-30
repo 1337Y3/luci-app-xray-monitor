@@ -2,18 +2,23 @@
 # Sandbox scenario for the config write pipeline in xray-sub (F-prep:
 # commit_config + post_restart_hooks + no-restart mode). Everything runs inside
 # a throwaway sandbox: a copy of xray-sub with EVERY writable path it mentions
-# rewritten into the sandbox (config, state, backups, staging, lock, crontab,
-# init scripts, /tmp downloads), the real .uc transforms, and stubs for xray /
-# pgrep / uci / opkg / the init scripts that only log. The live router is never
-# touched - no service restart, nothing outside the sandbox is written; a setup
-# safety net aborts if any live writable path is still reachable in the copy.
+# rewritten into the sandbox (config, state, backups, staging, both locks,
+# tmpxray state, crontab, init scripts, /tmp downloads), the real .uc
+# transforms, and stubs for xray / pgrep / uci / opkg / the init scripts that
+# only log. The live router is never touched - no service restart, nothing
+# outside the sandbox is written; a setup safety net aborts if any live
+# writable path is still reachable in the copy.
 #   sh tests/pipeline-scenario.sh [sandbox-dir]     (needs ucode + ucode-mod-fs)
 #   KEEP_SB=1 sh tests/pipeline-scenario.sh ...     keep the sandbox for review
 # Covered, per write path (apply / routing-set / balancers-set / config-save /
 # enable-api): backup name+kind, candidate validated then installed, restart
 # invoked, post_restart_hooks fired, prune_backups run; plus the test-failed
-# path, the verify-failed (rollback) path, no-restart (install only), and a
-# prune failure that must not fail the write.
+# path, the verify-failed (rollback) path, a config.json that is a SYMLINK
+# (snapshot must dereference, rollback must restore through the link),
+# no-restart (install only), a prune failure that must not fail the write, and
+# the mutation lock itself: a held flock fails a NOWAIT writer at once and a
+# waiting writer succeeds after the holder lets go (only where flock(1) is
+# real - a stubbed flock serializes nothing).
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -34,18 +39,20 @@ cleanup() { [ "$KEEP" = 1 ] || rm -rf "$SB"; return 0; }
 trap cleanup EXIT
 
 mkdir -p "$SB/bin" "$SB/etc/init.d" "$SB/etc/xray" "$SB/state" "$SB/lock" "$SB/log" \
-	"$SB/work" "$SB/tmp" "$SB/share" "$SB/flags"
+	"$SB/work" "$SB/tmp" "$SB/share" "$SB/flags" "$SB/tmp/xray-monitor"
 cp -a "$SHARESRC" "$SB/share/xray-monitor"
 
 # The sandboxed copy: same code, every writable path pointed into the sandbox
-# (write pipeline, cron-sync, self-update's download). post_restart_hooks gets
-# a logging body so the scenario can observe it; everything else is
-# byte-identical to the installed script.
+# (write pipeline, both locks, tmpxray state, cron-sync, self-update's
+# download). post_restart_hooks gets a logging body so the scenario can
+# observe it; everything else is byte-identical to the installed script.
 sed \
 	-e "s|^SHARE=.*|SHARE=$SB/share/xray-monitor|" \
 	-e "s|^STATE=.*|STATE=$SB/state|" \
 	-e "s|^XRAY=.*|XRAY=$SB/bin/xray|" \
 	-e "s|^LOCK=.*|LOCK=$SB/lock/xray-monitor|" \
+	-e "s|^TLOCK=.*|TLOCK=$SB/lock/xray-monitor-tmpxray|" \
+	-e "s|^TSTATE_DIR=.*|TSTATE_DIR=$SB/tmp/xray-monitor|" \
 	-e "s|echo \"/etc/xray/config.json\"|echo \"$SB/etc/xray/config.json\"|" \
 	-e "s|/etc/init\.d/xray|$SB/etc/init.d/xray|g" \
 	-e "s|/etc/init\.d/cron|$SB/etc/init.d/cron|g" \
@@ -54,24 +61,33 @@ sed \
 	-e "s|/tmp/luci-app-xray-monitor\.ipk|$SB/tmp/luci-app-xray-monitor.ipk|g" \
 	-e 's|post_restart_hooks() { return 0; }|post_restart_hooks() { echo hook >> "${STUB_HOOK_LOG:-/dev/null}"; return 0; }|' \
 	"$SHARESRC/xray-sub" > "$SB/sub"
-for pat in "SHARE=$SB" "STATE=$SB" "XRAY=$SB" "LOCK=$SB" "$SB/etc/xray/config.json" \
-	"$SB/etc/init.d/xray" "$SB/etc/crontabs/root" "$SB/etc/init.d/cron" "STUB_HOOK_LOG"; do
+for pat in "SHARE=$SB" "STATE=$SB" "XRAY=$SB" "LOCK=$SB" "TLOCK=$SB" "TSTATE_DIR=$SB" \
+	"$SB/etc/xray/config.json" "$SB/etc/init.d/xray" "$SB/etc/crontabs/root" \
+	"$SB/etc/init.d/cron" "STUB_HOOK_LOG"; do
 	grep -q -- "$pat" "$SB/sub" || { echo "scenario setup failed, rewrite missed: $pat"; exit 1; }
 done
 # safety net: mask the sandbox references (and the /etc, /tmp they cover),
-# then no live writable path may remain in the copy
+# then no live writable path may remain in the copy - including the real
+# /var/lock and /tmp/xray-monitor that TLOCK / TSTATE_DIR would otherwise use
 sed -e "s|$SB|<SB>|g" -e 's|<SB>/etc||g' -e 's|<SB>/tmp||g' "$SB/sub" > "$SB/work/sub-check.txt"
 if grep -q 'echo "/etc/xray' "$SB/work/sub-check.txt" \
 	|| grep -Eq '/etc/(init\.d|xray|crontabs)' "$SB/work/sub-check.txt" \
-	|| grep -q '/tmp/luci-app' "$SB/work/sub-check.txt"; then
+	|| grep -q '/var/lock' "$SB/work/sub-check.txt" \
+	|| grep -q '/tmp/luci-app' "$SB/work/sub-check.txt" \
+	|| grep -q '/tmp/xray-monitor' "$SB/work/sub-check.txt"; then
 	echo "scenario setup failed: a live writable path is still reachable in the copy"; exit 1
 fi
 
-# OpenWrt's lock(1) is what actually serializes writers; elsewhere (dev boxes)
-# fall back to a no-op so the scenario can still exercise the pipeline.
-if ! command -v lock >/dev/null 2>&1; then
-	printf '#!/bin/sh\n# no-op lock(1) stand-in (not on OpenWrt): no real serialization\nexit 0\n' > "$SB/bin/lock"
-	echo "NOTE   lock(1) not found - using a no-op stub"
+# Writers serialize with flock(2) on an open descriptor (`flock FD`, busybox
+# and util-linux alike). Where no flock exists (dev boxes) fall back to a
+# no-op stub: the pipeline still runs, but nothing serializes - the lock
+# assertions below are skipped there.
+FLOCK_STUB=0
+if ! command -v flock >/dev/null 2>&1; then
+	printf '#!/bin/sh\n# no-op flock(1) stand-in (no real flock on this box): no serialization\nexit 0\n' > "$SB/bin/flock"
+	chmod 0755 "$SB/bin/flock"
+	FLOCK_STUB=1
+	echo "NOTE   flock(1) not found - using a no-op stub, lock cases skipped"
 fi
 
 cat > "$SB/bin/xray" <<'EOF'
@@ -148,6 +164,7 @@ same()  { if cmp -s "$1" "$2"; then echo 1; else echo 0; fi; }
 differs() { if cmp -s "$1" "$2"; then echo 0; else echo 1; fi; }
 
 runsub()    { PATH="$SB/bin:$PATH" sh "$SB/sub" "$@"; }
+runsub_nw() { XRAYMON_NOWAIT=1 PATH="$SB/bin:$PATH" sh "$SB/sub" "$@"; }
 lines()     { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
 restarts()  { lines "$STUB_INITD_LOG"; }
 hookruns()  { lines "$STUB_HOOK_LOG"; }
@@ -318,6 +335,43 @@ ok_eq "verify-failed(apply): status file" "rolled-back" "$(cat "$SB/state/status
 is "verify-failed(apply): snapshot restored" "$(same "$CFG" "$SB/work/pre-rb.json")"
 rm -f "$STUB_PGREP_DOWN"
 
+echo "== symlinked config.json: snapshot dereferences, rollback restores through the link"
+# The live config is a symlink to a real file (set-cfg can point xray at one).
+# The snapshot MUST be a regular file with the OLD content - `cp -a` would
+# copy the link itself, so after the install the "backup" would already hold
+# the NEW config and the rollback below would restore nothing.
+REAL="$SB/etc/xray/config.real.json"
+rm -f "$CFG" "$CFG".bak.* "$CFG.new" "$REAL" "$REAL.new"
+cp "$FIX/config.json" "$REAL"
+ln -s "$REAL" "$CFG"
+cp "$FIX/staged-clean.json" "$SB/state/staged.json"
+cp "$REAL" "$SB/work/pre-sym.json"
+is "symlink: the staged change really differs from the old config" "$(differs "$SB/work/exp1.json" "$SB/work/pre-sym.json")"
+touch "$STUB_PGREP_DOWN"
+r0=$(restarts)
+out=$(runsub apply 2>/dev/null); rc=$?
+ok_eq "symlink(apply): stdout" "applied but xray/api failed health check - rolled back" "$out"
+ok_eq "symlink(apply): rc" 1 "$rc"
+ab=$(auto_bak)
+is "symlink: snapshot is a regular file, not a symlink into the live config" "$([ -f "$ab" ] && [ ! -L "$ab" ] && echo 1 || echo 0)"
+is "symlink: snapshot holds the OLD config" "$(same "$ab" "$SB/work/pre-sym.json")"
+is "symlink: OLD content back through the link after rollback" "$(same "$CFG" "$SB/work/pre-sym.json")"
+is "symlink: config.json is still a symlink" "$([ -L "$CFG" ] && echo 1 || echo 0)"
+is "symlink: no leftover .new beside the real file" "$([ ! -e "$REAL.new" ] && echo 1 || echo 0)"
+ok_eq "symlink: restart tried twice (install + rollback)" "$((r0 + 2))" "$(restarts)"
+rm -f "$STUB_PGREP_DOWN"
+# a successful write through a symlink, too: the link must survive it
+rm -f "$CFG".bak.*
+cp "$REAL" "$SB/work/pre-sym2.json"
+out=$(runsub apply 2>/dev/null); rc=$?
+ok_eq "symlink(apply,healthy): stdout" "ok" "$out"
+ok_eq "symlink(apply,healthy): rc" 0 "$rc"
+is "symlink(healthy): new config installed through the link" "$(same "$CFG" "$SB/work/exp1.json")"
+is "symlink(healthy): config.json is still a symlink" "$([ -L "$CFG" ] && echo 1 || echo 0)"
+# back to a plain file for the sections below
+rm -f "$CFG" "$CFG".bak.* "$REAL" "$REAL.new"
+cp "$FIX/config.json" "$CFG"
+
 echo "== no-restart: test + backup + atomic install, no restart / verify / hooks / prune"
 reset_cfg
 seed_baks 5
@@ -379,7 +433,8 @@ stage_init
 cp "$SB/work/nr-cand.json" "\$STAGE_DIR/config.json"
 commit_config "" 1 "\$STAGE_DIR/config.json" no-restart || { echo "install_rc=\$?"; exit 1; }
 # simulated hot-swap failure -> fall back to a full restart + verify
-cp -a "\$COMMIT_BAK" "\$CFG"
+# (restore via install_config: a plain cp would clobber a symlinked config)
+install_config "\$COMMIT_BAK"
 "$SB/etc/init.d/xray" restart >/dev/null 2>&1
 verify_or_rollback "\$COMMIT_BAK" 1
 echo "fallback_rc=\$?"
@@ -389,6 +444,47 @@ fb=$(PATH="$SB/bin:$PATH" sh "$SB/work/fb-run.sh" 2>/dev/null); fbrc=$?
 ok_eq "fallback: driver rc" 0 "$fbrc"
 ok_eq "fallback: restore + restart + verify healthy" 0 "$(printf '%s\n' "$fb" | sed -n 's/^fallback_rc=//p')"
 is "fallback: config back to the snapshot" "$(same "$CFG" "$FIX/config.json")"
+
+echo "== mutation lock: a held flock blocks a second writer (NOWAIT fails at once)"
+if [ "$FLOCK_STUB" = 1 ]; then
+	echo "NOTE   flock(1) is a no-op stub here - lock cases skipped"
+else
+	reset_cfg
+	cp "$FIX/staged-clean.json" "$SB/work/save-in.json"
+	cp "$CFG" "$SB/work/pre-lock.json"
+	# hold the sandbox lock exactly the way a real holder does: an exclusive
+	# flock on an open descriptor of the lock file, kept alive by a subshell
+	( exec 3>>"$SB/lock/xray-monitor"; flock -n 3 || exit 1; sleep 6 ) &
+	holder=$!
+	sleep 1
+	t0=$(date +%s)
+	out=$(runsub_nw config-save "$SB/work/save-in.json" 2>/dev/null); rc=$?
+	t1=$(date +%s)
+	ok_eq "lock(nowait): stdout" "another xray-monitor operation is running, try again in a moment" "$out"
+	ok_eq "lock(nowait): rc" 1 "$rc"
+	fast=0; [ $((t1 - t0)) -lt 4 ] && fast=1
+	is "lock(nowait): failed fast, not after the ~55 s poll" "$fast"
+	is "lock(nowait): live config untouched" "$(same "$CFG" "$SB/work/pre-lock.json")"
+	# the same holder, now without NOWAIT: the writer waits inside the bound
+	# and succeeds as soon as the holder lets go
+	t0=$(date +%s)
+	out=$(runsub config-save "$SB/work/save-in.json" 2>/dev/null); rc=$?
+	t1=$(date +%s)
+	ok_eq "lock(wait): stdout" "saved and restarted xray" "$out"
+	ok_eq "lock(wait): rc" 0 "$rc"
+	bounded=0; [ $((t1 - t0)) -le 30 ] && bounded=1
+	is "lock(wait): succeeded within the bounded wait" "$bounded"
+	echo "NOTE   lock(wait): waited $((t1 - t0)) s for the holder"
+	wait "$holder"
+	# the waiter released the lock on exit: a NOWAIT writer runs at once now
+	t0=$(date +%s)
+	out=$(runsub_nw config-save "$SB/work/save-in.json" 2>/dev/null); rc=$?
+	t1=$(date +%s)
+	ok_eq "lock(free): stdout" "saved and restarted xray" "$out"
+	ok_eq "lock(free): rc" 0 "$rc"
+	fast=0; [ $((t1 - t0)) -lt 3 ] && fast=1
+	is "lock(free): lock released by the previous writer" "$fast"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then

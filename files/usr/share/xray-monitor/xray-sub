@@ -26,17 +26,19 @@ mkdir -p "$STATE"
 # config-save/enable-api/cron-sync/backups-delete/backups-pin/backups-restore)
 # serialize on this lock so concurrent cron fetches and UI/RPC clicks can't
 # interleave uci commits, staging and config
-# renames. Read-only commands skip it. OpenWrt's lock(1) has no bounded wait
-# (`-w` waits but does not acquire), so poll the non-blocking `-n` try with a
-# cap; the EXIT trap releases the lock on every path.
+# renames. Read-only commands skip it. The lock is a kernel flock held on fd 3
+# of this process (busybox `flock -n 3`): the kernel drops it when the holder
+# dies - even by SIGKILL/OOM, which cannot run the EXIT trap - so there is no
+# stale-orphan recovery left to get wrong (the old lock(1) + $LOCK_OWNER
+# scheme could hand the lock to two waiters at once when a killed holder was
+# recovered by two concurrent runs). The EXIT trap releases it on every path.
 LOCK=/var/lock/xray-monitor
-LOCK_OWNER="$LOCK.owner"
 held=0
-# tmpxray start/stop serialize on their own mini-lock (contract B2): a tmpxray
-# session outlives the command, so holding the config LOCK for the process
-# lifetime would block fetch/apply - and taking the config LOCK at all would
-# make e2e runs (F13/F18) contend with config writes for no benefit. Only the
-# short start/stop critical sections take the mini-lock.
+# tmpxray start/stop serialize on their own mini-lock on fd 4 (contract B2):
+# a tmpxray session outlives the command, so holding the config LOCK for the
+# process lifetime would block fetch/apply - and taking the config LOCK at all
+# would make e2e runs (F13/F18) contend with config writes for no benefit.
+# Only the short start/stop critical sections take the mini-lock.
 TLOCK=/var/lock/xray-monitor-tmpxray
 TSTATE_DIR=/tmp/xray-monitor
 TSTATE=$TSTATE_DIR/tmpxray.json
@@ -45,10 +47,13 @@ STAGE_DIR=""
 cleanup() {
 	[ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"
 	if [ "$held" = 1 ]; then
-		rm -f "$LOCK_OWNER"
-		lock -u "$LOCK" </dev/null >/dev/null 2>&1
+		flock -u 3 2>/dev/null
+		exec 3>&-
 	fi
-	[ "$theld" = 1 ] && lock -u "$TLOCK" </dev/null >/dev/null 2>&1
+	if [ "$theld" = 1 ]; then
+		flock -u 4 2>/dev/null
+		exec 4>&-
+	fi
 	return 0
 }
 trap cleanup EXIT
@@ -56,39 +61,35 @@ trap cleanup EXIT
 # exit(1) so a signalled run still releases the lock and removes $STAGE_DIR.
 trap 'exit 1' INT TERM HUP
 
-# Take the mutation lock: bounded poll of the non-blocking try (~55 x 1 s).
-# The lock(1) holder is a lingering child process with ALL fds redirected to
-# /dev/null - inheriting this script's stdout would keep an rpcd command
-# substitution open (no EOF) until the rpcd timeout, long after this exit.
-# A run killed by SIGKILL/OOM cannot run its EXIT trap: its holder child
-# survives as an orphan and keeps the flock until reboot. $LOCK_OWNER records
-# the holder run's PID; when that process is gone, break the orphaned lock
-# (lock -u releases even an orphaned holder) and retry at once - still inside
-# the same overall budget, so a permanently stuck lock still fails in ~55 s.
+# Take the mutation lock: a bounded poll of the non-blocking flock try
+# (~55 x 1 s). Every process must open its OWN descriptor of the lock file
+# (`exec 3>>`): an inherited descriptor is one shared open file description,
+# and a lock on it would not exclude the parent that passed it down.
+# CRITICAL: the lock lives on that descriptor, so a child spawned while it is
+# held and meant to outlive this script MUST close fd 3 (redirect `3>&-`),
+# or it holds the lock hostage for its whole lifetime. fd 4 (mini-lock) has
+# the same rule. The only such children are the tmpxray instance and its
+# watchdog - they close both descriptors; everything else we spawn is waited
+# for, and the xray daemon itself is procd's child, never ours.
+# XRAYMON_NOWAIT=1 (exported by the rpcd backend): a UI click must not sit
+# out the wait inside the rpcd call - the HTTP session can time out while the
+# operation would still run afterwards. One try only; the cron path keeps the
+# bounded wait.
 take_lock() {
-	local tries=0 stale opid
-	while :; do
-		if lock -n "$LOCK" </dev/null >/dev/null 2>&1; then
-			held=1
-			printf '%s\n' "$$" > "$LOCK_OWNER"
-			return 0
-		fi
-		stale=0
-		opid=$(cat "$LOCK_OWNER" 2>/dev/null)
-		if [ -n "$opid" ] && ! kill -0 "$opid" 2>/dev/null; then
-			rm -f "$LOCK_OWNER"          # before lock -u: past it a waiter may win the race and write a fresh one
-			lock -u "$LOCK" </dev/null >/dev/null 2>&1
-			stale=1
-		fi
-		# XRAYMON_NOWAIT=1 (exported by the rpcd backend): a UI click must not
-		# sit out the wait inside the rpcd call - the HTTP session can time out
-		# while the operation would still run afterwards. One try (plus the
-		# stale-lock recovery above); the cron path keeps the bounded wait.
-		[ "$XRAYMON_NOWAIT" = 1 ] && [ "$stale" = 0 ] && return 1
+	local tries=0
+	# without flock(1) the poll below would spin its whole budget on a "not
+	# found" and fail every writer after ~55 s - fail at once with a reason
+	# instead (busybox on OpenWrt ships flock)
+	command -v flock >/dev/null 2>&1 || { echo "flock(1) not available - cannot serialize writes" >&2; return 1; }
+	exec 3>>"$LOCK" || return 1
+	while ! flock -n 3; do
+		[ "$XRAYMON_NOWAIT" = 1 ] && return 1
 		tries=$((tries + 1))
 		[ "$tries" -ge 55 ] && return 1
-		[ "$stale" = 1 ] || sleep 1
+		sleep 1
 	done
+	held=1
+	return 0
 }
 
 ua_default=$(uci -q get xray-monitor.sub.user_agent); [ -n "$ua_default" ] || ua_default="v2rayNG/1.8.0"
@@ -258,7 +259,8 @@ api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
 #     prune_backups - the single entry point every writer funnels through
 # Writers run test_config BEFORE making the backup: a backup is only worth
 # keeping if a verified candidate actually follows it, and prune_backups keeps
-# just 3 - a series of failed attempts must not evict the meaningful ones.
+# only the newest backup_keep (UCI xray-monitor.sub.backup_keep, default 5) -
+# a series of failed attempts must not evict the meaningful ones.
 stage_init() {
 	STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xraymon.XXXXXX") || exit 1
 }
@@ -285,6 +287,9 @@ test_and_install() {  # <candidate config.json> — test, then install
 # After a config change + restart, confirm xray came back healthy; if not,
 # restore the pre-change backup and restart. $1 = backup file to restore,
 # $2 = 1 to also require the stats API to answer (else only require xray up).
+# The restore goes through install_config (never `cp onto $CFG`): $CFG may be
+# a symlink, and a plain copy would replace the LINK with a regular file - the
+# same reason the write path resolves the target first.
 verify_or_rollback() {
 	local bak="$1" need_api="$2" i
 	for i in 1 2 3 4 5; do
@@ -293,7 +298,7 @@ verify_or_rollback() {
 		fi
 		sleep 1
 	done
-	[ -f "$bak" ] && cp -a "$bak" "$CFG"
+	[ -f "$bak" ] && install_config "$bak"
 	/etc/init.d/xray restart >/dev/null 2>&1
 	return 1
 }
@@ -342,7 +347,12 @@ commit_config() {  # <kind> <need_api> <candidate> [no-restart]
 	test_config "$cand" || return 1
 	ts=$(date +%Y%m%d-%H%M%S)
 	if [ -n "$kind" ]; then COMMIT_BAK="$CFG.bak.$kind.$ts"; else COMMIT_BAK="$CFG.bak.$ts"; fi
-	cp -a "$CFG" "$COMMIT_BAK"
+	# -L: $CFG may be a symlink (see install_config). cp -a would copy the LINK,
+	# so the "backup" would alias the live file and already hold the NEW config
+	# after install_config - rollback and backups-restore would then restore
+	# nothing. The snapshot must be a regular file with the OLD content; -p
+	# keeps the live config's mode like the -a this replaces.
+	cp -pL "$CFG" "$COMMIT_BAK"
 	install_config "$cand" || return 3
 	if [ "$mode" = "no-restart" ]; then return 0; fi
 	/etc/init.d/xray restart >/dev/null 2>&1
@@ -395,12 +405,14 @@ do_cron_sync() {
 # process is stopped and its files removed before the new one is spawned.
 
 tmpxray_take_lock() {
-	local lw=0
-	# same fd hygiene as take_lock: the lock(1) holder must never inherit
-	# this script's stdout (rpcd captures it via $(...))
-	while ! lock -n "$TLOCK" </dev/null >/dev/null 2>&1; do
-		lw=$((lw + 1))
-		[ "$lw" -ge 10 ] && return 1
+	local tries=0
+	# same flock-on-a-descriptor model as take_lock, on fd 4: released by
+	# cleanup() and by process death, no orphaned holder to recover
+	command -v flock >/dev/null 2>&1 || return 1
+	exec 4>>"$TLOCK" || return 1
+	while ! flock -n 4; do
+		tries=$((tries + 1))
+		[ "$tries" -ge 10 ] && return 1
 		sleep 1
 	done
 	return 0
@@ -444,16 +456,31 @@ tmpxray_wait_ports() {  # <pid> <port> ...
 	return 1
 }
 
+# Is <pid> still one of OUR tmpxray processes for <dir>? /proc/<pid>/cmdline
+# names the temp config (`-config <dir>/config.json`) in the instance's and the
+# watchdog's argv; busybox grep cannot search past the NUL separators, so the
+# NULs are folded to spaces first (busybox tr does translate \0). A pid whose
+# cmdline no longer carries the dir has exited and been reused - signalling a
+# bare pid number could kill an innocent process. rc 1 = leave it alone.
+tmpxray_pid_ours() {  # <pid> <dir>
+	[ -n "$1" ] && [ -n "$2" ] || return 1
+	tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "$2"
+}
+
 # Stop the recorded instance and remove its files. Caller holds TLOCK.
 # The watchdog and the xray process both carry the temp dir in their cmdline,
 # so pgrep -f on the dir finds the watchdog even when the pid in $TSTATE is
 # stale (e.g. state file survived a reboot of the box but pids did not).
+# Every kill is guarded by tmpxray_pid_ours: a stale $TSTATE after a pid reuse
+# must never turn "stop" into killing somebody else's process.
 tmpxray_kill() {
 	local pid tdir tpat wp i rc=1
 	[ -s "$TSTATE" ] || { echo "not running"; return 0; }
 	pid=$(jsonfilter -i "$TSTATE" -e '@.pid' 2>/dev/null)
 	tdir=$(jsonfilter -i "$TSTATE" -e '@.dir' 2>/dev/null)
-	[ -n "$pid" ] && kill "$pid" 2>/dev/null
+	if [ -n "$pid" ] && tmpxray_pid_ours "$pid" "$tdir"; then
+		kill "$pid" 2>/dev/null
+	fi
 	if [ -n "$tdir" ]; then
 		tpat=$(printf '%s' "$tdir" | sed 's/\./\\./g')
 		for wp in $(pgrep -f "$tpat" 2>/dev/null); do
@@ -466,7 +493,7 @@ tmpxray_kill() {
 		sleep 1
 	done
 	if [ "$rc" != 0 ]; then
-		kill -9 "$pid" 2>/dev/null
+		tmpxray_pid_ours "$pid" "$tdir" && kill -9 "$pid" 2>/dev/null
 		[ -n "$tdir" ] && for wp in $(pgrep -f "$tpat" 2>/dev/null); do kill -9 "$wp" 2>/dev/null; done
 	fi
 	case "$tdir" in /tmp/*) rm -rf "$tdir" ;; esac
@@ -513,11 +540,14 @@ do_tmpxray_start() {  # <tag> ...
 
 	# Not setsid: $! must be the xray pid itself, and a plain background child
 	# survives this script's exit. If the parent shell is ever killed by group
-	# signal the TTL watchdog still reaps the instance.
-	"$XRAY" run -config "$tdir/config.json" >/dev/null 2>&1 &
+	# signal the TTL watchdog still reaps the instance. `3>&- 4>&-`: the lock
+	# lives on those descriptors, and this xray (and anything it spawns)
+	# outlives the command - keeping them would hold the config lock and the
+	# mini-lock open for the whole TTL.
+	"$XRAY" run -config "$tdir/config.json" >/dev/null 2>&1 3>&- 4>&- &
 	pid=$!
 	if ! tmpxray_wait_ports "$pid" $pports; then
-		kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null
+		tmpxray_pid_ours "$pid" "$tdir" && { kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null; }
 		rm -rf "$tdir"; rm -f "$TSTATE"
 		echo "tmpxray did not come up (port bind failed or timed out)"
 		return 1
@@ -530,13 +560,17 @@ do_tmpxray_start() {  # <tag> ...
 
 	# TTL watchdog, detached so it survives this command and its caller. It only
 	# removes $TSTATE while that file still records OUR pid, so it can never
-	# clean up a replacement instance started later. setsid is used when present
-	# (23.05 busybox builds ship without it); the HUP-ignoring trap covers the
-	# plain-background fallback on those boxes.
-	watchdog='trap "" HUP; sleep "$2"; kill "$1" 2>/dev/null; sleep 5; kill -9 "$1" 2>/dev/null; rm -rf "$3"; [ "$(jsonfilter -i "$4" -e "@.pid" 2>/dev/null)" = "$1" ] && rm -f "$4"'
+	# clean up a replacement instance started later, and it only signals the
+	# recorded pid while that pid's cmdline still names our temp dir - a pid
+	# that exited early and got reused now belongs to someone else (see
+	# tmpxray_pid_ours). setsid is used when present (23.05 busybox builds ship
+	# without it); the HUP-ignoring trap covers the plain-background fallback
+	# on those boxes. `3>&- 4>&-` for the same reason as on the xray spawn
+	# above: the watchdog outlives the command and must not keep the locks.
+	watchdog='trap "" HUP; sleep "$2"; if tr "\0" " " < "/proc/$1/cmdline" 2>/dev/null | grep -q "$3"; then kill "$1" 2>/dev/null; sleep 5; tr "\0" " " < "/proc/$1/cmdline" 2>/dev/null | grep -q "$3" && kill -9 "$1" 2>/dev/null; fi; rm -rf "$3"; [ "$(jsonfilter -i "$4" -e "@.pid" 2>/dev/null)" = "$1" ] && rm -f "$4"'
 	detach=""
 	command -v setsid >/dev/null 2>&1 && detach="setsid"
-	$detach sh -c "$watchdog" tmpxray "$pid" "$ttl" "$tdir" "$TSTATE" >/dev/null 2>&1 &
+	$detach sh -c "$watchdog" tmpxray "$pid" "$ttl" "$tdir" "$TSTATE" >/dev/null 2>&1 3>&- 4>&- &
 
 	printf '{"pid":%s,"ports":{%s}}\n' "$pid" "$pjson"
 }

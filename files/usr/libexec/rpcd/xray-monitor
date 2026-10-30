@@ -543,8 +543,19 @@ case "$1" in
 				json_dump
 			;;
 			update_apply)
-				# detach so the rpcd restart during opkg install can't kill the update
-				setsid sh -c 'sleep 2; /usr/share/xray-monitor/xray-sub self-update > /tmp/xraymon-update.log 2>&1' >/dev/null 2>&1 &
+				# Detach so the rpcd restart during opkg install can't kill the
+				# update. setsid is deliberately NOT used: busybox builds without
+				# that applet exist (this 23.05 box has none - the same reason
+				# the tmpxray watchdog falls back to a plain background shell),
+				# and `setsid: not found` would leave the button dead. Ignoring
+				# SIGHUP covers the caller's death. The detached shell also
+				# drops XRAYMON_NOWAIT (exported above for every xray-sub call
+				# from this backend): the package postinst runs `xray-sub
+				# cron-sync` and `enable-api`, which take the same mutation
+				# lock - with NOWAIT inherited they would fail fast whenever a
+				# cron fetch happened to hold it.
+				sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; sleep 2; exec /usr/share/xray-monitor/xray-sub self-update' \
+					>/tmp/xraymon-update.log 2>&1 </dev/null &
 				json_init
 				json_add_boolean ok 1
 				json_add_string msg "Update started; the page will reconnect in a few seconds."
