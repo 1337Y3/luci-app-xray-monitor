@@ -74,7 +74,7 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
   untouched and kept in the `// === local ===` block. **Never tag a manual
   outbound with a subscription prefix**: anything matching one is managed and
   is replaced or pruned by the next fetch/apply. Per-tag local overrides are
-  supported.
+  supported ([overrides.json](#per-tag-overrides-etcxray-monitoroverridesjson)).
 - **Churn control**: outbound fields the panel randomizes on every fetch (by
   default `streamSettings.realitySettings.spiderX`) are pruned from both sides
   before the diff, so two consecutive fetches with no panel-side changes report
@@ -120,6 +120,38 @@ with `jsonfilter`, nothing is hardcoded.
 Tested on OpenWrt 24.10 and 23.05 with `xray-core` 25.x. The connectivity
 column needs one of the probe backends present; without any it shows "unknown"
 (traffic/graphs still work).
+
+## Per-tag overrides (`/etc/xray-monitor/overrides.json`)
+
+Subscription outbounds sometimes need a local tweak the panel can't express —
+`tcpFastOpen`, a `dialerProxy` chain, a different `fingerprint`. Since fetch
+regenerates every managed outbound from the subscription response, hand edits
+in `config.json` are **reverted on the next fetch/apply**. Put them in
+`/etc/xray-monitor/overrides.json` instead: a JSON object keyed by the full
+outbound **tag**, each value a partial outbound that is deep-merged into what
+the panel delivered, before diffing and staging:
+
+```json
+{
+	"proxy-de-frankfurt": {
+		"streamSettings": {
+			"realitySettings": { "fingerprint": "firefox" },
+			"sockopt": { "tcpFastOpen": true, "dialerProxy": "manual-vps" }
+		}
+	}
+}
+```
+
+- Objects merge recursively (`streamSettings` merges into the outbound's own);
+  arrays and scalars are **replaced** whole.
+- Keyed by final tag (`<prefix>-<base>`, e.g. `proxy-de-1`) — the tags shown
+  in the Servers tab; they stay stable across fetches.
+- Applied at fetch time, so overrides are part of the staged result, the
+  pending diff, `xray -test` and backups — not a post-hoc patch.
+- Unknown tags are ignored (create the entry after the first fetch, when the
+  tag exists). The file is optional; delete or empty `{}` to disable.
+- **Never tag a manual outbound with a subscription prefix** (see above) —
+  overrides are the supported way to customize a subscription outbound.
 
 ## Install / upgrade (recommended — one line)
 
@@ -245,3 +277,4 @@ Pure data package (`Architecture: all`), so the SDK isn't required.
 | `/usr/share/xray-monitor/{parse,apply,diff,snapshot,status,routing,balancers,enable-api,render,probe}.uc` | ucode JSON transforms (render = shared outbounds renderer, probe = TCP probe backend) |
 | `/usr/share/xray-monitor/xray-sub` | fetch/stage/apply helper (+ hourly cron) |
 | `/etc/config/xray-monitor` | UCI config (sub URL, user-agent, cron) — conffile |
+| `/etc/xray-monitor/overrides.json` | optional per-tag outbound overrides (see above) |
