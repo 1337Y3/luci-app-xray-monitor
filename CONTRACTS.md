@@ -14,18 +14,24 @@ Paths (variables at the top of `xray-sub`): `CFG=/etc/xray/config.json`,
 ### Locking of mutations
 There is no `with_lock` wrapper. The main `case "$1"` in `xray-sub` takes the
 lock for: `fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|
-sub-del|sub-edit|set-cfg|cron-sync` with a bounded poll (`while ! lock -n
-"$LOCK"` up to ~55 x sleep 1), sets `held=1`, and the `cleanup()` EXIT trap
-releases it (`lock -u`). Read-only commands never lock. Internal recursion is
-avoided by calling `do_apply` / `do_cron_sync` functions in-process instead of
-re-executing `"$0"` (there is no `XRAYMON_LOCKED` env marker — do not invent one
-without proposing it).
+sub-del|sub-edit|set-cfg|cron-sync|backups-delete|backups-pin|backups-restore`.
+The lock is a kernel flock held on fd 3 of `/var/lock/xray-monitor`
+(`take_lock()`: `exec 3>>` + bounded poll of `flock -n 3`, ~55 x 1 s;
+`XRAYMON_NOWAIT=1` = one try then fail fast). `cleanup()` releases it
+(`flock -u 3` + `exec 3>&-`); the kernel also drops it when the holder dies,
+even by SIGKILL/OOM — there is no owner file and no stale recovery. THE LOCK
+LIVES ON THE DESCRIPTOR: any child meant to outlive the command must close
+fd 3 (`3>&-`) or it holds the lock hostage (the tmpxray instance and its
+watchdog close fd 3 AND fd 4). Read-only commands never lock. Internal
+recursion is avoided by calling `do_apply` / `do_cron_sync` functions
+in-process instead of re-executing `"$0"`.
 
 ### Config write pipeline (a pattern, not one function)
 Every writer follows the same sequence (see `do_apply`, `routing-set`,
 `balancers-set`, `config-save`, `enable-api`):
 1. `api_before=0; api_up && api_before=1` (where the stats API matters),
-2. `bak="$CFG.bak.<kind>.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"`
+2. `bak="$CFG.bak.<kind>.$(date +%Y%m%d-%H%M%S)"; cp -pL "$CFG" "$bak"`
+   (dereferences a symlinked config — the snapshot is always a regular file)
    — kind is empty (auto) for apply/routing-set/balancers-set, `manual` for
    config-save, `preapi` for enable-api,
 3. `stage_init()` → `STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xraymon.XXXXXX")`,
@@ -39,9 +45,12 @@ Every writer follows the same sequence (see `do_apply`, `routing-set`,
 6. `/etc/init.d/xray restart`,
 7. `verify_or_rollback <bak> <need_api>`: waits up to 5x1 s for
    `pgrep -f "$XRAY run"` (+ `api_up` when need_api=1), else restores the
-   backup and restarts again,
-8. `prune_backups [keep]` — keeps the newest N (currently default 3)
-   `$CFG.bak.*` files, never the live config.
+   backup via `install_config` (never `cp` onto `$CFG` — it may be a
+   symlink) and restarts again,
+8. `prune_backups [keep]` — keeps the newest N `$CFG.bak.*` files, never the
+   live config; N = UCI `xray-monitor.sub.backup_keep` (default 5, 0 = keep
+   all); pinned (`*.pinned.*`) and non-pipeline-shaped files are neither
+   counted nor deleted.
 `cleanup()` (EXIT trap) removes `$STAGE_DIR`.
 
 ### Managed prefixes
@@ -109,6 +118,10 @@ both defaulting in code). Subscriptions are `subscription` sections with
 `tests/run.sh` — flat golden suite: fixtures in `tests/fixtures/`, goldens in
 `tests/expected/`, `UPDATE_GOLDEN=1 sh tests/run.sh` regenerates, `XRAY=<bin>`
 adds `xray -test` validation of every produced config (auto-detected on PATH).
+`tests/pipeline-scenario.sh` — sandboxed end-to-end runs of a path-rewritten
+xray-sub copy (config, state, backups, staging, BOTH locks, tmpxray state,
+crontab and init scripts all point into the sandbox; flock is stubbed no-op
+only where the binary is absent, lock cases are skipped there).
 `status.uc` imports uci and is NOT covered. There is NO bootstrap script: CI
 (.github/workflows/build-feed.yml, job `tests`) builds ucode-lang/ucode master
 on ubuntu with integration modules off; the pinned openwrt-23.05 ucode version
@@ -148,7 +161,12 @@ and removes its files; the process exits by itself after
 inbound per requested exit tag on 127.0.0.1, routing inboundTag → outboundTag,
 log none, no api/stats; outbounds copied from the live config; config lives in
 a mktemp dir as `config.json`; it waits for its ports to listen before
-printing the JSON.
+printing the JSON. The mini-lock (`TLOCK`) is flock on fd 4 (same model as the
+mutation lock). The spawned xray process and its TTL watchdog close fd 3 and
+fd 4 (`3>&- 4>&-`) and every kill is guarded by `tmpxray_pid_ours()` — the
+pid's `/proc/<pid>/cmdline` must still name the temp dir (busybox grep cannot
+search past NULs: fold them with `tr '\0' ' '` first), so a reused pid is
+never signalled.
 
 ### B3. E2E results (F13 writes, F18 reads)
 `/tmp/xray-monitor/e2e.json`:
