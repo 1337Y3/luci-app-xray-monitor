@@ -86,6 +86,30 @@ echo "== apply (tasks 2+7: prefixes, // block comments)"
 check "apply: subscription groups + local block" "$EXP/apply.json" "$W/apply.json"
 xraytest "apply output" "$W/apply.json"
 
+echo "== overlapping prefixes (longest-prefix ownership: 'proxy' vs 'proxy-work')"
+# The snapshot of a FAILED 'proxy' fetch must not capture 'proxy-work-*' exits -
+# the other subscription's own staged group already carries them.
+"$SHARE/snapshot.uc" "$FIX/config-overlap.json" proxy proxy proxy-work > "$W/snapshot-ov-p.json"
+check "snapshot: failed 'proxy' keeps only its own exits" "$EXP/snapshot-ov-p.json" "$W/snapshot-ov-p.json"
+"$SHARE/snapshot.uc" "$FIX/config-overlap.json" proxy-work proxy proxy-work > "$W/snapshot-ov-w.json"
+check "snapshot: 'proxy-work' owns proxy-work-fi" "$EXP/snapshot-ov-w.json" "$W/snapshot-ov-w.json"
+"$SHARE/diff.uc" "$FIX/staged-overlap.json" "$FIX/config-overlap.json" proxy proxy-work -- > "$W/diff-ov.json"
+check "diff: overlapping prefixes, churn ignored -> total 0" "$EXP/diff-ov.json" "$W/diff-ov.json"
+"$SHARE/apply.uc" "$FIX/config-overlap.json" "$FIX/staged-overlap.json" "$W/apply-ov.json" proxy proxy-work >/dev/null
+check "apply: nested prefix keeps its own block" "$EXP/apply-ov.json" "$W/apply-ov.json"
+xraytest "apply overlap output" "$W/apply-ov.json"
+"$SHARE/routing.uc" set "$FIX/config-overlap.json" "$FIX/routing-desired-ov.json" "$W/routing-ov.json" proxy proxy-work >/dev/null
+check "routing set: longest-prefix grouping" "$EXP/routing-ov.json" "$W/routing-ov.json"
+xraytest "routing set overlap output" "$W/routing-ov.json"
+# Same tag in two staged groups (what the pre-fix snapshot could produce):
+# apply must refuse it, naming the tag - not emit a config xray -test rejects.
+out=$("$SHARE/apply.uc" "$FIX/config-overlap.json" "$FIX/staged-dup.json" "$W/apply-dup.json" proxy proxy-work 2>&1); rc=$?
+if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q '"proxy-work-fi"'; then
+	echo "PASS   apply: duplicate staged tag rejected, tag named"
+else
+	echo "FAIL   apply: duplicate staged tag rejected, tag named"; fails=$((fails + 1))
+fi
+
 echo "== routing / balancers (task 7: comments survive rewrites)"
 "$SHARE/routing.uc" get "$FIX/config.json" > "$W/routing-get.json"
 check "routing get" "$EXP/routing-get.json" "$W/routing-get.json"
