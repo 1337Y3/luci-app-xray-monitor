@@ -9,6 +9,7 @@
 // streamSettings.realitySettings.spiderX, which the panel randomizes per fetch).
 'use strict';
 import { readfile } from 'fs';
+import { canonsig } from 'jsondiff';
 
 let staged = json(readfile(ARGV[0]));
 let cfg = json(readfile(ARGV[1]));
@@ -28,21 +29,8 @@ function is_managed(tag) {
 	return false;
 }
 
-// Canonical, order-independent serialization: object keys are sorted, so a mere
-// reordering of fields in the panel output does not read as a change.
-function canonsig(v) {
-	if (type(v) == 'object') {
-		let ks = sort(keys(v)), parts = [];
-		for (let i = 0; i < length(ks); i++) push(parts, ks[i] + ':' + canonsig(v[ks[i]]));
-		return '{' + join(',', parts) + '}';
-	}
-	if (type(v) == 'array') {
-		let parts = [];
-		for (let i = 0; i < length(v); i++) push(parts, canonsig(v[i]));
-		return '[' + join(',', parts) + ']';
-	}
-	return sprintf('%J', v);
-}
+// canonsig() lives in jsondiff.uc now (shared with the paths_diff module);
+// everything below is unchanged.
 
 // Signature covers the WHOLE outbound body (minus the tag, which is the map
 // key): endpoint, transport, credentials and everything else - tlsSettings,
