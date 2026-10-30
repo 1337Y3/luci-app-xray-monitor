@@ -138,9 +138,9 @@ case "$1" in
 		[ -s "$STATE/staged.json" ] || { echo "nothing staged"; exit 1; }
 		api_before=0; api_up && api_before=1
 		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$CFG.new" >/dev/null 2>&1 \
-			&& "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
-			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
+		if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$CFG.new.json" >/dev/null 2>&1 \
+			&& "$XRAY" -test -format json -config "$CFG.new.json" >/dev/null 2>&1; then
+			mv "$CFG.new.json" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
 			if verify_or_rollback "$bak" "$api_before"; then
 				prune_backups
 				echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
@@ -148,7 +148,7 @@ case "$1" in
 				echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; exit 1
 			fi
 		else
-			rm -f "$CFG.new"; echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; exit 1
+			rm -f "$CFG.new.json"; echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; exit 1
 		fi
 		;;
 
@@ -221,12 +221,12 @@ case "$1" in
 		case "$1" in routing-set) uc="$SHARE/routing.uc" ;; *) uc="$SHARE/balancers.uc" ;; esac
 		api_before=0; api_up && api_before=1
 		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if "$uc" set "$CFG" "$2" "$CFG.new" >/dev/null 2>&1 && "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
-			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
+		if "$uc" set "$CFG" "$2" "$CFG.new.json" >/dev/null 2>&1 && "$XRAY" -test -format json -config "$CFG.new.json" >/dev/null 2>&1; then
+			mv "$CFG.new.json" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
 			if verify_or_rollback "$bak" "$api_before"; then prune_backups; echo ok
 			else echo "xray/api failed health check - rolled back"; exit 1; fi
 		else
-			rm -f "$CFG.new"; echo "config test failed - not applied"; exit 1
+			rm -f "$CFG.new.json"; echo "config test failed - not applied"; exit 1
 		fi
 		;;
 
@@ -270,7 +270,7 @@ case "$1" in
 		command -v ucode >/dev/null 2>&1 || { echo "ucode not installed"; exit 1; }
 		ucode -e 'import { readfile } from "fs";' >/dev/null 2>&1 || { echo "ucode-mod-fs not installed"; exit 1; }
 		[ -f "$CFG" ] || { echo "xray config not found at $CFG"; exit 1; }
-		new="$CFG.apinew.$$"
+		new="$CFG.apinew.$$.json"
 		res=$("$SHARE/enable-api.uc" "$CFG" "$new" 10085 2>&1)
 		case "$res" in
 			unchanged) rm -f "$new"; echo "already enabled ($CFG)"; exit 0 ;;

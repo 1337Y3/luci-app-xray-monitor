@@ -305,10 +305,10 @@ case "$1" in
 			;;
 			config_test)
 				input=$(cat)
-				tmp=$(mktemp)
+				tmp=$(mktemp -d)/config.json
 				printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
 				out=$($XRAY -test -format json -config "$tmp" 2>&1); rc=$?
-				rm -f "$tmp"
+				rm -rf "${tmp%/*}"
 				msg=$(printf '%s\n' "$out" | grep -viE '^Xray [0-9]|Penetrates Everything|unified platform|infra/conf/serial: Reading' | tr -s '\r\n\t ' ' ')
 				json_init
 				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
@@ -317,10 +317,10 @@ case "$1" in
 			;;
 			config_save)
 				input=$(cat)
-				tmp=$(mktemp)
+				tmp=$(mktemp -d)/config.json
 				printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
 				msg=$("$SUB" config-save "$tmp" 2>&1); rc=$?
-				rm -f "$tmp"
+				rm -rf "${tmp%/*}"
 				json_init
 				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
 				json_add_string msg "$msg"
