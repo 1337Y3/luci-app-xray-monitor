@@ -1,0 +1,11 @@
+{
+  "log": { "loglevel": "warning" },
+  "outbounds": [
+    { "tag": "chain-a", "protocol": "freedom", "settings": { "domainStrategy": "AsIs" },
+      "streamSettings": { "sockopt": { "dialerProxy": "chain-b" } } },
+    { "tag": "chain-b", "protocol": "freedom",
+      "streamSettings": { "sockopt": { "dialerProxy": "direct" } } },
+    { "tag": "direct", "protocol": "freedom" },
+    { "tag": "unused-exit", "protocol": "blackhole" }
+  ]
+}

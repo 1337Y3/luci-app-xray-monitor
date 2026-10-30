@@ -1,0 +1,55 @@
+{
+  "log": {
+    "loglevel": "none"
+  },
+  "inbounds": [
+    {
+      "tag": "in-chain-a",
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 12001,
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "chain-a",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "AsIs"
+      },
+      "streamSettings": {
+        "sockopt": {
+          "dialerProxy": "chain-b"
+        }
+      }
+    },
+    {
+      "tag": "chain-b",
+      "protocol": "freedom",
+      "streamSettings": {
+        "sockopt": {
+          "dialerProxy": "direct"
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "in-chain-a"
+        ],
+        "outboundTag": "chain-a"
+      }
+    ]
+  }
+}

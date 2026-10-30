@@ -99,6 +99,31 @@ check "balancers get" "$EXP/balancers-get.json" "$W/balancers-get.json"
 check "balancers set keeps // blocks + observatory union" "$EXP/balancers-set.json" "$W/balancers-set.json"
 xraytest "balancers set output" "$W/balancers-set.json"
 
+echo "== enable-api (F0: StatsService + HandlerService + RoutingService)"
+"$SHARE/enable-api.uc" "$FIX/config.json" "$W/eapi.json" 10085 proxy > "$W/eapi-changed.out" 2>/dev/null
+check "enable-api: no api section -> changed" "$EXP/enable-api-changed.out" "$W/eapi-changed.out"
+check "enable-api: adds stats/policy/inbound/rule + 3 services" "$EXP/enable-api.json" "$W/eapi.json"
+xraytest "enable-api output" "$W/eapi.json"
+"$SHARE/enable-api.uc" "$FIX/api-stats.json" "$W/eapi-stats.json" 10085 proxy > "$W/eapi-stats.out" 2>/dev/null
+check "enable-api: StatsService only -> changed" "$EXP/enable-api-changed.out" "$W/eapi-stats.out"
+check "enable-api: adds Handler+Routing, rest untouched" "$EXP/enable-api.json" "$W/eapi-stats.json"
+"$SHARE/enable-api.uc" "$W/eapi.json" "$W/eapi-again.json" 10085 proxy > "$W/eapi-unchanged.out" 2>/dev/null
+check "enable-api: all present -> unchanged" "$EXP/enable-api-unchanged.out" "$W/eapi-unchanged.out"
+check "enable-api: unchanged rewrite is byte-identical" "$EXP/enable-api.json" "$W/eapi-again.json"
+
+echo "== tmpxray config (F0: per-exit socks test instance)"
+"$SHARE/tmpxray.uc" "$FIX/config.json" "$W/tmpxray.json" proxy-fi 10801 proxy-ch 10802
+check "tmpxray: one socks inbound + pinned rule per tag" "$EXP/tmpxray.json" "$W/tmpxray.json"
+xraytest "tmpxray output" "$W/tmpxray.json"
+"$SHARE/tmpxray.uc" "$FIX/tmpxray-chain.json" "$W/tmpxray-chain.json" chain-a 12001
+check "tmpxray: dialerProxy/proxySettings chain copied, unused not" "$EXP/tmpxray-chain.json" "$W/tmpxray-chain.json"
+xraytest "tmpxray chain output" "$W/tmpxray-chain.json"
+if "$SHARE/tmpxray.uc" "$FIX/config.json" "$W/tmpxray-bad.json" no-such-tag 10803 >/dev/null 2>&1; then
+	echo "FAIL   tmpxray: unknown tag must be rejected"; fails=$((fails + 1))
+else
+	echo "PASS   tmpxray: unknown tag rejected"
+fi
+
 echo
 if [ "$fails" -eq 0 ] && [ "$xrayfails" -eq 0 ]; then
 	echo "all tests passed${XRAY:+ (incl. xray -test)}"
