@@ -323,9 +323,17 @@ case "$1" in
 		date +%s > "$STATE/last_fetch"
 		rm -rf "$tmpd"
 		case "$(cat "$STATE/status" 2>/dev/null)" in ok|partial) frc=0 ;; *) frc=1 ;; esac
-		# auto-apply runs in-process (fetch already holds the lock)
+		# auto-apply runs in-process (fetch already holds the lock). A failed
+		# apply must NOT read as a failed fetch: the fresh exits ARE staged
+		# (pending stays 1, the UI offers Apply again) - only swapping the
+		# config failed. Mark that explicitly instead of letting apply's
+		# test-failed/rolled-back stand in for the fetch's own state.
 		if [ "$auto_apply" = "1" ] && [ "$(cat "$STATE/pending" 2>/dev/null)" = "1" ]; then
-			do_apply >/dev/null 2>&1 || frc=1
+			apply_msg=$(do_apply 2>&1) || {
+				frc=1
+				echo "fetched-apply-failed" > "$STATE/status"
+				[ -n "$apply_msg" ] && echo "$apply_msg" >&2
+			}
 		fi
 		exit "$frc"
 		;;

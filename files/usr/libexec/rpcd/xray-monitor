@@ -185,7 +185,7 @@ get_outbounds() {
 	cfg=$(config_file)
 	dlist=$(probe_disabled_list)
 	n=$(jsonfilter -i "$cfg" -e '@.outbounds[*].tag' 2>/dev/null | wc -l)
-	tmp=$(mktemp -d)
+	tmp=$(mktemp -d) || { json_init; json_add_array "outbounds"; json_close_array; json_dump; return; }
 	i=0
 	while [ "$i" -lt "$n" ]; do
 		tag=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].tag" 2>/dev/null)
@@ -377,26 +377,36 @@ case "$1" in
 			;;
 			config_test)
 				input=$(cat)
-				tmp=$(mktemp -d)/config.json
-				printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
-				out=$($XRAY -test -format json -config "$tmp" 2>&1); rc=$?
-				rm -rf "${tmp%/*}"
-				msg=$(printf '%s\n' "$out" | grep -viE '^Xray [0-9]|Penetrates Everything|unified platform|infra/conf/serial: Reading' | tr -s '\r\n\t ' ' ')
-				json_init
-				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-				json_add_string msg "${msg:-no output}"
-				json_dump
+				tmp=$(mktemp -d)
+				if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+					json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp dir"; json_dump
+				else
+					tmp="$tmp/config.json"
+					printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
+					out=$($XRAY -test -format json -config "$tmp" 2>&1); rc=$?
+					rm -rf "${tmp%/*}"
+					msg=$(printf '%s\n' "$out" | grep -viE '^Xray [0-9]|Penetrates Everything|unified platform|infra/conf/serial: Reading' | tr -s '\r\n\t ' ' ')
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "${msg:-no output}"
+					json_dump
+				fi
 			;;
 			config_save)
 				input=$(cat)
-				tmp=$(mktemp -d)/config.json
-				printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
-				msg=$("$SUB" config-save "$tmp" 2>&1); rc=$?
-				rm -rf "${tmp%/*}"
-				json_init
-				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-				json_add_string msg "$msg"
-				json_dump
+				tmp=$(mktemp -d)
+				if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+					json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp dir"; json_dump
+				else
+					tmp="$tmp/config.json"
+					printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
+					msg=$("$SUB" config-save "$tmp" 2>&1); rc=$?
+					rm -rf "${tmp%/*}"
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				fi
 			;;
 			sub_get)   "$SUB" status ;;
 			sub_fetch) sub_msg fetch ;;
@@ -436,13 +446,17 @@ case "$1" in
 			routing_set)
 				input=$(cat)
 				f=$(mktemp)
-				echo "$input" | jsonfilter -e '@.inbounds' > "$f" 2>/dev/null
-				msg=$("$SUB" routing-set "$f" 2>&1); rc=$?
-				rm -f "$f"
-				json_init
-				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-				json_add_string msg "$msg"
-				json_dump
+				if [ -z "$f" ] || [ ! -f "$f" ]; then
+					json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp file"; json_dump
+				else
+					echo "$input" | jsonfilter -e '@.inbounds' > "$f" 2>/dev/null
+					msg=$("$SUB" routing-set "$f" 2>&1); rc=$?
+					rm -f "$f"
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				fi
 			;;
 			enable_api)
 				msg=$("$SUB" enable-api 2>&1); rc=$?
@@ -472,13 +486,17 @@ case "$1" in
 			balancers_set)
 				input=$(cat)
 				f=$(mktemp)
-				echo "$input" | jsonfilter -e '@.balancers' > "$f" 2>/dev/null
-				msg=$("$SUB" balancers-set "$f" 2>&1); rc=$?
-				rm -f "$f"
-				json_init
-				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-				json_add_string msg "$msg"
-				json_dump
+				if [ -z "$f" ] || [ ! -f "$f" ]; then
+					json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp file"; json_dump
+				else
+					echo "$input" | jsonfilter -e '@.balancers' > "$f" 2>/dev/null
+					msg=$("$SUB" balancers-set "$f" 2>&1); rc=$?
+					rm -f "$f"
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				fi
 			;;
 			*)         printf '{}' ;;
 		esac
