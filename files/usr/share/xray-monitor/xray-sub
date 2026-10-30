@@ -4,6 +4,8 @@
 #         | sub-add <prefix> <url> | sub-del <id> | sub-edit <id> <prefix> <url> <enabled>
 #         | routing-get | routing-set <f> | balancers-get | balancers-set <f>
 #         | config-save <f> | enable-api
+#         | backups-list | backups-get <name> | backups-delete <name>
+#         | backups-pin <name> <0|1> | backups-restore <name>
 SHARE=/usr/share/xray-monitor
 STATE=/etc/xray-monitor
 XRAY=/usr/bin/xray
@@ -20,8 +22,9 @@ CFG=$(config_file)
 mkdir -p "$STATE"
 
 # Mutating commands (fetch/apply/sub-*/set-cfg/routing-set/balancers-set/
-# config-save/enable-api/cron-sync) serialize on this lock so concurrent cron
-# fetches and UI/RPC clicks can't interleave uci commits, staging and config
+# config-save/enable-api/cron-sync/backups-delete/backups-pin/backups-restore)
+# serialize on this lock so concurrent cron fetches and UI/RPC clicks can't
+# interleave uci commits, staging and config
 # renames. Read-only commands skip it. OpenWrt's lock(1) has no bounded wait
 # (`-w` waits but does not acquire), so poll the non-blocking `-n` try with a
 # cap; the EXIT trap releases the lock on every path.
@@ -88,16 +91,80 @@ prefix_in_use() {  # <prefix> <exclude-id>
 	done; return 1
 }
 
-# Keep the newest $1 (default 3) "$CFG.bak.*" backups, delete the rest.
-# Only ever runs after a config change verified working (xray -test + restart).
+# Keep the newest N "$CFG.bak.*" backups, delete the rest. N comes from UCI
+# xray-monitor.sub.backup_keep (default 5, 0 = keep everything); an explicit
+# argument overrides (tests). Pinned backups (see backups-pin) neither count
+# towards N nor are ever deleted. Only ever runs after a config change
+# verified working (xray -test + restart).
 prune_backups() {
-	local keep="${1:-3}" f n=0
+	local keep="${1:-$(uci -q get xray-monitor.sub.backup_keep)}"
+	case "$keep" in ''|*[!0-9]*) keep=5 ;; esac
+	[ "$keep" -gt 0 ] || return 0
+	local f n=0
 	for f in $(ls -t "$CFG".bak.* 2>/dev/null); do
+		case "$(basename "$f")" in *.pinned.*) continue ;; esac
+		# Only pipeline-shaped backups are managed here; a stray user-made
+		# config.json.bak.* neither counts towards the budget nor is deleted.
+		backup_meta "${f##*/}" >/dev/null || continue
 		n=$((n + 1))
 		[ "$n" -le "$keep" ] && continue
 		[ "$f" = "$CFG" ] && continue   # never the live config
 		rm -f "$f"
 	done
+}
+
+# --- config.json backups -----------------------------------------------------
+# Backups are created by the write pipeline as "$CFG.bak.<kind>.<ts>" with kind
+# empty (auto), "manual" or "preapi". Pinning renames a backup to
+# "$CFG.bak.pinned.<kind>.<ts>" - the only difference is the name; prune_backups
+# leaves anything matching "*.pinned.*" alone. Clients (rpcd, UI) only ever see
+# and send the basename: it is checked against a strict charset AND against
+# this real directory listing, and the path is always rebuilt from $CFG's own
+# directory - a client-provided path is never used to touch the filesystem.
+
+backup_names() {  # basenames of all backups, newest first
+	local b
+	for b in $(ls -t "$(dirname "$CFG")/$(basename "$CFG").bak."* 2>/dev/null); do
+		echo "${b##*/}"
+	done
+}
+
+# Parse a backup basename into "<kind> <ts> <pinned>"; rc 1 = not a backup of
+# ours (wrong prefix or no trailing timestamp - such files are ignored by the
+# backup commands and never listed or restorable).
+backup_meta() {  # <basename>
+	local pfx="$(basename "$CFG").bak." rest="$1" kind pinned=0
+	case "$rest" in "$pfx"*) rest="${rest#"$pfx"}" ;; *) return 1 ;; esac
+	case "$rest" in pinned.*) pinned=1; rest="${rest#pinned.}" ;; esac
+	case "$rest" in manual.*) kind=manual; rest="${rest#manual.}" ;;
+		preapi.*) kind=preapi; rest="${rest#preapi.}" ;;
+		*)       kind=auto ;;
+	esac
+	case "$rest" in
+		20[0-9][0-9][01][0-9][0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9]) ;;
+		*) return 1 ;;
+	esac
+	echo "$kind $rest $pinned"
+}
+
+# Resolve a client-supplied basename to an existing backup file (prints the
+# path). Rejects anything that is not a plain basename, not in backup_names(),
+# or not pipeline-shaped (backup_meta) - the membership check is what actually
+# authorizes the access, so get/delete/pin/restore see exactly the set that
+# backups-list shows.
+backup_path() {  # <basename>
+	local name="$1" b
+	case "$name" in
+		''|*[!A-Za-z0-9._-]*) return 1 ;;   # strict charset; no /, no NUL-ish tricks
+	esac
+	for b in $(backup_names); do
+		if [ "$b" = "$name" ]; then
+			backup_meta "$name" >/dev/null || return 1
+			echo "$(dirname "$CFG")/$name"
+			return 0
+		fi
+	done
+	return 1
 }
 
 # Dot-paths INSIDE an outbound whose change must not read as a diff, e.g. the
@@ -180,7 +247,7 @@ do_cron_sync() {
 }
 
 case "$1" in
-	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync)
+	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync|backups-delete|backups-pin|backups-restore)
 		lw=0
 		while ! lock -n "$LOCK" 2>/dev/null; do
 			lw=$((lw + 1))
@@ -415,6 +482,76 @@ case "$1" in
 		fi
 		;;
 
+	backups-list)
+		first=1
+		printf '{"backups":['
+		for b in $(backup_names); do
+			meta=$(backup_meta "$b") || continue
+			set -- $meta; kind=$1; ts=$2; pinned=$3
+			size=$(wc -c < "$(dirname "$CFG")/$b" | tr -d ' ')
+			[ "$first" = 1 ] || printf ','
+			first=0
+			printf '{"name":"%s","kind":"%s","ts":"%s","size":%s,"pinned":%s}' \
+				"$b" "$kind" "$ts" "$size" "$pinned"
+		done
+		printf ']}\n'
+		;;
+
+	backups-get)
+		p=$(backup_path "$2") || { echo "no such backup"; exit 1; }
+		cat "$p"
+		;;
+
+	backups-delete)
+		p=$(backup_path "$2") || { echo "no such backup"; exit 1; }
+		rm -f "$p" && echo ok || { echo "delete failed"; exit 1; }
+		;;
+
+	backups-pin)  # <name> <0|1>: pin = rename into the pinned.* form (and back)
+		name="$2"; pin="$3"
+		p=$(backup_path "$name") || { echo "no such backup"; exit 1; }
+		case "$pin" in 0|1) ;; *) echo "pin must be 0 or 1"; exit 1 ;; esac
+		meta=$(backup_meta "$name") || { echo "not a recognized backup"; exit 1; }
+		kind=$(echo "$meta" | cut -d' ' -f1)
+		ts=$(echo "$meta"   | cut -d' ' -f2)
+		new="$(basename "$CFG").bak."
+		[ "$pin" = 1 ] && new="${new}pinned."
+		[ "$kind" != auto ] && new="${new}${kind}."
+		new="${new}${ts}"
+		[ "$new" = "$name" ] && { echo "$name"; exit 0; }   # already pinned/unpinned
+		target="$(dirname "$CFG")/$new"
+		[ -e "$target" ] && { echo "target name already exists"; exit 1; }
+		mv "$p" "$target" && echo "$new"
+		;;
+
+	# Restore = a config write like any other: the backup content is staged and
+	# xray -tested BEFORE anything changes, the current config gets its own
+	# manual backup, then the standard test_and_install + restart + rollback
+	# pipeline runs. Refuses rather than rolls back on a bad backup (the
+	# content came from disk, not the user's editor, so a test failure means
+	# the backup itself is broken).
+	backups-restore)
+		p=$(backup_path "$2") || { echo "no such backup"; exit 1; }
+		[ -s "$p" ] || { echo "backup is empty"; exit 1; }
+		stage_init
+		cp "$p" "$STAGE_DIR/config.json"
+		"$XRAY" -test -format json -config "$STAGE_DIR/config.json" >/dev/null 2>&1 \
+			|| { echo "xray -test failed on backup content - not restored"; exit 1; }
+		api_before=0; api_up && api_before=1
+		bak="$CFG.bak.manual.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
+		if test_and_install "$STAGE_DIR/config.json"; then
+			/etc/init.d/xray restart >/dev/null 2>&1
+			if verify_or_rollback "$bak" "$api_before"; then
+				prune_backups
+				echo "restored and restarted xray"
+			else
+				echo "restored but xray/api failed health check - rolled back"; exit 1
+			fi
+		else
+			rm -f "$CFG.new"; echo "xray -test failed - not restored"; exit 1
+		fi
+		;;
+
 	*)
-		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api"; exit 1 ;;
+		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api|backups-list|backups-get <name>|backups-delete <name>|backups-pin <name> <0|1>|backups-restore <name>"; exit 1 ;;
 esac

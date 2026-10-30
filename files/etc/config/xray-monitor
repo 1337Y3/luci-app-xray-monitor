@@ -7,5 +7,8 @@ config xray-monitor 'sub'
 	option cron_schedule '0 * * * *'
 	# auto-apply (splice + restart xray) when a scheduled/manual fetch finds changes
 	option auto_apply '0'
+	# how many config.json.bak.* backups to keep (newest first; 0 = keep all;
+	# pinned backups never count and are never pruned)
+	option backup_keep '5'
 	# auto-enable the Xray Stats API in config.json on package install (1=yes)
 	option auto_enable_api '1'
