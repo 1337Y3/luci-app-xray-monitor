@@ -1,7 +1,9 @@
 #!/usr/bin/ucode
-// Idempotently add the Xray Stats API (stats/api/policy + api inbound + api rule)
-// to an existing config. Writes the (possibly unchanged) result to out-path and
-// prints "changed" or "unchanged".
+// Idempotently add the Xray API services to an existing config: StatsService
+// (traffic counters: stats/api/policy + api inbound + api rule) plus
+// HandlerService (`xray api ado/rmo`) and RoutingService (`xray api bi/bo`).
+// Writes the (possibly unchanged) result to out-path and prints "changed" or
+// "unchanged".
 //   enable-api.uc <config.json> <out-path> [port] [prefix ...]
 // Prefixes keep the outbounds section's // group comments on the rewrite (render.uc).
 'use strict';
@@ -20,16 +22,16 @@ let before = sprintf('%J', cfg);
 // stats {}
 if (type(cfg.stats) != 'object') cfg.stats = {};
 
-// api { tag, services:[...StatsService] }
-if (type(cfg.api) != 'object') cfg.api = { tag: 'api', services: [ 'StatsService' ] };
-else {
-	if (!cfg.api.tag) cfg.api.tag = 'api';
-	if (type(cfg.api.services) != 'array') cfg.api.services = [ 'StatsService' ];
-	else {
-		let has = false;
-		for (let i = 0; i < length(cfg.api.services); i++) if (cfg.api.services[i] == 'StatsService') has = true;
-		if (!has) push(cfg.api.services, 'StatsService');
-	}
+// api { tag, services: [...required, keeping any extras the user had] }
+// Keep in sync with the rpcd backend's status fields (api_services/api_missing).
+let services = [ 'StatsService', 'HandlerService', 'RoutingService' ];
+if (type(cfg.api) != 'object') cfg.api = { tag: 'api' };
+if (!cfg.api.tag) cfg.api.tag = 'api';
+if (type(cfg.api.services) != 'array') cfg.api.services = [];
+for (let k = 0; k < length(services); k++) {
+	let has = false;
+	for (let i = 0; i < length(cfg.api.services); i++) if (cfg.api.services[i] == services[k]) has = true;
+	if (!has) push(cfg.api.services, services[k]);
 }
 let apitag = cfg.api.tag;
 
