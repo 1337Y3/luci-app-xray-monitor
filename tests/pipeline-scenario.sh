@@ -636,6 +636,9 @@ via_reset() {  # <fetch_via> [fetch_via_exit] — uci, flags, logs, fetch state
 	rm -f "$SB/tmp/xray-monitor/e2e.json" "$SB/state/fetch_path" "$SB/state/update_path"
 	rm -f "$SB/state/usage-proxy.json" "$SB/state/title-proxy.txt" "$SB/state/tagmap-proxy.json"
 	rm -f "$SB/tmp/luci-app-xray-monitor.ipk"
+	# restore the correct checksum sidecar (the mismatch case overwrites it)
+	printf '%s  luci-app-xray-monitor.ipk\n' \
+		"$(sha256sum "$STUB_CURL_IPK" 2>/dev/null | awk '{ print $1 }')" > "$STUB_CURL_SHA256"
 	: > "$STUB_CURL_LOG"; : > "$STUB_TMPXRAY_LOG"; : > "$STUB_UBUS_LOG"
 	printf '%s\n' \
 		"xray-monitor.sub=xray-monitor" \
