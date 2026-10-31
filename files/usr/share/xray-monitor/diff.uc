@@ -1,6 +1,6 @@
 #!/usr/bin/ucode
 // Diff staged (grouped) proxy outbounds against the proxies currently in config.json.
-// argv: <staged-groups.json> <config.json> [prefix ...] [-- dot.path ...]
+// argv: <staged-groups.json> <config.json> [prefix ...] [ignore=dot.path ...]
 //   ->  { added, removed, changed, total }
 // NOTE: <staged> comes FIRST here, while the sibling hotswap.uc plan takes
 // <installed> <candidate> - the first two argv are swapped between the two
@@ -9,8 +9,13 @@
 // With prefixes, only outbounds tagged <prefix> or <prefix>-* (the subscriptions'
 // own exits) are managed; proxy outbounds added by hand are left alone. Without
 // prefixes every proxy outbound is managed (legacy behavior).
-// The dot-paths after `--` are pruned from both sides before comparing (default:
-// streamSettings.realitySettings.spiderX, which the panel randomizes per fetch).
+// Each ignore=dot.path is pruned from both sides before comparing; passing any
+// replaces the default (streamSettings.realitySettings.spiderX, which the panel
+// randomizes per fetch). The paths travel as `ignore=<path>` arguments, NOT
+// after a `--` separator: the ucode shipped by OpenWrt 23.05 (commit 1a8a0bcf)
+// swallows a literal `--` from a script's ARGV, so everything after it would
+// silently land in `prefixes` there. Subscription prefixes cannot contain `=`
+// (valid_prefix), so the `ignore=` spelling is unambiguous.
 'use strict';
 import { readfile } from 'fs';
 import { owner_prefix } from 'render';
@@ -18,10 +23,10 @@ import { canonsig } from 'jsondiff';
 
 let staged = json(readfile(ARGV[0]));
 let cfg = json(readfile(ARGV[1]));
-let prefixes = [], ignores = [], into_ignores = false;
+let prefixes = [], ignores = [];
 for (let i = 2; i < length(ARGV); i++) {
-	if (ARGV[i] == '--') { into_ignores = true; continue; }
-	if (into_ignores) push(ignores, ARGV[i]); else push(prefixes, ARGV[i]);
+	if (substr(ARGV[i], 0, 7) == 'ignore=') push(ignores, substr(ARGV[i], 7));
+	else push(prefixes, ARGV[i]);
 }
 if (!length(ignores)) push(ignores, 'streamSettings.realitySettings.spiderX');
 let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];

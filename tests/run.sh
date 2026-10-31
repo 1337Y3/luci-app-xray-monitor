@@ -66,10 +66,22 @@ echo "== snapshot (task 1: failed fetch keeps installed exits)"
 check "snapshot installed proxy-* exits" "$EXP/snapshot.json" "$W/snapshot.json"
 
 echo "== diff (tasks 2+3: managed prefixes, ignore paths, reorder immunity)"
-"$SHARE/diff.uc" "$FIX/staged-clean.json" "$FIX/config.json" proxy -- > "$W/diff-clean.json"
+"$SHARE/diff.uc" "$FIX/staged-clean.json" "$FIX/config.json" proxy > "$W/diff-clean.json"
 check "diff: key reorder + spiderX churn -> total 0" "$EXP/diff-clean.json" "$W/diff-clean.json"
-"$SHARE/diff.uc" "$FIX/staged-nested.json" "$FIX/config.json" proxy -- > "$W/diff-nested.json"
+"$SHARE/diff.uc" "$FIX/staged-nested.json" "$FIX/config.json" proxy > "$W/diff-nested.json"
 check "diff: one nested field change -> changed" "$EXP/diff-nested.json" "$W/diff-nested.json"
+# ignore= delivery (the 23.05 ucode drops a literal `--` from ARGV, so ignore
+# paths travel as ignore=<path> words; any explicit ignore= replaces the default)
+"$SHARE/diff.uc" "$FIX/staged-custom.json" "$FIX/config.json" proxy > "$W/diff-custom-def.json"
+check "diff: shortId churn, default ignore -> changed" "$EXP/diff-custom-def.json" "$W/diff-custom-def.json"
+"$SHARE/diff.uc" "$FIX/staged-custom.json" "$FIX/config.json" proxy ignore=streamSettings.realitySettings.shortId > "$W/diff-custom-ign.json"
+check "diff: ignore= path delivered -> churn suppressed" "$EXP/diff-custom-ign.json" "$W/diff-custom-ign.json"
+"$SHARE/diff.uc" "$FIX/staged-clean.json" "$FIX/config.json" proxy ignore=streamSettings.realitySettings.spiderX > "$W/diff-explicit.json"
+check "diff: explicit default via ignore= = same clean result" "$EXP/diff-clean.json" "$W/diff-explicit.json"
+"$SHARE/diff.uc" "$FIX/staged-clean.json" "$FIX/config.json" proxy ignore=mux.enabled > "$W/diff-nodef.json"
+check "diff: explicit non-default ignore= drops the default (spiderX counts)" "$EXP/diff-nodef.json" "$W/diff-nodef.json"
+"$SHARE/diff.uc" "$FIX/staged-custom.json" "$FIX/config.json" ignore=streamSettings.realitySettings.shortId > "$W/diff-custom-legacy.json"
+check "diff: legacy mode (no prefixes) with ignore= path" "$EXP/diff-custom-legacy.json" "$W/diff-custom-legacy.json"
 "$SHARE/diff.uc" "$FIX/staged-clean.json" "$FIX/config.json" > "$W/diff-legacy.json"
 check "diff without prefixes: manual outbound counts (legacy)" "$EXP/diff-legacy.json" "$W/diff-legacy.json"
 
@@ -79,7 +91,7 @@ cat "$W/parse-proxy.json" >> "$W/staged.json"
 printf '},{"label":"work","outbounds":' >> "$W/staged.json"
 cat "$W/parse-work.json" >> "$W/staged.json"
 printf '}]}' >> "$W/staged.json"
-"$SHARE/diff.uc" "$W/staged.json" "$FIX/config.json" proxy work -- > "$W/diff-added.json"
+"$SHARE/diff.uc" "$W/staged.json" "$FIX/config.json" proxy work > "$W/diff-added.json"
 check "diff: new sub added, manual-vps untouched (task 2)" "$EXP/diff-added.json" "$W/diff-added.json"
 
 echo "== jsondiff (F16: paths_diff via canonsig, order-independent)"
@@ -102,7 +114,7 @@ echo "== overlapping prefixes (longest-prefix ownership: 'proxy' vs 'proxy-work'
 check "snapshot: failed 'proxy' keeps only its own exits" "$EXP/snapshot-ov-p.json" "$W/snapshot-ov-p.json"
 "$SHARE/snapshot.uc" "$FIX/config-overlap.json" proxy-work proxy proxy-work > "$W/snapshot-ov-w.json"
 check "snapshot: 'proxy-work' owns proxy-work-fi" "$EXP/snapshot-ov-w.json" "$W/snapshot-ov-w.json"
-"$SHARE/diff.uc" "$FIX/staged-overlap.json" "$FIX/config-overlap.json" proxy proxy-work -- > "$W/diff-ov.json"
+"$SHARE/diff.uc" "$FIX/staged-overlap.json" "$FIX/config-overlap.json" proxy proxy-work > "$W/diff-ov.json"
 check "diff: overlapping prefixes, churn ignored -> total 0" "$EXP/diff-ov.json" "$W/diff-ov.json"
 "$SHARE/apply.uc" "$FIX/config-overlap.json" "$FIX/staged-overlap.json" "$W/apply-ov.json" proxy proxy-work >/dev/null
 check "apply: nested prefix keeps its own block" "$EXP/apply-ov.json" "$W/apply-ov.json"
@@ -170,23 +182,31 @@ echo "== hotswap plan (F14: live rmo/ado vs restart-required)"
 # plan <installed> <candidate> [prefix ...]: membership/body-only changes of
 # the MANAGED outbounds are live; anything else (locals, other sections, a
 # default-outbound change) forces a restart. Same ignore list as diff.uc.
-"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-live.json" proxy -- > "$W/hs-live.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-live.json" proxy > "$W/hs-live.json"
 check "hotswap: changed+added+removed, first tag re-added -> live" "$EXP/hs-plan-live.json" "$W/hs-live.json"
-"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-churn.json" proxy -- > "$W/hs-churn.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-churn.json" proxy > "$W/hs-churn.json"
 check "hotswap: ignored-path churn only -> nothing to do, live" "$EXP/hs-plan-churn.json" "$W/hs-churn.json"
-"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-beyond.json" proxy -- > "$W/hs-beyond.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-beyond.json" proxy > "$W/hs-beyond.json"
 check "hotswap: local outbound changed -> restart (beyond membership)" "$EXP/hs-plan-beyond.json" "$W/hs-beyond.json"
-"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-first.json" proxy -- > "$W/hs-first.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-first.json" proxy > "$W/hs-first.json"
 check "hotswap: first outbound dropped, next first not (re-)added -> restart" "$EXP/hs-plan-first.json" "$W/hs-first.json"
 # a managed tag the shell cannot transport safely (word splitting / the
 # hand-built rmo JSON) restarts instead - caught at PLAN time, never mid-flight
-"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-badtag.json" proxy -- > "$W/hs-badtag.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-badtag.json" proxy > "$W/hs-badtag.json"
 check "hotswap: exotic NEW managed tag -> restart (tag-charset)" "$EXP/hs-plan-badtag.json" "$W/hs-badtag.json"
-"$SHARE/hotswap.uc" plan "$FIX/hs-inst-badtag.json" "$FIX/hs-cand-live.json" proxy -- > "$W/hs-badtag2.json"
+"$SHARE/hotswap.uc" plan "$FIX/hs-inst-badtag.json" "$FIX/hs-cand-live.json" proxy > "$W/hs-badtag2.json"
 check "hotswap: exotic tag in the INSTALLED config -> restart (tag-charset)" "$EXP/hs-plan-badtag2.json" "$W/hs-badtag2.json"
 # legacy mode (no prefixes): every tagged proxy outbound is managed
-"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-live.json" -- > "$W/hs-legacy.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-live.json" > "$W/hs-legacy.json"
 check "hotswap: legacy (no prefixes) same plan for this pair" "$EXP/hs-plan-legacy.json" "$W/hs-legacy.json"
+# ignore= delivery: churn2 churns shortId ONLY (spiderX identical), so the
+# default plan shows a changed body while ignore=shortId collapses it to noop
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-churn2.json" proxy > "$W/hs-churn2-def.json"
+check "hotswap: shortId churn, default ignore -> remove+add of proxy-fi" "$EXP/hs-plan-churn2.json" "$W/hs-churn2-def.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-churn2.json" proxy ignore=streamSettings.realitySettings.shortId > "$W/hs-churn2-ign.json"
+check "hotswap: ignore= path delivered -> nothing to do, live" "$EXP/hs-plan-churn2-ign.json" "$W/hs-churn2-ign.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-churn2.json" ignore=streamSettings.realitySettings.shortId > "$W/hs-churn2-legacy.json"
+check "hotswap: legacy mode (no prefixes) with ignore= path" "$EXP/hs-plan-churn2-legacy.json" "$W/hs-churn2-legacy.json"
 # adds: full bodies for `xray api ado`, in CANDIDATE order (not argument order
 # - the order decides which outbound claims the default handler)
 "$SHARE/hotswap.uc" adds "$FIX/hs-cand-live.json" proxy-de proxy-fi > "$W/hs-adds.json"

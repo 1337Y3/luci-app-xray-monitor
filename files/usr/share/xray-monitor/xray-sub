@@ -316,6 +316,14 @@ diff_ignore() {
 	list=$(uci -q get xray-monitor.sub.diff_ignore)
 	if [ -n "$list" ]; then echo "$list"; else echo "streamSettings.realitySettings.spiderX"; fi
 }
+# The same list as diff.uc/hotswap.uc ARGUMENTS: each path as `ignore=<path>`
+# (NOT after a `--` separator - the 23.05 ucode drops a literal `--` from a
+# script's ARGV, which would feed every path into the prefixes; prefixes
+# cannot contain `=`, so the spelling is unambiguous - see diff.uc's header).
+diff_ignore_args() {
+	local p
+	for p in $(diff_ignore); do printf 'ignore=%s ' "$p"; done
+}
 
 # Stats API reachability probe (rc 0 = answering on 127.0.0.1:10085).
 APISRV="127.0.0.1:10085"
@@ -637,7 +645,7 @@ do_apply() {
 	# before commit_config replaces it) -----------------------------------
 	live=0; hs_reason=""
 	if [ "$hot_swap" = 1 ]; then
-		hs_plan=$("$SHARE/hotswap.uc" plan "$CFG" "$cand" $(sub_prefixes) -- $(diff_ignore) 2>/dev/null)
+		hs_plan=$("$SHARE/hotswap.uc" plan "$CFG" "$cand" $(sub_prefixes) $(diff_ignore_args) 2>/dev/null)
 		case $(printf '%s' "$hs_plan" | jsonfilter -e '@.hot_swap' 2>/dev/null) in
 			true)
 				# Membership-only change. Two runtime guards before touching
@@ -1340,7 +1348,7 @@ case "$1" in
 			echo "no-subs" > "$STATE/status"
 		elif [ "$nok" -gt 0 ]; then
 			mv "$staged" "$STATE/staged.json"
-			"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" $(sub_prefixes) -- $(diff_ignore) > "$STATE/diff.json" 2>/dev/null
+			"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" $(sub_prefixes) $(diff_ignore_args) > "$STATE/diff.json" 2>/dev/null
 			cnt=$(jsonfilter -i "$STATE/diff.json" -e '@.total' 2>/dev/null)
 			[ "${cnt:-0}" -gt 0 ] && echo 1 > "$STATE/pending" || echo 0 > "$STATE/pending"
 			[ "$nok" -eq "$nsub" ] && echo "ok" > "$STATE/status" || echo "partial" > "$STATE/status"

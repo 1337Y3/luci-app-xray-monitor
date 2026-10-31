@@ -110,13 +110,17 @@
 // ---------------------------------------------------------------------------
 //
 // Usage:
-//   hotswap.uc plan <installed.json> <candidate.json> [prefix ...] [-- dot.path ...]
+//   hotswap.uc plan <installed.json> <candidate.json> [prefix ...] [ignore=dot.path ...]
 //     -> {"remove":[tag...],"add":[tag...],"changed":[tag...],
 //         "first_old":"t","first_new":"t",
 //         "restart_required":null|"changes-beyond-outbounds"|"tag-charset"|"default-outbound",
 //         "hot_swap":true|false}
 //     remove is installed-order, add is candidate-order; restart_required is
 //     null exactly when the change is live-applicable (hot_swap true).
+//     NOTE: the first two argv are <installed> <candidate> - deliberately the
+//     Ignore paths travel as `ignore=<path>` args (see diff.uc's header: the
+//     23.05 ucode swallows a literal `--` from ARGV, so a `--` separator would
+//     feed every ignore path into `prefixes` there; prefixes cannot contain `=`).
 //     NOTE: the first two argv are <installed> <candidate> - deliberately the
 //     reverse of the sibling diff.uc (<staged> <config>): diff shows the staged
 //     groups against the installed config, while plan must lead with the OLD
@@ -226,10 +230,10 @@ function plan(installed, candidate, prefixes, ignores) {
 }
 
 if (ARGV[0] == 'plan') {
-	let prefixes = [], ignores = [], into_ignores = false;
+	let prefixes = [], ignores = [];
 	for (let i = 3; i < length(ARGV); i++) {
-		if (ARGV[i] == '--') { into_ignores = true; continue; }
-		if (into_ignores) push(ignores, ARGV[i]); else push(prefixes, ARGV[i]);
+		if (substr(ARGV[i], 0, 7) == 'ignore=') push(ignores, substr(ARGV[i], 7));
+		else push(prefixes, ARGV[i]);
 	}
 	if (!length(ignores)) push(ignores, 'streamSettings.realitySettings.spiderX');
 	let installed = json(readfile(ARGV[1]));
@@ -254,7 +258,7 @@ else if (ARGV[0] == 'adds') {
 	printf('%J\n', { outbounds: out });
 }
 else {
-	warn('usage: hotswap.uc plan <installed> <candidate> [prefix ...] [-- ignore ...]\n' +
+	warn('usage: hotswap.uc plan <installed> <candidate> [prefix ...] [ignore=dot.path ...]\n' +
 	     '       hotswap.uc adds <candidate> <tag> ...\n');
 	exit(1);
 }
