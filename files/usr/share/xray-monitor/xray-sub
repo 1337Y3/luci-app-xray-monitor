@@ -7,6 +7,8 @@
 #         | tmpxray start <tag>... | tmpxray stop   (short-lived per-exit test xray)
 #         | backups-list | backups-get <name> | backups-delete <name>
 #         | backups-pin <name> <0|1> | backups-restore <name>
+# `apply` reconciles subscription-outbound-only changes live via `xray api
+# rmo`/`ado` (no restart) when hot_swap is on - see the F14 block below.
 SHARE=/usr/share/xray-monitor
 STATE=/etc/xray-monitor
 XRAY=/usr/bin/xray
@@ -245,6 +247,99 @@ diff_ignore() {
 APISRV="127.0.0.1:10085"
 api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
 
+# --- hot-swap apply (F14) ---------------------------------------------------
+# When the ONLY change of an apply is the membership/bodies of the managed
+# subscription outbounds, reconcile the RUNNING xray with `xray api rmo`/`ado`
+# instead of restarting it. The full reasoning (from the xray-core sources) is
+# in hotswap.uc's header; the load-bearing facts for this shell code:
+#   - a changed body is remove+add of the same tag (no alter operation exists),
+#     and adds must FOLLOW the removals ("existing tag found" otherwise);
+#   - adds must run in the plan's order: the candidate's first outbound re-
+#     claims the default handler when the old default was removed;
+#   - `lso` lists the running outbound tags (order random - compare as sets);
+#     removing an unknown tag is a no-op success, adding a known tag fails;
+#   - balancers/observatories follow outbound add/remove live (new members
+#     carry traffic after at most one observatory probe round).
+# Everything runs inside the mutation lock the apply command already holds;
+# every xray-api child here is waited for, so none outlives fd 3.
+# On ANY step failing, fall back to the documented recipe: restore the
+# pre-change snapshot ($COMMIT_BAK) when it exists + full restart +
+# verify_or_rollback - the restart+verify ALWAYS run, even when the snapshot
+# itself is missing (see the fallback block in do_apply).
+# hot_swap (UCI xray-monitor.sub.hot_swap, default 1) turns the whole thing
+# off - then every apply restarts, exactly as before F14.
+hot_swap=$(uci -q get xray-monitor.sub.hot_swap); [ -n "$hot_swap" ] || hot_swap=1
+
+# The RUNNING outbound tag list as raw JSON (empty output + rc != 0 = the
+# HandlerService is not answering: API disabled, xray down, or too old).
+lso_out() { "$XRAY" api lso --server="$APISRV" 2>/dev/null; }
+
+# The outbound tags of a config file, one per line, config order.
+config_tags() { jsonfilter -i "$1" -e '@.outbounds[*].tag' 2>/dev/null | sed '/^$/d'; }
+
+# Set-compare of two tag lists (files, one tag per line): rc 0 = same set.
+tags_same_set() {  # <a> <b>
+	[ "$(sort -u < "$1")" = "$(sort -u < "$2")" ]
+}
+
+# How the last apply was applied - status.uc hands it to the subscription tab:
+#   mode: "live" (xray api rmo/ado, no restart) | "restart" (classic pipeline)
+#   reason: "" | why a restart was chosen instead of the live path
+#           ("changes-beyond-outbounds", "tag-charset", "default-outbound",
+#            "api-unavailable", "running-state-mismatch", "plan-unavailable"),
+#            or "hot-swap-failed" together with fallback=1 when a live
+#            attempt had to roll back
+write_last_apply() {  # <mode> <reason> <fallback 0|1> <removed> <added>
+	printf '{"mode":"%s","reason":"%s","fallback":%s,"removed":%s,"added":%s,"ts":%s}\n' \
+		"$1" "$2" "$3" "${4:-0}" "${5:-0}" "$(date +%s)" > "$STATE/last-apply.json"
+}
+
+# Reconcile the running xray with the freshly installed candidate (commit_config
+# no-restart already put it at $CFG). rc 0 = live applied and verified;
+# rc 1 = failed at some step, the caller runs the documented fallback.
+hotswap_apply() {  # <plan-json> <candidate>
+	local plan="$1" cand="$2"
+	local rmo_tags add_tags t first=1 lsout
+
+	rmo_tags=$(printf '%s' "$plan" | jsonfilter -e '@.remove[*]' 2>/dev/null | sed '/^$/d')
+	add_tags=$(printf '%s' "$plan" | jsonfilter -e '@.add[*]' 2>/dev/null | sed '/^$/d')
+
+	# Removals first, tags via a JSON file: `rmo` treats an argument that
+	# happens to name a readable file as a config, so a tag must never travel
+	# as a bare argument. Strict tag charset - the JSON is built by hand here.
+	if [ -n "$rmo_tags" ]; then
+		printf '{"outbounds":[' > "$STAGE_DIR/rmo.json"
+		for t in $rmo_tags; do
+			case "$t" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+			[ "$first" = 1 ] || printf ',' >> "$STAGE_DIR/rmo.json"
+			first=0
+			printf '{"tag":"%s"}' "$t" >> "$STAGE_DIR/rmo.json"
+		done
+		printf ']}' >> "$STAGE_DIR/rmo.json"
+		# rmo prints a line per tag; only its rc matters here. -t 10: the
+		# default 3 s deadline spans dialing AND the whole batch (one context
+		# per invocation) - too tight for a large batch on slow hardware, and
+		# a timeout there would push every apply into the fallback.
+		"$XRAY" api rmo -t 10 --server="$APISRV" "$STAGE_DIR/rmo.json" >/dev/null 2>&1 || return 1
+	fi
+
+	# Adds in the plan's (candidate) order, bodies lifted verbatim from the
+	# candidate - the same JSON `xray -test` already validated, so the client
+	# side of ado cannot choke on an unknown field.
+	if [ -n "$add_tags" ]; then
+		"$SHARE/hotswap.uc" adds "$cand" $add_tags > "$STAGE_DIR/ado.json" 2>/dev/null || return 1
+		"$XRAY" api ado -t 10 --server="$APISRV" "$STAGE_DIR/ado.json" >/dev/null 2>&1 || return 1
+	fi
+
+	# Verify the RUNNING set now equals the candidate's (lso order is random,
+	# so compare as sets). This also proves xray is alive and answering gRPC.
+	lsout=$(lso_out) || return 1
+	printf '%s' "$lsout" | jsonfilter -e '@.outbounds[*].tag' 2>/dev/null | sed '/^$/d' | sort -u > "$STAGE_DIR/ran.tags"
+	config_tags "$cand" | sort -u > "$STAGE_DIR/want.tags"
+	tags_same_set "$STAGE_DIR/ran.tags" "$STAGE_DIR/want.tags" || return 1
+	return 0
+}
+
 # Candidate configs for `xray -test` are staged as $d/config.json inside their
 # own mktemp(1) directory, never next to $CFG: when xray runs with `-confdir D`
 # it loads every D/*.json, so a leftover `config.json.new.json` there would be
@@ -366,6 +461,12 @@ commit_config() {  # <kind> <need_api> <candidate> [no-restart]
 # auto-apply calls it in-process - re-running `"$0" apply` would deadlock on
 # the very lock fetch already holds. Non-zero return (and state files) on any
 # failure; rc propagates to the caller.
+# With hot_swap (UCI xray-monitor.sub.hot_swap, default 1) a change that is
+# confined to the managed subscription outbounds is applied LIVE via
+# `xray api rmo`/`ado` (commit_config no-restart + reconcile + verify); every
+# other change - and any failing live step - takes the classic restart
+# pipeline, falling back to restore+restart+verify when a live attempt already
+# replaced the config. See the hot-swap block above and hotswap.uc.
 do_apply() {
 	[ -s "$STATE/staged.json" ] || { echo "nothing staged"; return 1; }
 	api_before=0; api_up && api_before=1
@@ -375,9 +476,79 @@ do_apply() {
 		echo "merge-failed" > "$STATE/status"
 		echo "staged merge failed - not applied: $apply_err"; return 1
 	fi
-	rc=0; commit_config "" "$api_before" "$STAGE_DIR/config.json" || rc=$?
+	cand="$STAGE_DIR/config.json"
+
+	# --- decide live vs restart (the plan is computed against the OLD $CFG,
+	# before commit_config replaces it) -----------------------------------
+	live=0; hs_reason=""
+	if [ "$hot_swap" = 1 ]; then
+		hs_plan=$("$SHARE/hotswap.uc" plan "$CFG" "$cand" $(sub_prefixes) -- $(diff_ignore) 2>/dev/null)
+		case $(printf '%s' "$hs_plan" | jsonfilter -e '@.hot_swap' 2>/dev/null) in
+			true)
+				# Membership-only change. Two runtime guards before touching
+				# anything: the handler API must answer, and the RUNNING
+				# outbound set must still equal the installed config (a
+				# hand-played `xray api` or an un-restarted manual edit would
+				# otherwise desync remove/add).
+				lsout=$(lso_out) || lsout=""
+				if [ -z "$lsout" ]; then
+					hs_reason="api-unavailable"
+				else
+					printf '%s' "$lsout" | jsonfilter -e '@.outbounds[*].tag' 2>/dev/null | sed '/^$/d' | sort -u > "$STAGE_DIR/ran0.tags"
+					config_tags "$CFG" | sort -u > "$STAGE_DIR/cfg0.tags"
+					if tags_same_set "$STAGE_DIR/ran0.tags" "$STAGE_DIR/cfg0.tags"; then
+						live=1
+					else
+						hs_reason="running-state-mismatch"
+					fi
+				fi
+				;;
+			false) hs_reason=$(printf '%s' "$hs_plan" | jsonfilter -e '@.restart_required' 2>/dev/null) ;;
+			*)     hs_reason="plan-unavailable" ;;
+		esac
+	fi
+
+	if [ "$live" = 1 ]; then
+		# install without restart, then make the running xray match
+		rc=0; commit_config "" "$api_before" "$cand" no-restart || rc=$?
+		case "$rc" in
+			0) ;;
+			1) echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1 ;;
+			*) echo "install-failed" > "$STATE/status"; echo "failed to install new config"; return 1 ;;
+		esac
+		if hotswap_apply "$hs_plan" "$cand"; then
+			nrem=$(printf '%s' "$hs_plan" | jsonfilter -e '@.remove[*]' 2>/dev/null | sed '/^$/d' | grep -c .)
+			nadd=$(printf '%s' "$hs_plan" | jsonfilter -e '@.add[*]' 2>/dev/null | sed '/^$/d' | grep -c .)
+			echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"
+			write_last_apply live "" 0 "${nrem:-0}" "${nadd:-0}"
+			prune_backups
+			echo "ok (applied live)"
+			return 0
+		fi
+		# live reconciliation failed at some step: the candidate is already
+		# installed but the running xray may be mid-mutation - the documented
+		# fallback restores the snapshot and takes the full restart path.
+		# The restart + verify run UNCONDITIONALLY: if the snapshot itself is
+		# unusable (its cp failed, e.g. disk full -> $COMMIT_BAK missing),
+		# skipping them would end the apply with $CFG holding the candidate,
+		# the running xray mid-mutated and NO restart. verify_or_rollback
+		# tolerates a missing backup: with none to restore it only demands
+		# that xray comes back up - on the validated candidate - which still
+		# reconciles the running state with the installed config.
+		[ -n "$COMMIT_BAK" ] && [ -f "$COMMIT_BAK" ] && install_config "$COMMIT_BAK"
+		/etc/init.d/xray restart >/dev/null 2>&1
+		verify_or_rollback "$COMMIT_BAK" "$api_before" || true
+		echo "rolled-back" > "$STATE/status"
+		write_last_apply restart "hot-swap-failed" 1 0 0
+		echo "hot-swap failed - rolled back to the previous config and restarted xray"
+		return 1
+	fi
+
+	rc=0; commit_config "" "$api_before" "$cand" || rc=$?
 	case "$rc" in
-		0) echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok ;;
+		0) echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"
+		   write_last_apply restart "$hs_reason" 0 0 0
+		   echo ok ;;
 		2) echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; return 1 ;;
 		3) echo "install-failed" > "$STATE/status"; echo "failed to install new config"; return 1 ;;
 		*) echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1 ;;
@@ -708,7 +879,7 @@ case "$1" in
 		echo ok
 		;;
 
-	set-cfg)  # <cron> <cron_schedule> <auto_apply> <user_agent>  (empty = keep)
+	set-cfg)  # <cron> <cron_schedule> <auto_apply> <user_agent> <hot_swap>  (empty = keep)
 		uci set xray-monitor.sub=xray-monitor 2>/dev/null
 		[ -n "$2" ] && uci set xray-monitor.sub.cron="$2"
 		if [ -n "$3" ]; then
@@ -717,6 +888,9 @@ case "$1" in
 		fi
 		[ -n "$4" ] && uci set xray-monitor.sub.auto_apply="$4"
 		[ -n "$5" ] && uci set xray-monitor.sub.user_agent="$5"
+		if [ -n "$6" ]; then
+			case "$6" in 0|1) uci set xray-monitor.sub.hot_swap="$6" ;; *) echo "hot_swap must be 0 or 1"; exit 1 ;; esac
+		fi
 		uci commit xray-monitor
 		do_cron_sync >/dev/null 2>&1
 		echo ok

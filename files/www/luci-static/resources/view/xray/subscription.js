@@ -7,7 +7,7 @@
 var callGet    = rpc.declare({ object: 'xray-monitor', method: 'sub_get' });
 var callFetch  = rpc.declare({ object: 'xray-monitor', method: 'sub_fetch' });
 var callApply  = rpc.declare({ object: 'xray-monitor', method: 'sub_apply' });
-var callSetCfg = rpc.declare({ object: 'xray-monitor', method: 'sub_setcfg', params: [ 'cron', 'cron_schedule', 'auto_apply', 'user_agent' ] });
+var callSetCfg = rpc.declare({ object: 'xray-monitor', method: 'sub_setcfg', params: [ 'cron', 'cron_schedule', 'auto_apply', 'user_agent', 'hot_swap' ] });
 var callAdd    = rpc.declare({ object: 'xray-monitor', method: 'sub_add',  params: [ 'prefix', 'url' ] });
 var callDel    = rpc.declare({ object: 'xray-monitor', method: 'sub_del',  params: [ 'id' ] });
 var callEdit   = rpc.declare({ object: 'xray-monitor', method: 'sub_edit', params: [ 'id', 'prefix', 'url', 'enabled' ] });
@@ -20,7 +20,7 @@ var SCHEDS = [
 
 var root = null;
 var state = { subscriptions: [], cron: true, cron_schedule: '0 * * * *', auto_apply: false,
-              last_fetch: 0, status: 'never', pending: false,
+              hot_swap: true, last_fetch: 0, status: 'never', pending: false, last_apply: null,
               diff: { added: [], removed: [], changed: [], total: 0 }, servers: [] };
 
 function fmtAgo(e) {
@@ -57,7 +57,7 @@ function decodeTitle(t) {
 		}).join(''));
 	} catch (e) { return ''; }
 }
-function statusBadge(st) {
+function statusBadge(st, la) {
 	var m = ({ ok: ['#46a546', _('fetched OK')], applied: ['#46a546', _('applied')],
 		partial: ['#cc7a00', _('partial — some failed')], never: ['#888', _('never fetched')],
 		'no-subs': ['#888', _('no subscriptions')], 'fetch-error': ['#cc3300', _('fetch error')],
@@ -66,11 +66,50 @@ function statusBadge(st) {
 		'install-failed': ['#cc3300', _('config install failed')],
 		'fetched-apply-failed': ['#cc3300', _('fetched — apply failed, changes stay staged')],
 		'rolled-back': ['#cc3300', _('applied but rolled back — xray unhealthy')] })[st] || ['#888', st];
+	// "rolled-back" has two faces: the classic restart failed its health check
+	// (xray unhealthy) - or a live apply failed and was rolled back (xray runs
+	// the PREVIOUS config and is healthy; last-apply says which one it was).
+	if (st == 'rolled-back' && la && la.fallback)
+		m = ['#cc3300', _('live apply failed — restored the previous config')];
 	return E('span', { 'style': 'background:' + m[0] + ';color:#fff;padding:2px 8px;border-radius:3px;' }, m[1]);
 }
 function tagList(a, c) {
 	if (!a || !a.length) return E('span', { 'style': 'color:#888' }, '—');
 	return E('span', {}, a.map(function(t) { return E('span', { 'style': 'display:inline-block;margin:1px 3px;padding:1px 6px;border-radius:3px;background:' + c + ';color:#fff;font-size:90%;' }, t); }));
+}
+// How the last apply hit the running xray (xray-sub writes last-apply.json):
+// live = applied via the xray API without a restart; restart = classic
+// pipeline, optionally with the reason a live apply was not possible, or the
+// fallback note when a live attempt failed and was rolled back.
+var APPLY_REASONS = {
+	'changes-beyond-outbounds': _('changes beyond outbound membership'),
+	'tag-charset': _('an outbound tag cannot be applied live (letters, digits, . _ - only)'),
+	'default-outbound': _('the default outbound would change'),
+	'api-unavailable': _('xray handler API not available'),
+	'running-state-mismatch': _('running outbounds differ from config.json'),
+	'plan-unavailable': _('hot-swap plan could not be computed')
+};
+function applyBadge(la) {
+	if (!la || !la.ts) return null;
+	var txt, col;
+	if (la.mode == 'live') {
+		col = '#46a546';
+		txt = _('applied live (hot-swap)');
+		if (la.removed || la.added) txt += ' · -' + (Number(la.removed) || 0) + '/+' + (Number(la.added) || 0);
+	}
+	else if (la.fallback) {
+		col = '#cc3300';
+		txt = _('hot-swap failed — rolled back');
+	}
+	else if (la.reason) {
+		col = '#cc7a00';
+		txt = _('restart required') + ': ' + (APPLY_REASONS[la.reason] || la.reason);
+	}
+	else {
+		col = '#46a546';
+		txt = _('applied with restart');
+	}
+	return E('span', { 'style': 'background:' + col + ';color:#fff;padding:2px 8px;border-radius:3px;' }, txt);
 }
 function busy(btn, p) { btn.disabled = true; return p.then(function(v) { btn.disabled = false; return v; }, function(e) { btn.disabled = false; throw e; }); }
 function refresh() { return callGet().then(function(r) { if (r && typeof r == 'object') state = r; redraw(); }); }
@@ -178,16 +217,18 @@ function buildSettings() {
 	preset.addEventListener('change', function() { if (preset.value) schedInput.value = preset.value; });
 	var cronChk = E('input', { 'type': 'checkbox', 'checked': state.cron ? '' : null });
 	var autoChk = E('input', { 'type': 'checkbox', 'checked': state.auto_apply ? '' : null });
+	var hsChk = E('input', { 'type': 'checkbox', 'checked': state.hot_swap ? '' : null });
 	var saveBtn = E('button', { 'class': 'cbi-button cbi-button-save' }, _('Save settings'));
 	saveBtn.addEventListener('click', function() {
 		var sched = (schedInput.value || '').trim();
 		if (sched.split(/\s+/).filter(Boolean).length !== 5) return ui.addNotification(null, E('p', _('Cron schedule must have 5 fields')), 'warning');
-		busy(saveBtn, callSetCfg(cronChk.checked ? '1' : '0', sched, autoChk.checked ? '1' : '0', '').then(function(r) { return notify(r, _('Settings saved.')); }));
+		busy(saveBtn, callSetCfg(cronChk.checked ? '1' : '0', sched, autoChk.checked ? '1' : '0', '', hsChk.checked ? '1' : '0').then(function(r) { return notify(r, _('Settings saved.')); }));
 	});
 	return E('table', { 'class': 'table' }, [
 		row(_('Scheduled fetch'), E('label', { 'style': 'display:inline-flex;gap:6px;align-items:center;' }, [ cronChk, E('span', {}, _('Periodically fetch all subscriptions')) ])),
 		row(_('Schedule'), E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;' }, [ preset, schedInput, E('span', { 'style': 'color:#888;font-size:90%;' }, _('(cron expression)')) ])),
-		row(_('Auto-apply updates'), E('label', { 'style': 'display:inline-flex;gap:6px;align-items:center;' }, [ autoChk, E('span', {}, _('On fetch, apply changes and restart xray automatically')) ])),
+		row(_('Auto-apply updates'), E('label', { 'style': 'display:inline-flex;gap:6px;align-items:center;' }, [ autoChk, E('span', {}, _('On fetch, apply changes automatically')) ])),
+		row(_('Hot-swap apply'), E('label', { 'style': 'display:inline-flex;gap:6px;align-items:center;' }, [ hsChk, E('span', {}, _('Apply outbound changes live via the xray API — restart only when a change is not hot-swappable')) ])),
 		row('', saveBtn)
 	]);
 }
@@ -198,17 +239,29 @@ function redraw() {
 	fetchBtn.addEventListener('click', function() {
 		busy(fetchBtn, callFetch().then(function(r) { return notify(r, _('Fetched.')); }, rpcFail));
 	});
-	var applyBtn = E('button', { 'class': 'cbi-button cbi-button-positive', 'disabled': state.pending ? null : 'disabled' }, _('Apply & restart xray'));
+	var applyBtn = E('button', { 'class': 'cbi-button cbi-button-positive', 'disabled': state.pending ? null : 'disabled' }, _('Apply staged changes'));
 	applyBtn.addEventListener('click', function() {
-		if (!confirm(_('Apply staged outbounds to config.json and restart xray now?'))) return;
-		busy(applyBtn, callApply().then(function(r) { return notify(r, _('Applied and restarted xray.')); }));
+		if (!confirm(_('Apply staged outbounds to config.json now? (live via the xray API when possible, otherwise xray is restarted)'))) return;
+		busy(applyBtn, callApply().then(function(r) {
+			if (r && r.ok) {
+				var live = (r.msg || '').indexOf('applied live') >= 0;
+				return notify(r, live ? _('Applied live — xray was not restarted.') : _('Applied and restarted xray.'));
+			}
+			return notify(r, _('Apply failed.'));
+		}, rpcFail));
 	});
 
-	var statusTable = E('table', { 'class': 'table' }, [
-		row(_('Last fetch'), E('span', {}, [ document.createTextNode(fmtAgo(state.last_fetch) + '  '), statusBadge(state.status) ])),
-		row(_('Pending'), state.pending ? E('span', { 'style': 'color:#cc7a00;font-weight:bold;' }, _('changes staged — not yet applied')) : E('span', { 'style': 'color:#46a546;' }, _('config up to date'))),
-		row(_('Auto-apply'), state.auto_apply ? E('span', { 'style': 'color:#cc7a00;' }, _('ON')) : E('span', { 'style': 'color:#888;' }, _('off')))
-	]);
+	var statusRows = [
+		row(_('Last fetch'), E('span', {}, [ document.createTextNode(fmtAgo(state.last_fetch) + '  '), statusBadge(state.status, state.last_apply) ]))
+	];
+	var laBadge = applyBadge(state.last_apply);
+	if (laBadge)
+		statusRows.push(row(_('Last apply'), E('span', {}, [ document.createTextNode(fmtAgo(state.last_apply.ts) + '  '), laBadge ])));
+	statusRows.push(row(_('Pending'), state.pending ? E('span', { 'style': 'color:#cc7a00;font-weight:bold;' }, _('changes staged — not yet applied')) : E('span', { 'style': 'color:#46a546;' }, _('config up to date'))));
+	statusRows.push(row(_('Auto-apply'), state.auto_apply ? E('span', { 'style': 'color:#cc7a00;' }, _('ON')) : E('span', { 'style': 'color:#888;' }, _('off'))));
+	if (state.last_apply && state.last_apply.fallback)
+		statusRows.push(row(_('Hot-swap'), E('span', { 'style': 'color:#cc3300;' }, _('live apply failed and was rolled back — xray runs the previous config'))));
+	var statusTable = E('table', { 'class': 'table' }, statusRows);
 
 	var diffBox = state.pending ? E('table', { 'class': 'table' }, [
 		E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td', 'width': '28%' }, _('Added')),   E('td', { 'class': 'td' }, tagList(state.diff.added, '#46a546')) ]),

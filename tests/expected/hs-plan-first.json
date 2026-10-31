@@ -1,0 +1,1 @@
+{ "remove": [ "proxy-fi" ], "add": [ "proxy-de" ], "changed": [ ], "first_old": "proxy-fi", "first_new": "proxy-ch", "restart_required": "default-outbound", "hot_swap": false }
