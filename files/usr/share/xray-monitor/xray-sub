@@ -49,7 +49,13 @@ TSTATE_DIR=/tmp/xray-monitor
 TSTATE=$TSTATE_DIR/tmpxray.json
 theld=0
 STAGE_DIR=""
+# via_* state for proxied fetches / self-updates (F18, see the block below):
+# via_stop is best-effort, bounded (tmpxray_kill waits <= ~4 s) and must never
+# change this script's exit status. NOT run for an instance started by the
+# `tmpxray` command itself - that one is meant to outlive the command.
+VIA_TAG=""; VIA_PORT=""; via_started=0; via_dead=0; via_err=""
 cleanup() {
+	via_stop
 	[ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"
 	if [ "$held" = 1 ]; then
 		flock -u 3 2>/dev/null
@@ -119,10 +125,58 @@ e2e_bytes=$(uci -q get xray-monitor.sub.e2e_bytes)
 case "$e2e_bytes" in ''|*[!0-9]*) e2e_bytes=1048576 ;; esac
 [ "$e2e_bytes" -ge 1024 ] && [ "$e2e_bytes" -le 104857600 ] || e2e_bytes=1048576
 
-fetch_url() {  # <url> <user-agent> [header-dump-file]
-	local hdr="${3:-/dev/null}"
-	if command -v curl >/dev/null 2>&1; then curl -s -D "$hdr" -A "$2" --max-time 25 "$1"
-	else uclient-fetch -q -O - -U "$2" -T 25 "$1"; fi
+# --- fetch / self-update through xray (F18) ----------------------------------
+# Routers whose own internet path to the panel or GitHub is blocked, but whose
+# xray exits can reach it. UCI (xray-monitor.sub):
+#   fetch_via         direct (default) | proxy | auto    subscription fetches
+#   fetch_via_update  0/direct (default) | proxy | auto  self-update downloads
+#   fetch_via_exit    an outbound tag, or auto (default) which exit to use
+# "via xray" = one tmpxray socks inbound (contract B2) for the ONE chosen exit,
+# then curl --socks5-hostname 127.0.0.1:<port> with the SAME user agent (incl.
+# the per-subscription override), the SAME --max-time bound and the SAME
+# response-header capture as the direct path. The instance is stopped on
+# success, on failure and from the EXIT trap (cleanup -> via_stop); the TTL
+# watchdog stays as the last-resort backstop. A configured proxy path that
+# cannot be established is an HONEST failure - never a silent direct fallback
+# (that would leak the fetch to an ISP that blocks it).
+via_norm() {  # <raw uci value> -> canonical direct|proxy|auto
+	case "$1" in
+		proxy) echo proxy ;;
+		auto)  echo auto ;;
+		*)     echo direct ;;   # "", "0", "direct" and typos = today's behavior
+	esac
+}
+fetch_via=$(via_norm "$(uci -q get xray-monitor.sub.fetch_via)")
+fetch_via_update=$(via_norm "$(uci -q get xray-monitor.sub.fetch_via_update)")
+fetch_via_exit=$(uci -q get xray-monitor.sub.fetch_via_exit); [ -n "$fetch_via_exit" ] || fetch_via_exit=auto
+
+fetch_url() {  # <url> <user-agent> [header-dump-file] [socks-port]
+	local hdr="${3:-/dev/null}" port="${4:-}"
+	if command -v curl >/dev/null 2>&1; then
+		if [ -n "$port" ]; then
+			# proxied fetch: only the transport changes. socks5-HOSTNAME so the
+			# panel's name is resolved at the exit, not by the blocked router.
+			curl -s -D "$hdr" -A "$2" --max-time 25 --socks5-hostname "127.0.0.1:$port" "$1"
+		else
+			curl -s -D "$hdr" -A "$2" --max-time 25 "$1"
+		fi
+	else
+		# uclient-fetch cannot speak socks5: a proxied fetch without curl is an
+		# honest failure, not a downgrade to a direct connection
+		[ -z "$port" ] || return 1
+		uclient-fetch -q -O - -U "$2" -T 25 "$1"
+	fi
+}
+
+# curl with the proxy appended when a via port is up (self-update downloads).
+# Every flag stays exactly as the direct path passes it; only the transport
+# changes, so timeouts and error handling are unchanged.
+via_curl() {  # <curl args...>
+	if [ -n "$VIA_PORT" ]; then
+		curl "$@" --socks5-hostname "127.0.0.1:$VIA_PORT"
+	else
+		curl "$@"
+	fi
 }
 
 # Parse the standard `subscription-userinfo` response header into usage state:
@@ -1097,6 +1151,94 @@ do_e2e() {  # [tag ...]
 	return 0
 }
 
+# --- via-xray plumbing (F18) -------------------------------------------------
+# Which exit a proxied fetch / self-update uses. SELECTION ORDER, in full:
+# 1. fetch_via_exit is a concrete outbound tag -> that tag, nothing else is
+#    consulted (a tag no longer in the config fails tmpxray start honestly).
+# 2. fetch_via_exit=auto, step 1: the freshest e2e results F13 writes to
+#    $E2E_JSON (contract B3). pickexit.uc accepts it only when its top-level
+#    ts is within E2E_MAX_AGE seconds of now (a file from the future by > 300 s
+#    is clock skew and also rejected), and picks the exit with status "ok" and
+#    the highest speed_bps; ties keep document order.
+# 3. fetch_via_exit=auto, step 2 (e2e absent / stale / nothing ok): the rpcd
+#    outbounds surface - `ubus call xray-monitor outbounds` probes every
+#    endpoint (bare TCP, ~3 s, honors probe_disabled) and answers them in
+#    CONFIG order; the FIRST outbound with up=1 wins (up=0 down, -1 no probe
+#    tool and -2 probe-disabled never match).
+# 4. neither source names an exit -> rc 1: a fetch/update configured to go via
+#    xray then fails with today's honest failure statuses. In proxy mode there
+#    is NEVER a silent direct retry - the whole point is that direct is blocked
+#    or must not be used.
+E2E_MAX_AGE=3600
+E2E_JSON="$TSTATE_DIR/e2e.json"
+
+via_pick_exit() {  # prints the chosen tag; rc 1 = nothing selectable
+	local tag out i
+	if [ "$fetch_via_exit" != auto ]; then
+		echo "$fetch_via_exit"; return 0
+	fi
+	tag=$("$SHARE/pickexit.uc" "$E2E_JSON" "$(date +%s)" "$E2E_MAX_AGE" 2>/dev/null)
+	[ -n "$tag" ] && { echo "$tag"; return 0; }
+	out=$(ubus call xray-monitor outbounds 2>/dev/null) || return 1
+	i=0
+	while :; do
+		tag=$(printf '%s' "$out" | jsonfilter -e "@.outbounds[$i].tag" 2>/dev/null)
+		[ -n "$tag" ] || return 1
+		if [ "$(printf '%s' "$out" | jsonfilter -e "@.outbounds[$i].up" 2>/dev/null)" = 1 ]; then
+			echo "$tag"; return 0
+		fi
+		i=$((i + 1))
+	done
+}
+
+# Start the ONE-exit tmpxray used for proxied transfers. The mini-lock (fd 4)
+# is released again as soon as the instance is up: a fetch can keep the socks
+# port open for minutes and must not block unrelated tmpxray use (F13 e2e) for
+# that long. The instance itself is a replace-style B2 session, so a concurrent
+# e2e tmpxray is stopped by our start (one tmpxray at a time, by design).
+via_start() {  # <tag> -> sets VIA_TAG/VIA_PORT; via_err carries the reason
+	local out tag_re
+	VIA_TAG=""; VIA_PORT=""
+	out=$(do_tmpxray_start "$1" 2>&1) || { via_err="$out"; return 1; }
+	if [ "$theld" = 1 ]; then
+		flock -u 4 2>/dev/null
+		exec 4>&- 2>/dev/null
+		theld=0
+	fi
+	# do_tmpxray_start prints exactly {"pid":N,"ports":{"<tag>":port}} - read
+	# the port without depending on jsonfilter key syntax for dashed tags
+	# (escape the dot, the one regex metachar a tag may contain)
+	tag_re=$(printf '%s' "$1" | sed 's/\./\\./g')
+	VIA_PORT=$(printf '%s' "$out" | sed -n "s/.*\"$tag_re\":\([0-9][0-9]*\).*/\1/p")
+	case "$VIA_PORT" in
+		''|*[!0-9]*)
+			via_err="tmpxray started but reported no port for $1"
+			do_tmpxray_stop >/dev/null 2>&1
+			return 1 ;;
+	esac
+	VIA_TAG="$1"; via_started=1
+	return 0
+}
+
+via_stop() {
+	[ "$via_started" = 1 ] || return 0
+	via_started=0; VIA_PORT=""
+	do_tmpxray_stop >/dev/null 2>&1
+	return 0
+}
+
+# Lazy start (the exit is picked and the instance started only when a transfer
+# actually needs the proxy, so an all-direct `auto` run never touches tmpxray).
+# After a hard failure the run remembers (via_dead) and stops retrying.
+via_ensure() {
+	[ -n "$VIA_PORT" ] && return 0
+	[ "$via_dead" = 1 ] && return 1
+	local tag
+	tag=$(via_pick_exit) || { via_dead=1; via_err="no exit selectable for the proxy path (no fresh e2e.json and no outbound probing up)"; return 1; }
+	via_start "$tag" || { via_dead=1; return 1; }
+	return 0
+}
+
 case "$1" in
 	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync|backups-delete|backups-pin|backups-restore|overrides-apply)
 		take_lock || {
@@ -1115,6 +1257,9 @@ case "$1" in
 		tmpd=$(mktemp -d); staged="$tmpd/staged.json"
 		printf '{"groups":[' > "$staged"
 		first=1; nsub=0; nok=0; failed=""
+		# which transport actually moved bytes this run (status surface):
+		#   direct | via <tag> | direct, retried via <tag>
+		moved_direct=0; moved_via=0; via_noted=0
 		for id in $(sub_ids); do
 			[ "$(uci -q get "xray-monitor.$id.enabled")" = "0" ] && continue
 			url=$(uci -q get "xray-monitor.$id.url"); [ -n "$url" ] || continue
@@ -1122,7 +1267,28 @@ case "$1" in
 			ua=$(uci -q get "xray-monitor.$id.user_agent"); [ -n "$ua" ] || ua="$ua_default"
 			nsub=$((nsub + 1))
 			raw="$tmpd/$id.raw"; obs="$tmpd/$id.obs"; hdrf="$tmpd/$id.hdr"
-			if fetch_url "$url" "$ua" "$hdrf" > "$raw" 2>/dev/null && [ -s "$raw" ]; then
+			got=""
+			# direct attempt unless fetch_via=proxy (there direct is known-broken
+			# or must not be tried at all)
+			if [ "$fetch_via" != proxy ]; then
+				if fetch_url "$url" "$ua" "$hdrf" > "$raw" 2>/dev/null && [ -s "$raw" ]; then
+					got=direct
+				fi
+			fi
+			# proxy mode: the only transport. auto mode: retry a transport-level
+			# failure (curl error or empty body) through xray, same UA/timeouts.
+			if [ -z "$got" ] && [ "$fetch_via" != direct ]; then
+				if via_ensure; then
+					if fetch_url "$url" "$ua" "$hdrf" "$VIA_PORT" > "$raw" 2>/dev/null && [ -s "$raw" ]; then
+						got=via
+					fi
+				elif [ "$via_noted" = 0 ]; then
+					via_noted=1
+					echo "proxy path unavailable: $via_err" >&2
+				fi
+			fi
+			if [ -n "$got" ]; then
+				[ "$got" = direct ] && moved_direct=1 || moved_via=1
 				store_usage "$prefix" "$hdrf"
 				if "$SHARE/parse.uc" "$raw" "$STATE/tagmap-$prefix.json" "$STATE/overrides.json" "$prefix" > "$obs" 2>/dev/null && [ -s "$obs" ]; then
 					[ "$first" = 1 ] || printf ',' >> "$staged"
@@ -1137,6 +1303,24 @@ case "$1" in
 				failed="$failed $prefix"
 			fi
 		done
+		# the proxy instance is no longer needed: stop it now (the EXIT trap and
+		# the TTL watchdog are only backstops) - auto-apply below may restart
+		# xray, and usage/diff state is already written
+		via_stop
+		if [ "$nsub" -gt 0 ]; then
+			# machine-greppable path token (UI reads it via status):
+			#   direct | via <tag> | direct, retried via <tag> (auto mode)
+			# "" when nothing was fetched at all (e.g. proxy mode could not
+			# establish the instance) - the status file carries that failure.
+			tok=""
+			if [ "$moved_via" = 1 ]; then
+				if [ "$fetch_via" = auto ]; then tok="direct, retried via $VIA_TAG"
+				else tok="via $VIA_TAG"; fi
+			elif [ "$moved_direct" = 1 ]; then
+				tok="direct"
+			fi
+			printf '%s\n' "$tok" > "$STATE/fetch_path"
+		fi
 		# A subscription that could not be refetched keeps its currently installed
 		# exits: snapshot them from the live config as extra staged groups. Disabled
 		# subscriptions are deliberately absent here - those DO get pruned on apply.
@@ -1282,29 +1466,63 @@ case "$1" in
 
 	self-update)
 		tmp="/tmp/luci-app-xray-monitor.ipk"
-		# 1) preferred: stable GitHub Release asset (single redirect, robust)
-		if curl -fsSL --max-time 60 -o "$tmp" "$REL" 2>/dev/null && tar -tzf "$tmp" >/dev/null 2>&1; then
-			src=release
-		else
+		# Only the DOWNLOADS go via xray when fetch_via_update says so; opkg
+		# install stays local and the SHA256 gate below is untouched. The
+		# downloads run through via_curl, so with a tmpxray port up they use
+		# the same exit, with identical flags otherwise.
+		update_downloads() {  # -> $upd_src = release|feed; rc 1, $upd_err = reason
+			upd_src=""; upd_err=""
+			# 1) preferred: stable GitHub Release asset (single redirect, robust)
+			if via_curl -fsSL --max-time 60 -o "$tmp" "$REL" 2>/dev/null && tar -tzf "$tmp" >/dev/null 2>&1; then
+				upd_src=release; return 0
+			fi
 			# 2) fallback: the opkg feed
-			ipk=$(curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
-			[ -n "$ipk" ] || { rm -f "$tmp"; echo "cannot reach Releases or feed"; exit 1; }
-			curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { rm -f "$tmp"; echo "download failed"; exit 1; }
-			tar -tzf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "downloaded file is not a valid package (feed may be updating)"; exit 1; }
-			src=feed
+			ipk=$(via_curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
+			[ -n "$ipk" ] || { upd_err="cannot reach Releases or feed"; return 1; }
+			via_curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { upd_err="download failed"; return 1; }
+			tar -tzf "$tmp" >/dev/null 2>&1 || { upd_err="downloaded file is not a valid package (feed may be updating)"; return 1; }
+			upd_src=feed; return 0
+		}
+		upd_via_fail=""
+		upd_path="direct"
+		upd_ok=0
+		# direct attempt first unless the update path is pinned to proxy
+		if [ "$fetch_via_update" != proxy ]; then
+			update_downloads && upd_ok=1
 		fi
+		# proxy mode: the only transport. auto: retry a failed direct download.
+		if [ "$upd_ok" != 1 ] && [ "$fetch_via_update" != direct ]; then
+			if via_ensure; then
+				if update_downloads; then
+					upd_ok=1
+					upd_path="via $VIA_TAG"
+					[ "$fetch_via_update" = auto ] && upd_path="direct, retried via $VIA_TAG"
+				fi
+			else
+				upd_via_fail="proxy path unavailable: $via_err"
+			fi
+		fi
+		if [ "$upd_ok" != 1 ]; then
+			rm -f "$tmp"
+			if   [ -n "$upd_via_fail" ]; then echo "$upd_via_fail"
+			elif [ -n "$upd_err" ];      then echo "$upd_err"
+			else                              echo "download failed"; fi
+			exit 1
+		fi
+		printf '%s\n' "$upd_path" > "$STATE/update_path"
 		# Integrity gate: verify the download against a published checksum
 		# before handing it to opkg. Preferred: the .sha256 sidecar next to
 		# the Release asset; else the SHA256sum of the matching Version
 		# stanza in the feed index. Neither available, or mismatch => refuse.
+		# (Checksum fetches ride the same transport the .ipk came over.)
 		exp=""
-		if [ "$src" = release ]; then
-			exp=$(curl -fsSL --max-time 20 "$REL.sha256" 2>/dev/null | awk 'NR==1 { print $1 }')
+		if [ "$upd_src" = release ]; then
+			exp=$(via_curl -fsSL --max-time 20 "$REL.sha256" 2>/dev/null | awk 'NR==1 { print $1 }')
 		fi
 		if [ -z "$exp" ]; then
 			ver=$(tar -xzOf "$tmp" ./control.tar.gz 2>/dev/null | tar -xzO ./control 2>/dev/null | sed -n 's/^Version: //p' | head -n1)
 			[ -n "$ver" ] || { rm -f "$tmp"; echo "cannot read package version - refusing to install"; exit 1; }
-			exp=$(curl -s --max-time 20 "$FEED/Packages" 2>/dev/null | awk -v want="$ver" '
+			exp=$(via_curl -s --max-time 20 "$FEED/Packages" 2>/dev/null | awk -v want="$ver" '
 				/^Package: /    { ok = ($2 == PKG) }
 				/^Version: /    { ok = ok && ($2 == want) }
 				/^SHA256sum: /  { if (ok) { print $2; exit } }' PKG="$PKG")
@@ -1312,6 +1530,10 @@ case "$1" in
 		[ -n "$exp" ] || { rm -f "$tmp"; echo "no published SHA256 for this package version - refusing to install"; exit 1; }
 		got=$(sha256sum "$tmp" 2>/dev/null | awk '{ print $1 }')
 		[ "$got" = "$exp" ] || { rm -f "$tmp"; echo "SHA256 mismatch (expected $exp, got $got) - refusing to install"; exit 1; }
+		# downloads done: drop the proxy instance BEFORE opkg - installing the
+		# package restarts rpcd and replaces this very script, so only the TTL
+		# watchdog would be left to reap the instance
+		via_stop
 		opkg install --force-reinstall "$tmp"; rc=$?
 		rm -f "$tmp"
 		[ "$rc" -eq 0 ] && echo "updated" || { echo "opkg install failed"; exit 1; }

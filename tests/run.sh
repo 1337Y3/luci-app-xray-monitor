@@ -1,6 +1,6 @@
 #!/bin/sh
 # Golden-output tests for the ucode helpers: parse / snapshot / diff / apply /
-# routing / balancers / balance / tmpxray / e2e (status.uc imports uci and is
+# routing / balancers / balance / tmpxray / e2e / pickexit (status.uc imports uci and is
 # deliberately not covered).
 # Runs wherever a POSIX sh and ucode exist - the CI job (ucode built from
 # source) or a router directly (BusyBox ash):
@@ -259,6 +259,29 @@ check "e2e status: file content + running flag" "$EXP/e2e-status.json" "$W/e2e-s
 check "e2e status: missing file -> idle, empty results" "$EXP/e2e-status0.json" "$W/e2e-status0.json"
 "$E" summary "$W/e2e.json" > "$W/e2e-summary.txt"
 check "e2e summary: per-exit lines + count line" "$EXP/e2e-summary.txt" "$W/e2e-summary.txt"
+
+echo "== pickexit (F18: which exit a proxied fetch/update uses, from e2e results)"
+# fixture ts = 1700000000; 1700000500 = fresh, 1700004000 = beyond the 3600 s
+# max age, 1699999400 = file "from the future" (clock skew)
+"$SHARE/pickexit.uc" "$FIX/e2e.json" 1700000500 > "$W/pickexit-e2e.out" 2>/dev/null
+check "pickexit: ok exit with best speed_bps (stalled/fail/skipped ignored)" "$EXP/pickexit-e2e.out" "$W/pickexit-e2e.out"
+"$SHARE/pickexit.uc" "$FIX/e2e-tie.json" 1700000500 > "$W/pickexit-tie.out" 2>/dev/null
+check "pickexit: equal speed_bps keeps document order" "$EXP/pickexit-tie.out" "$W/pickexit-tie.out"
+pe_rc() {  # <fixture> <now> [max-age] -> 0 when pickexit correctly refuses
+	if "$SHARE/pickexit.uc" "$1" "$2" ${3:-} >/dev/null 2>&1; then return 1; else return 0; fi
+}
+pe_rc "$FIX/e2e.json" 1700004000 && echo "PASS   pickexit: stale e2e.json rejected" \
+	|| { echo "FAIL   pickexit: stale e2e.json rejected"; fails=$((fails + 1)); }
+pe_rc "$FIX/e2e.json" 1699999400 && echo "PASS   pickexit: future ts (clock skew) rejected" \
+	|| { echo "FAIL   pickexit: future ts (clock skew) rejected"; fails=$((fails + 1)); }
+pe_rc "$FIX/e2e-no-ok.json" 1700000500 && echo "PASS   pickexit: fresh file with no ok exit rejected" \
+	|| { echo "FAIL   pickexit: fresh file with no ok exit rejected"; fails=$((fails + 1)); }
+pe_rc "$FIX/e2e-bad.json" 1700000500 && echo "PASS   pickexit: unparseable e2e.json rejected" \
+	|| { echo "FAIL   pickexit: unparseable e2e.json rejected"; fails=$((fails + 1)); }
+pe_rc "$W/no-such-e2e.json" 1700000500 && echo "PASS   pickexit: absent e2e.json rejected" \
+	|| { echo "FAIL   pickexit: absent e2e.json rejected"; fails=$((fails + 1)); }
+pe_rc "$FIX/e2e.json" 1700000100 50 && echo "PASS   pickexit: max-age argument honored" \
+	|| { echo "FAIL   pickexit: max-age argument honored"; fails=$((fails + 1)); }
 
 echo
 if [ "$fails" -eq 0 ] && [ "$xrayfails" -eq 0 ]; then

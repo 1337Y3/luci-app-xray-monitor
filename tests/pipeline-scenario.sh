@@ -33,6 +33,14 @@
 # and touches nothing, no/empty hash keeps the old behavior), config_diff_text
 # (semantic diff of the editor text vs the live config, invalid JSON named as
 # such), and list/ACL consistency for every declared method.
+# The F18 sections cover fetches / self-updates routed through a tmpxray socks
+# instance: the auto exit-selection order (fresh e2e.json first, then the rpcd
+# outbounds fallback), the same UA / timeout / header capture on the proxied
+# curl, honest failures when nothing is selectable or tmpxray cannot start
+# (never a silent direct fallback), the self-update downloads proxied while
+# opkg stays local and the SHA256 gate stays strict, and the instance being
+# stopped before opkg install. curl / ubus / tmpxray are stubbed there; uci
+# answers come from a file the cases rewrite.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -105,6 +113,36 @@ if grep -q 'echo "/etc/xray' "$SB/work/sub-check.txt" \
 	|| grep -q '/tmp/xray-monitor' "$SB/work/sub-check.txt"; then
 	echo "scenario setup failed: a live writable path is still reachable in the copy"; exit 1
 fi
+
+# tmpxray override for the F18 fetch-via sections: the contract-B2 boundary is
+# stubbed (start prints the JSON with a fixed port, stop logs), so proxied
+# fetch/update cases need no real xray, bound ports or netstat. Inserted before
+# the first dispatcher `case` (after the real definitions, so the override wins
+# in ash); the $STAGE_DIR lib extraction below then carries it too, harmlessly.
+# GUARDED by $STUB_TMPXRAY_OVERRIDE: only the F18 sections export it - the F13
+# e2e sections need the REAL tmpxray machinery (ports, state file, netstat).
+cat > "$SB/work/tmpxray-override.sh" <<'EOF'
+
+# --- scenario override: stub the tmpxray (B2) start/stop boundary -----------
+if [ -n "${STUB_TMPXRAY_OVERRIDE:-}" ]; then
+do_tmpxray_start() {
+	echo "start $*" >> "${STUB_TMPXRAY_LOG:-/dev/null}"
+	[ -f "${STUB_TMPXRAY_FAIL:-/nonexistent}" ] && { echo "stub: tmpxray start failed"; return 1; }
+	printf '{"pid":%s,"ports":{"%s":%s}}\n' "$$" "$1" "${STUB_TMPXRAY_PORT:-11080}"
+}
+do_tmpxray_stop() {
+	echo "stop" >> "${STUB_TMPXRAY_LOG:-/dev/null}"
+	echo "stopped"
+	return 0
+}
+fi
+EOF
+awk -v ins="$SB/work/tmpxray-override.sh" '
+	!done && $0 == "case \"$1\" in" { while ((getline line < ins) > 0) print line; close(ins); done = 1 }
+	{ print }
+' "$SB/sub" > "$SB/sub.new" && mv "$SB/sub.new" "$SB/sub"
+[ "$(grep -c '^do_tmpxray_start()' "$SB/sub")" = 2 ] \
+	|| { echo "scenario setup failed: tmpxray override not inserted"; exit 1; }
 
 # Writers serialize with flock(2) on an open descriptor (`flock FD`, busybox
 # and util-linux alike). Where no flock exists (dev boxes) fall back to a
@@ -224,49 +262,170 @@ exit 0
 EOF
 cat > "$SB/bin/uci" <<'EOF'
 #!/bin/sh
-# uci stub: keeps the sandbox off the live UCI. backup_keep=3 pins the prune
-# budget so the counts below are deterministic; hot_swap defaults to 0 so the
-# pre-F14 assertions stay byte-stable and the hot-swap cases opt in via
-# $STUB_UCI_HOTSWAP; balancer_override sections come from $STUB_UCI_STATE (a
-# file in `uci show xray-monitor` format) so the F15 override cases can vary
-# them; probe_disabled names the exit the e2e cases expect to be skipped;
-# STUB_UCI_E2E_CRON flips e2e_cron on for the cron-sync case; every other
-# query comes back empty (sub_prefixes empty = legacy "all proxy outbounds
-# are managed" mode).
-state="${STUB_UCI_STATE:-/nonexistent}"
-case " $* " in
-	*" get xray-monitor.sub.backup_keep "*) echo 3; exit 0 ;;
-	*" get xray-monitor.sub.hot_swap "*) echo "${STUB_UCI_HOTSWAP:-0}"; exit 0 ;;
-	*" get xray-monitor.sub.probe_disabled "*) echo "e2e-skip"; exit 0 ;;
-	*" get xray-monitor.sub.e2e_cron "*)
-		[ -n "${STUB_UCI_E2E_CRON:-}" ] && { echo 1; exit 0; }
-		exit 1
-		;;
-	*" show xray-monitor "*)
-		[ -f "$state" ] && cat "$state"
-		exit 0
-		;;
-esac
-# uci [-q] get xray-monitor.<section>.<option> -> the quoted value, rc 1 if absent
-prev="" want=""
-for a in "$@"; do
-	case "$prev" in get) want="$a" ;; esac
-	prev="$a"
+# uci stub: keeps the sandbox off the live UCI. Hardcoded answers keep the
+# deterministic cases stable: backup_keep=3 pins the prune budget, hot_swap
+# defaults to 0 (pre-F14 assertions byte-stable, hot-swap cases opt in via
+# $STUB_UCI_HOTSWAP), probe_disabled names the exit the e2e cases expect to be
+# skipped, e2e_cron answers 1 only while $STUB_UCI_E2E_CRON is set (cron-sync
+# case). Everything else is served from files in `uci show xray-monitor`
+# format: $STUB_UCI first (the default answers only backup_keep=3; the F18
+# fetch-via sections rewrite it with subscriptions and fetch_via* options),
+# then $STUB_UCI_STATE (balancer_override sections for the F15 override
+# cases). Nothing found = rc 1 / empty, so an empty sub list keeps the legacy
+# "all proxy outbounds are managed" mode. Anything else (add/set/commit/...)
+# fails like before.
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-q) ;;
+		show)
+			if [ -f "${STUB_UCI_STATE:-/nonexistent}" ]; then
+				cat "${STUB_UCI_STATE}"
+			else
+				[ -n "${STUB_UCI:-}" ] && cat "$STUB_UCI" 2>/dev/null
+			fi
+			exit 0 ;;
+		get)
+			[ -n "$2" ] || exit 1
+			case "$2" in
+				xray-monitor.sub.backup_keep) echo 3; exit 0 ;;
+				xray-monitor.sub.hot_swap) echo "${STUB_UCI_HOTSWAP:-0}"; exit 0 ;;
+				xray-monitor.sub.probe_disabled) echo "e2e-skip"; exit 0 ;;
+				xray-monitor.sub.e2e_cron)
+					[ -n "${STUB_UCI_E2E_CRON:-}" ] && { echo 1; exit 0; }
+					exit 1 ;;
+			esac
+			# fixed-prefix match via case (no regex: section ids carry
+			# [ ] and dots that must not be interpreted)
+			while IFS= read -r line; do
+				case "$line" in "$2="*)
+					v=${line#*=}; v=${v#\'}; v=${v%\'}
+					echo "$v"; exit 0 ;;
+				esac
+			done < "${STUB_UCI:-/dev/null}"
+			# generic "<section>.<option>='value'" lookup for the override
+			# sections (the option name carries no dots, so this sed is safe)
+			if [ -f "${STUB_UCI_STATE:-/nonexistent}" ]; then
+				val=$(sed -n "s/^$(printf '%s' "$2" | sed 's/[.]/\\./g')='\\(.*\\)'$/\\1/p" "${STUB_UCI_STATE}")
+				if [ -n "$val" ]; then echo "$val"; exit 0; fi
+			fi
+			exit 1 ;;
+	esac
+	shift
 done
-case "$want" in
-	xray-monitor.*)
-		if [ -f "$state" ]; then
-			val=$(sed -n "s/^$(printf '%s' "$want" | sed 's/[.]/\\./g')='\\(.*\\)'$/\\1/p" "$state")
-			if [ -n "$val" ]; then echo "$val"; exit 0; fi
-		fi
-		;;
-esac
 exit 1
 EOF
+cat > "$SB/bin/ubus" <<'EOF'
+#!/bin/sh
+# ubus stub: stands in for the rpcd outbounds surface consulted by the F18
+# exit-selection fallback - $STUB_UBUS_OUT holds the (config-ordered) reply.
+# Every invocation is logged so cases can assert whether the fallback ran.
+echo "ubus $*" >> "${STUB_UBUS_LOG:-/dev/null}"
+if [ "$1" = call ] && [ "$2" = xray-monitor ] && [ "$3" = outbounds ] && [ -r "${STUB_UBUS_OUT:-}" ]; then
+	cat "$STUB_UBUS_OUT"
+	exit 0
+fi
+exit 1
+EOF
+cat > "$SB/bin/curl" <<'EOF'
+#!/bin/sh
+# curl stub, two protocols in one binary (dispatch on -w: only the e2e
+# runner passes a write-out format).
+# e2e calls (F13): resolve the exit tag from the tmpxray state file's port
+# map, then answer from $STUB_CURL_DIR/<tag>.204 or <tag>.body:
+#   line 1: curl exit code (0 ok, 28 timeout mid-transfer, 7 connect fail, ...)
+#   line 2: the -w line "http|ttfb_s|total_s|size_download|speed_download"
+#   line 3: optional seconds to sleep first (simulates a slow/frozen exit)
+# An unknown tag gets a resolve failure, like a dead socks port. Every
+# e2e call is logged ("tag=... kind=... port=... ua=... url=...") so the
+# scenario can prove a probe_disabled exit is never dialled.
+# every other call (F18 fetch-via / self-update, and the plain fetches):
+# logs the full argv (with a socks= marker so direct vs proxied calls are
+# distinguishable), then answers from per-URL canned files so a whole
+# self-update can run against it:
+#   *.sha256  -> $STUB_CURL_SHA256     *.ipk -> $STUB_CURL_IPK
+#   *Packages -> $STUB_CURL_PACKAGES   else  -> $STUB_CURL_BODY (fetch body)
+# $STUB_CURL_HDR is copied into the -D header-dump file, keeping the
+# subscription-userinfo capture in play on the proxy path too. Flags:
+#   $STUB_CURL_FAIL_ALL     every call fails
+#   $STUB_CURL_DIRECT_DOWN  calls WITHOUT --socks5-hostname fail (direct is
+#                           down, the proxy works - the auto-mode retry case)
+case " $* " in *" -w "*)
+	LOG=${STUB_CURL_LOG:-/dev/null}
+	DIR=${STUB_CURL_DIR:-/nonexistent}
+	args="$*"
+	port=$(printf '%s' "$args" | sed -n 's/.*--socks5-hostname 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p')
+	url=$(printf '%s' "$args" | tr ' ' '\n' | grep -E '^https?://' | head -n 1)
+	ua=$(printf '%s' "$args" | sed -n 's/.*-A \([^ ]*\).*/\1/p')
+	kind=body
+	case "$url" in *204*) kind=204 ;; esac
+	tag=""
+	if [ -n "$port" ] && [ -s "${STUB_TMPXRAY_STATE:-/nonexistent}" ]; then
+		# "ports" content of the tmpxray state: strip the prefix up to the object,
+		# then the outer closing brace, then everything from the ports' own brace
+		ports=$(cat "${STUB_TMPXRAY_STATE}" 2>/dev/null)
+		ports=${ports#*'"ports":{'}
+		ports=${ports%\}}
+		ports=${ports%%\}*}
+		for pair in $(printf '%s' "$ports" | tr ',' '\n'); do
+			if [ "$(printf '%s' "$pair" | cut -d':' -f2)" = "$port" ]; then
+				tag=$(printf '%s' "$pair" | cut -d'"' -f2)
+				break
+			fi
+		done
+	fi
+	echo "tag=$tag kind=$kind port=$port ua=$ua url=$url" >> "$LOG"
+	f="$DIR/$tag.$kind"
+	if [ -s "$f" ] && [ -n "$tag" ]; then
+		rc=$(sed -n '1p' "$f")
+		case "$rc" in ''|*[!0-9]*) rc=0 ;; esac
+		sl=$(sed -n '3p' "$f")
+		case "$sl" in ''|*[!0-9]*) sl=0 ;; esac
+		[ "$sl" -gt 0 ] && sleep "$sl"
+		sed -n '2p' "$f"
+		exit "$rc"
+	fi
+	echo "000|0.000|0.000|0|0"
+	exit 6
+		;;
+esac
+case " $* " in *" --socks5-hostname "*) socks=1 ;; *) socks=0 ;; esac
+echo "curl[socks=$socks] $*" >> "${STUB_CURL_LOG:-/dev/null}"
+[ -f "${STUB_CURL_FAIL_ALL:-/nonexistent}" ] && exit 22
+[ -f "${STUB_CURL_DIRECT_DOWN:-/nonexistent}" ] && [ "$socks" = 0 ] && exit 7
+url=""
+for a in "$@"; do
+	case "$a" in http://*|https://*) url="$a" ;; esac
+done
+case "$url" in
+	*.sha256)  body="${STUB_CURL_SHA256:-}" ;;
+	*.ipk)     body="${STUB_CURL_IPK:-}" ;;
+	*Packages) body="${STUB_CURL_PACKAGES:-}" ;;
+	*)         body="${STUB_CURL_BODY:-}" ;;
+esac
+hdrs=""; out=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-D) hdrs="$2"; shift 2; continue ;;
+		-o) out="$2"; shift 2; continue ;;
+	esac
+	shift
+done
+if [ -n "$hdrs" ] && [ -r "${STUB_CURL_HDR:-/nonexistent}" ]; then cp "$STUB_CURL_HDR" "$hdrs"; fi
+if [ -n "$out" ]; then
+	[ -r "$body" ] && cat "$body" > "$out"
+else
+	[ -r "$body" ] && cat "$body"
+fi
+exit 0
+EOF
+
 cat > "$SB/bin/opkg" <<'EOF'
 #!/bin/sh
-# opkg stub: even if a future case reaches self-update, nothing gets installed
+# opkg stub: even if a future case reaches self-update, nothing gets installed.
+# Calls also mark the tmpxray log so the F18 cases can assert ordering (the
+# proxied self-update must stop the instance BEFORE handing the file to opkg).
 echo "opkg $*" >> "${STUB_OPKG_LOG:-/dev/null}"
+echo "opkg-mark" >> "${STUB_TMPXRAY_LOG:-/dev/null}"
 exit 0
 EOF
 cat > "$SB/bin/netstat" <<'EOF'
@@ -285,53 +444,6 @@ for cfg in "${TMPDIR:-/tmp}"/tmpxray.*/config.json; do
 done
 exit 0
 EOF
-cat > "$SB/bin/curl" <<'EOF'
-#!/bin/sh
-# curl stub for the e2e cases: resolves the exit tag from the tmpxray state
-# file's port map, then answers from $STUB_CURL_DIR/<tag>.204 or <tag>.body:
-#   line 1: curl exit code (0 ok, 28 timeout mid-transfer, 7 connect fail, ...)
-#   line 2: the -w line "http|ttfb_s|total_s|size_download|speed_download"
-#   line 3: optional seconds to sleep first (simulates a slow/frozen exit)
-# An unknown tag gets a resolve failure, like a dead socks port. Every call is
-# logged ($STUB_CURL_LOG) so the scenario can prove a probe_disabled exit is
-# never dialled.
-LOG=${STUB_CURL_LOG:-/dev/null}
-DIR=${STUB_CURL_DIR:-/nonexistent}
-args="$*"
-port=$(printf '%s' "$args" | sed -n 's/.*--socks5-hostname 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p')
-url=$(printf '%s' "$args" | tr ' ' '\n' | grep -E '^https?://' | head -n 1)
-ua=$(printf '%s' "$args" | sed -n 's/.*-A \([^ ]*\).*/\1/p')
-kind=body
-case "$url" in *204*) kind=204 ;; esac
-tag=""
-if [ -n "$port" ] && [ -s "${STUB_TMPXRAY_STATE:-/nonexistent}" ]; then
-	# "ports" content of the tmpxray state: strip the prefix up to the object,
-	# then the outer closing brace, then everything from the ports' own brace
-	ports=$(cat "${STUB_TMPXRAY_STATE}" 2>/dev/null)
-	ports=${ports#*'"ports":{'}
-	ports=${ports%\}}
-	ports=${ports%%\}*}
-	for pair in $(printf '%s' "$ports" | tr ',' '\n'); do
-		if [ "$(printf '%s' "$pair" | cut -d':' -f2)" = "$port" ]; then
-			tag=$(printf '%s' "$pair" | cut -d'"' -f2)
-			break
-		fi
-	done
-fi
-echo "tag=$tag kind=$kind port=$port ua=$ua url=$url" >> "$LOG"
-f="$DIR/$tag.$kind"
-if [ -s "$f" ] && [ -n "$tag" ]; then
-	rc=$(sed -n '1p' "$f")
-	case "$rc" in ''|*[!0-9]*) rc=0 ;; esac
-	sl=$(sed -n '3p' "$f")
-	case "$sl" in ''|*[!0-9]*) sl=0 ;; esac
-	[ "$sl" -gt 0 ] && sleep "$sl"
-	sed -n '2p' "$f"
-	exit "$rc"
-fi
-echo "000|0.000|0.000|0|0"
-exit 6
-EOF
 cat > "$SB/etc/init.d/xray" <<'EOF'
 #!/bin/sh
 # init script stub: records what it was asked to do instead of restarting xray
@@ -340,7 +452,7 @@ exit 0
 EOF
 cp "$SB/etc/init.d/xray" "$SB/etc/init.d/cron"
 chmod 0755 "$SB/bin/xray" "$SB/bin/pgrep" "$SB/bin/uci" "$SB/bin/opkg" \
-	"$SB/bin/netstat" "$SB/bin/curl" \
+	"$SB/bin/netstat" "$SB/bin/ubus" "$SB/bin/curl" \
 	"$SB/etc/init.d/xray" "$SB/etc/init.d/cron" "$SB/sub"
 touch "$SB/lock/xray-monitor"
 
@@ -363,9 +475,38 @@ export STUB_UCI_STATE="$SB/work/uci-state"
 export STUB_CURL_DIR="$SB/curltab"
 export STUB_CURL_LOG="$SB/log/curl.log"
 export STUB_TMPXRAY_STATE="$SB/tmp/xray-monitor/tmpxray.json"
+# F18 fetch-via plumbing: uci answers come from a file, ubus serves the rpcd
+# outbounds surface, curl/tmpxray log their calls, and the failure flags let
+# individual cases take the proxy down.
+export STUB_UCI="$SB/work/uci-show.txt"
+export STUB_UBUS_LOG="$SB/log/ubus.log"
+export STUB_UBUS_OUT="$SB/work/ubus-outbounds.json"
+export STUB_CURL_BODY="$FIX/sub1.json"
+export STUB_CURL_HDR="$SB/work/curl-hdrs.txt"
+export STUB_CURL_IPK="$SB/work/fake-update.ipk"
+export STUB_CURL_SHA256="$SB/work/fake-update.sha256"
+export STUB_CURL_PACKAGES="$SB/work/fake-Packages"
+export STUB_TMPXRAY_LOG="$SB/log/tmpxray.log"
+export STUB_TMPXRAY_FAIL="$SB/flags/tmpxray-fail"
+export STUB_CURL_FAIL_ALL="$SB/flags/curl-fail-all"
+export STUB_CURL_DIRECT_DOWN="$SB/flags/curl-direct-down"
 mkdir -p "$SB/api"
 : > "$STUB_LOG"; : > "$STUB_HOOK_LOG"; : > "$STUB_INITD_LOG"; : > "$STUB_OPKG_LOG"; : > "$STUB_API_OB"; : > "$STUB_API_LOG"
+: > "$STUB_UBUS_LOG"; : > "$STUB_CURL_LOG"; : > "$STUB_TMPXRAY_LOG"
 rm -f "$STUB_BO_FAIL" "$STUB_UCI_STATE"
+# default uci answers = the old hardcoded stub: only backup_keep, no subs
+printf '%s\n' "xray-monitor.sub=xray-monitor" "xray-monitor.sub.backup_keep='3'" > "$STUB_UCI"
+# canned HTTP response headers for the fetch cases (subscription-userinfo must
+# survive the proxy path - store_usage parses it from the -D dump file)
+printf 'HTTP/1.1 200 OK\r\nsubscription-userinfo: upload=0; download=1234; total=5678; expire=0\r\n' > "$STUB_CURL_HDR"
+# a self-update payload the stub curl can serve: a real gzip tar (tar -tzf must
+# accept it) plus its correct .sha256 sidecar
+mkdir -p "$SB/work/fake-pkg"
+echo "scenario fake package payload" > "$SB/work/fake-pkg/data.txt"
+tar -czf "$STUB_CURL_IPK" -C "$SB/work/fake-pkg" . 2>/dev/null
+sha=$(sha256sum "$STUB_CURL_IPK" 2>/dev/null | awk '{ print $1 }')
+printf '%s  luci-app-xray-monitor.ipk\n' "$sha" > "$STUB_CURL_SHA256"
+printf 'Package: luci-app-xray-monitor\nVersion: 9.9.9-1\nFilename: luci-app-xray-monitor.ipk\nSHA256sum: %s\n' "$sha" > "$STUB_CURL_PACKAGES"
 
 CFG="$SB/etc/xray/config.json"
 fails=0
@@ -1196,6 +1337,182 @@ EOF
 	ok_eq "rpcd config_get(no config file): text empty, not an error" "" "$(jget "$out" '@.config')"
 	reset_cfg
 fi
+echo "== fetch/self-update via xray (F18): exit selection order + honest proxy failures"
+# curl / ubus / tmpxray are stubbed (see setup); uci answers, the e2e.json
+# fixture state and the failure flags are (re)seeded per case.
+via_reset() {  # <fetch_via> [fetch_via_exit] — uci, flags, logs, fetch state
+	# these sections run against the stubbed tmpxray boundary (setup above);
+	# the flag stays set until the section cleanup below unsets it again
+	export STUB_TMPXRAY_OVERRIDE=1
+	rm -f "$STUB_TMPXRAY_FAIL" "$STUB_CURL_FAIL_ALL" "$STUB_CURL_DIRECT_DOWN"
+	rm -f "$SB/tmp/xray-monitor/e2e.json" "$SB/state/fetch_path" "$SB/state/update_path"
+	rm -f "$SB/state/usage-proxy.json" "$SB/state/title-proxy.txt" "$SB/state/tagmap-proxy.json"
+	rm -f "$SB/tmp/luci-app-xray-monitor.ipk"
+	# restore the correct checksum sidecar (the mismatch case overwrites it)
+	printf '%s  luci-app-xray-monitor.ipk\n' \
+		"$(sha256sum "$STUB_CURL_IPK" 2>/dev/null | awk '{ print $1 }')" > "$STUB_CURL_SHA256"
+	: > "$STUB_CURL_LOG"; : > "$STUB_TMPXRAY_LOG"; : > "$STUB_UBUS_LOG"
+	printf '%s\n' \
+		"xray-monitor.sub=xray-monitor" \
+		"xray-monitor.sub.backup_keep='3'" \
+		"xray-monitor.sub.user_agent='v2rayNG/1.8.0'" \
+		"xray-monitor.sub.fetch_via='$1'" \
+		"xray-monitor.sub.fetch_via_exit='${2:-auto}'" \
+		"xray-monitor.@subscription[0]=subscription" \
+		"xray-monitor.@subscription[0].prefix='proxy'" \
+		"xray-monitor.@subscription[0].url='https://panel.example/sub/tok'" \
+		"xray-monitor.@subscription[0].enabled='1'" > "$STUB_UCI"
+}
+via_seed_e2e() {  # fresh e2e.json: proxy-de best ok exit, proxy-ru stalled decoy
+	printf '{"ts":%s,"results":{"proxy-fi":{"status":"ok","speed_bps":102400},"proxy-de":{"status":"ok","speed_bps":873813},"proxy-ru":{"status":"stalled","speed_bps":999999}}}' \
+		"$(date +%s)" > "$SB/tmp/xray-monitor/e2e.json"
+}
+via_seed_e2e_stale() {  # same winner, but measured 2 h ago
+	printf '{"ts":%s,"results":{"proxy-de":{"status":"ok","speed_bps":873813}}}' \
+		"$(( $(date +%s) - 7200 ))" > "$SB/tmp/xray-monitor/e2e.json"
+}
+has_line()  { grep -q -- "$2" "$1"; }
+nth_socks() { sed -n "$2p" "$STUB_CURL_LOG" | grep -q "curl\[socks=$3\]"; }
+
+# 1) proxy mode + fresh e2e.json: best ok exit wins, the rpcd fallback is not
+#    consulted, and the proxied curl keeps UA / --max-time / -D header capture
+via_reset proxy
+via_seed_e2e
+out=$(runsub fetch 2>/dev/null); rc=$?
+ok_eq "via(proxy,e2e): rc" 0 "$rc"
+ok_eq "via(proxy,e2e): status" "ok" "$(cat "$SB/state/status" 2>/dev/null)"
+ok_eq "via(proxy,e2e): tmpxray started for the best ok exit, then stopped" \
+	"$(printf 'start proxy-de\nstop')" "$(cat "$STUB_TMPXRAY_LOG")"
+ok_eq "via(proxy,e2e): one fetch, through the socks port" 1 "$(lines "$STUB_CURL_LOG")"
+is "via(proxy,e2e): socks5-hostname with the tmpxray port" "$(has_line "$STUB_CURL_LOG" -- "--socks5-hostname 127.0.0.1:11080" && echo 1 || echo 0)"
+is "via(proxy,e2e): same user agent as the direct path" "$(has_line "$STUB_CURL_LOG" -- "-A v2rayNG/1.8.0" && echo 1 || echo 0)"
+is "via(proxy,e2e): same --max-time bound" "$(has_line "$STUB_CURL_LOG" -- "--max-time 25" && echo 1 || echo 0)"
+is "via(proxy,e2e): response headers still captured (-D)" "$(has_line "$STUB_CURL_LOG" -- "-D " && echo 1 || echo 0)"
+is "via(proxy,e2e): e2e answered, rpcd fallback NOT consulted" "$([ "$(lines "$STUB_UBUS_LOG")" = 0 ] && echo 1 || echo 0)"
+ok_eq "via(proxy,e2e): fetch_path token" "via proxy-de" "$(cat "$SB/state/fetch_path" 2>/dev/null)"
+is "via(proxy,e2e): subscription-userinfo captured through the proxy" "$([ -s "$SB/state/usage-proxy.json" ] && echo 1 || echo 0)"
+
+# 2) stale e2e.json -> rpcd outbounds fallback: FIRST outbound with up=1
+#    (config order), not a later one and not a down one
+via_reset proxy
+via_seed_e2e_stale
+printf '%s\n' '{"outbounds":[{"tag":"proxy-fi","up":0},{"tag":"proxy-ch","up":0},{"tag":"proxy-de","up":1},{"tag":"proxy-ru","up":1}]}' > "$STUB_UBUS_OUT"
+out=$(runsub fetch 2>/dev/null); rc=$?
+ok_eq "via(proxy,stale e2e): rc" 0 "$rc"
+ok_eq "via(proxy,stale e2e): status" "ok" "$(cat "$SB/state/status" 2>/dev/null)"
+ok_eq "via(proxy,stale e2e): first up=1 outbound in config order chosen" \
+	"$(printf 'start proxy-de\nstop')" "$(cat "$STUB_TMPXRAY_LOG")"
+ok_eq "via(proxy,stale e2e): fallback consulted once" 1 "$(lines "$STUB_UBUS_LOG")"
+ok_eq "via(proxy,stale e2e): fetch_path token" "via proxy-de" "$(cat "$SB/state/fetch_path" 2>/dev/null)"
+
+# 3) proxy mode with NOTHING selectable: honest fetch-error, never a silent
+#    direct fallback (no curl call at all)
+via_reset proxy
+printf '%s\n' '{"outbounds":[{"tag":"proxy-fi","up":0},{"tag":"proxy-de","up":0}]}' > "$STUB_UBUS_OUT"
+out=$(runsub fetch 2>&1); rc=$?
+ok_eq "via(no exit): rc" 1 "$rc"
+ok_eq "via(no exit): honest status" "fetch-error" "$(cat "$SB/state/status" 2>/dev/null)"
+is "via(no exit): no fetch over any transport" "$([ "$(lines "$STUB_CURL_LOG")" = 0 ] && echo 1 || echo 0)"
+is "via(no exit): no tmpxray started" "$([ "$(lines "$STUB_TMPXRAY_LOG")" = 0 ] && echo 1 || echo 0)"
+is "via(no exit): reason surfaced on stderr" "$(printf '%s' "$out" | grep -q 'no exit selectable' && echo 1 || echo 0)"
+ok_eq "via(no exit): fetch_path cleared" "" "$(cat "$SB/state/fetch_path" 2>/dev/null)"
+
+# 4) auto mode, direct down: the failed sub is retried through xray with the
+#    same UA / timeout / header capture, and the token says so
+via_reset auto
+via_seed_e2e
+touch "$STUB_CURL_DIRECT_DOWN"
+out=$(runsub fetch 2>/dev/null); rc=$?
+ok_eq "auto(direct down): rc" 0 "$rc"
+ok_eq "auto(direct down): status" "ok" "$(cat "$SB/state/status" 2>/dev/null)"
+ok_eq "auto(direct down): direct attempt, then proxied retry" 2 "$(lines "$STUB_CURL_LOG")"
+is "auto(direct down): first attempt was direct" "$(nth_socks "$STUB_CURL_LOG" 1 0 && echo 1 || echo 0)"
+is "auto(direct down): retry went through the socks port" "$(nth_socks "$STUB_CURL_LOG" 2 1 && echo 1 || echo 0)"
+is "auto(direct down): proxied retry keeps the user agent" "$(sed -n 2p "$STUB_CURL_LOG" | grep -q -- "-A v2rayNG/1.8.0" && echo 1 || echo 0)"
+ok_eq "auto(direct down): fetch_path token" "direct, retried via proxy-de" "$(cat "$SB/state/fetch_path" 2>/dev/null)"
+is "auto(direct down): usage header captured on the retry" "$([ -s "$SB/state/usage-proxy.json" ] && echo 1 || echo 0)"
+
+# 5) auto mode, direct fine: no exit is even selected, tmpxray never starts
+via_reset auto
+out=$(runsub fetch 2>/dev/null); rc=$?
+ok_eq "auto(direct up): status" "ok" "$(cat "$SB/state/status" 2>/dev/null)"
+ok_eq "auto(direct up): one direct fetch" 1 "$(lines "$STUB_CURL_LOG")"
+is "auto(direct up): fetch was direct" "$(nth_socks "$STUB_CURL_LOG" 1 0 && echo 1 || echo 0)"
+is "auto(direct up): tmpxray never started" "$([ "$(lines "$STUB_TMPXRAY_LOG")" = 0 ] && echo 1 || echo 0)"
+is "auto(direct up): exit never selected (no ubus, no e2e consult)" "$([ "$(lines "$STUB_UBUS_LOG")" = 0 ] && echo 1 || echo 0)"
+ok_eq "auto(direct up): fetch_path token" "direct" "$(cat "$SB/state/fetch_path" 2>/dev/null)"
+
+# 6) proxy mode, tmpxray itself cannot start: honest failure, no direct leak
+via_reset proxy proxy-fi
+touch "$STUB_TMPXRAY_FAIL"
+out=$(runsub fetch 2>&1); rc=$?
+ok_eq "via(tmpxray fail): rc" 1 "$rc"
+ok_eq "via(tmpxray fail): honest status" "fetch-error" "$(cat "$SB/state/status" 2>/dev/null)"
+is "via(tmpxray fail): no fetch attempted" "$([ "$(lines "$STUB_CURL_LOG")" = 0 ] && echo 1 || echo 0)"
+is "via(tmpxray fail): concrete tag skips selection (no ubus call)" "$([ "$(lines "$STUB_UBUS_LOG")" = 0 ] && echo 1 || echo 0)"
+is "via(tmpxray fail): tmpxray failure surfaced" "$(printf '%s' "$out" | grep -q 'proxy path unavailable' && printf '%s' "$out" | grep -q 'tmpxray' && echo 1 || echo 0)"
+ok_eq "via(tmpxray fail): fetch_path cleared" "" "$(cat "$SB/state/fetch_path" 2>/dev/null)"
+
+# 7) self-update via proxy: BOTH downloads proxied, SHA256 gate intact, opkg
+#    stays local, and the instance is stopped BEFORE opkg runs
+via_reset proxy
+echo "xray-monitor.sub.fetch_via_update='proxy'" >> "$STUB_UCI"
+via_seed_e2e
+o0=$(lines "$STUB_OPKG_LOG")
+out=$(runsub self-update 2>/dev/null); rc=$?
+ok_eq "upd(via): stdout" "updated" "$out"
+ok_eq "upd(via): rc" 0 "$rc"
+ok_eq "upd(via): opkg ran once, locally" "$((o0 + 1))" "$(lines "$STUB_OPKG_LOG")"
+is "upd(via): opkg install of the verified file" "$(grep -q -- "install --force-reinstall" "$STUB_OPKG_LOG" && echo 1 || echo 0)"
+ok_eq "upd(via): .ipk and .sha256 both fetched through the proxy" 2 "$(grep -c 'socks=1' "$STUB_CURL_LOG")"
+is "upd(via): no direct download leaked" "$(grep -q 'socks=0' "$STUB_CURL_LOG" && echo 0 || echo 1)"
+ok_eq "upd(via): update_path token" "via proxy-de" "$(cat "$SB/state/update_path" 2>/dev/null)"
+stopline=$(grep -n '^stop$' "$STUB_TMPXRAY_LOG" | tail -n1 | cut -d: -f1)
+opkgline=$(grep -n '^opkg-mark$' "$STUB_TMPXRAY_LOG" | tail -n1 | cut -d: -f1)
+is "upd(via): proxy instance stopped BEFORE opkg install" \
+	"$([ -n "$stopline" ] && [ -n "$opkgline" ] && [ "$opkgline" -gt "$stopline" ] && echo 1 || echo 0)"
+is "upd(via): downloaded file cleaned up" "$([ ! -e "$SB/tmp/luci-app-xray-monitor.ipk" ] && echo 1 || echo 0)"
+
+# 8) self-update via proxy, checksum mismatch: refuse, never hand it to opkg
+via_reset proxy
+echo "xray-monitor.sub.fetch_via_update='proxy'" >> "$STUB_UCI"
+via_seed_e2e
+printf '%s  luci-app-xray-monitor.ipk\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$STUB_CURL_SHA256"
+o0=$(lines "$STUB_OPKG_LOG")
+out=$(runsub self-update 2>/dev/null); rc=$?
+ok_eq "upd(sha bad): rc" 1 "$rc"
+is "upd(sha bad): refuses with the mismatch reason" "$(printf '%s' "$out" | grep -q '^SHA256 mismatch' && echo 1 || echo 0)"
+ok_eq "upd(sha bad): opkg never called" "$o0" "$(lines "$STUB_OPKG_LOG")"
+is "upd(sha bad): refused download removed" "$([ ! -e "$SB/tmp/luci-app-xray-monitor.ipk" ] && echo 1 || echo 0)"
+is "upd(sha bad): proxy instance still stopped (trap)" "$(grep -q '^stop$' "$STUB_TMPXRAY_LOG" && echo 1 || echo 0)"
+
+# 9) self-update default (no fetch_via_update): exactly today's direct flow
+via_reset direct
+o0=$(lines "$STUB_OPKG_LOG")
+out=$(runsub self-update 2>/dev/null); rc=$?
+ok_eq "upd(default): stdout" "updated" "$out"
+ok_eq "upd(default): rc" 0 "$rc"
+ok_eq "upd(default): .ipk + .sha256 fetched directly" 2 "$(grep -c 'socks=0' "$STUB_CURL_LOG")"
+is "upd(default): no proxy instance started" "$(grep -q '^start ' "$STUB_TMPXRAY_LOG" && echo 0 || echo 1)"
+ok_eq "upd(default): update_path token" "direct" "$(cat "$SB/state/update_path" 2>/dev/null)"
+
+# 10) self-update auto with direct down: retried through xray, token says so
+via_reset direct
+echo "xray-monitor.sub.fetch_via_update='auto'" >> "$STUB_UCI"
+via_seed_e2e
+touch "$STUB_CURL_DIRECT_DOWN"
+out=$(runsub self-update 2>/dev/null); rc=$?
+ok_eq "upd(auto retry): stdout" "updated" "$out"
+ok_eq "upd(auto retry): rc" 0 "$rc"
+ok_eq "upd(auto retry): direct attempts first, then proxied" "2 2" "$(grep -c 'socks=0' "$STUB_CURL_LOG") $(grep -c 'socks=1' "$STUB_CURL_LOG")"
+ok_eq "upd(auto retry): update_path token" "direct, retried via proxy-de" "$(cat "$SB/state/update_path" 2>/dev/null)"
+is "upd(auto retry): proxy instance stopped after the downloads" "$(grep -q '^stop$' "$STUB_TMPXRAY_LOG" && echo 1 || echo 0)"
+
+# restore the default uci answers so any later section sees the base state,
+# and drop the tmpxray-boundary override flag again
+printf '%s\n' "xray-monitor.sub=xray-monitor" "xray-monitor.sub.backup_keep='3'" > "$STUB_UCI"
+rm -f "$STUB_TMPXRAY_FAIL" "$STUB_CURL_FAIL_ALL" "$STUB_CURL_DIRECT_DOWN"
+unset STUB_TMPXRAY_OVERRIDE
 
 echo
 if [ "$fails" -eq 0 ]; then

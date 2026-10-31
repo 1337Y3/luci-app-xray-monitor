@@ -37,6 +37,12 @@ let diff = load(diff_path, { added: [], removed: [], changed: [], total: 0 });
 // How the LAST apply hit the running xray (written by xray-sub's do_apply):
 // {"mode":"live"|"restart","reason":"",...,"fallback":0|1,"removed":N,"added":N,"ts":N}
 let last_apply = state_dir ? load(state_dir + '/last-apply.json', null) : null;
+// Which transport the last fetch / self-update actually used (F18): the exact
+// tokens xray-sub writes are "direct", "via <tag>" and "direct, retried via
+// <tag>"; an empty file / missing file = no fetch moved any bytes yet.
+function readtok(p) { let s = p ? readfile(p) : null; return s ? trim(s) : ''; }
+let fetch_path = state_dir ? readtok(state_dir + '/fetch_path') : '';
+let update_path = state_dir ? readtok(state_dir + '/update_path') : '';
 let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
 let servers = [], obs = cfg.outbounds ?? [];
 for (let i = 0; i < length(obs); i++) {
@@ -60,6 +66,8 @@ printf('%J\n', {
 	user_agent: g('user_agent') ?? '',
 	last_fetch: int(lf) ?? 0,
 	status: (st && length(st)) ? st : 'never',
+	fetch_path: fetch_path,
+	update_path: update_path,
 	pending: (pending == '1') ? true : false,
 	diff: diff,
 	last_apply: last_apply,

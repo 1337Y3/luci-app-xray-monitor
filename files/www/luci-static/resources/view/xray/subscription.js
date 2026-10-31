@@ -21,6 +21,7 @@ var SCHEDS = [
 var root = null;
 var state = { subscriptions: [], cron: true, cron_schedule: '0 * * * *', auto_apply: false,
               hot_swap: true, last_fetch: 0, status: 'never', pending: false, last_apply: null,
+              fetch_path: '', update_path: '',
               diff: { added: [], removed: [], changed: [], total: 0 }, servers: [] };
 
 function fmtAgo(e) {
@@ -110,6 +111,12 @@ function applyBadge(la) {
 		txt = _('applied with restart');
 	}
 	return E('span', { 'style': 'background:' + col + ';color:#fff;padding:2px 8px;border-radius:3px;' }, txt);
+}
+
+function pathBadge(p) {  // transport token from xray-sub: direct | via <tag> | direct, retried via <tag>
+	if (!p) return E('span', { 'style': 'color:#888' }, '—');
+	var proxied = p.indexOf('via') !== -1;
+	return E('span', { 'style': 'font-family:monospace;background:' + (proxied ? '#4a6a9c' : '#5a5a5a') + ';color:#fff;padding:2px 8px;border-radius:3px;' }, p);
 }
 function busy(btn, p) { btn.disabled = true; return p.then(function(v) { btn.disabled = false; return v; }, function(e) { btn.disabled = false; throw e; }); }
 function refresh() { return callGet().then(function(r) { if (r && typeof r == 'object') state = r; redraw(); }); }
@@ -258,6 +265,8 @@ function redraw() {
 	if (laBadge)
 		statusRows.push(row(_('Last apply'), E('span', {}, [ document.createTextNode(fmtAgo(state.last_apply.ts) + '  '), laBadge ])));
 	statusRows.push(row(_('Pending'), state.pending ? E('span', { 'style': 'color:#cc7a00;font-weight:bold;' }, _('changes staged — not yet applied')) : E('span', { 'style': 'color:#46a546;' }, _('config up to date'))));
+	statusRows.push(row(_('Fetch path'), pathBadge(state.fetch_path)));
+	statusRows.push(row(_('Self-update path'), pathBadge(state.update_path)));
 	statusRows.push(row(_('Auto-apply'), state.auto_apply ? E('span', { 'style': 'color:#cc7a00;' }, _('ON')) : E('span', { 'style': 'color:#888;' }, _('off'))));
 	if (state.last_apply && state.last_apply.fallback)
 		statusRows.push(row(_('Hot-swap'), E('span', { 'style': 'color:#cc3300;' }, _('live apply failed and was rolled back — xray runs the previous config'))));
