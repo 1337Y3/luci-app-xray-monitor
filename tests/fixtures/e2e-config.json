@@ -1,0 +1,46 @@
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [
+    {
+      "tag": "tproxy-in", "protocol": "dokodemo-door", "listen": "0.0.0.0", "port": 12345,
+      "settings": { "network": "tcp,udp", "followRedirect": true },
+      "sniffing": { "enabled": true, "destOverride": [ "http", "tls" ] },
+      "streamSettings": { "sockopt": { "tproxy": "tproxy" } }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "e2e-ok", "protocol": "vless",
+      "settings": { "vnext": [ { "address": "ok1.example.org", "port": 443,
+        "users": [ { "id": "00000000-0000-0000-0000-000000000001", "encryption": "none" } ] } ] },
+      "streamSettings": { "network": "tcp", "security": "reality",
+        "realitySettings": { "serverName": "ok.example.org", "fingerprint": "chrome",
+          "publicKey": "pbVjhWqqvXcvKZW2jH3mBa9BHuK5iOLXeiCBBB9XKA0", "shortId": "0001", "spiderX": "/" } }
+    },
+    {
+      "tag": "e2e-stall", "protocol": "vless",
+      "settings": { "vnext": [ { "address": "stall1.example.org", "port": 443,
+        "users": [ { "id": "00000000-0000-0000-0000-000000000002", "encryption": "none" } ] } ] },
+      "streamSettings": { "network": "tcp", "security": "reality",
+        "realitySettings": { "serverName": "stall.example.org", "fingerprint": "chrome",
+          "publicKey": "pbVjhWqqvXcvKZW2jH3mBa9BHuK5iOLXeiCBBB9XKA0", "shortId": "0002", "spiderX": "/" } }
+    },
+    {
+      "tag": "e2e-fail", "protocol": "vless",
+      "settings": { "vnext": [ { "address": "fail1.example.org", "port": 443,
+        "users": [ { "id": "00000000-0000-0000-0000-000000000003", "encryption": "none" } ] } ] },
+      "streamSettings": { "network": "tcp", "security": "reality",
+        "realitySettings": { "serverName": "fail.example.org", "fingerprint": "chrome",
+          "publicKey": "pbVjhWqqvXcvKZW2jH3mBa9BHuK5iOLXeiCBBB9XKA0", "shortId": "0003", "spiderX": "/" } }
+    },
+    {
+      "tag": "e2e-skip", "protocol": "vless",
+      "settings": { "vnext": [ { "address": "skip1.example.org", "port": 443,
+        "users": [ { "id": "00000000-0000-0000-0000-000000000004", "encryption": "none" } ] } ] },
+      "streamSettings": { "network": "tcp", "security": "reality",
+        "realitySettings": { "serverName": "skip.example.org", "fingerprint": "chrome",
+          "publicKey": "pbVjhWqqvXcvKZW2jH3mBa9BHuK5iOLXeiCBBB9XKA0", "shortId": "0004", "spiderX": "/" } }
+    },
+    { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIP" } }
+  ]
+}

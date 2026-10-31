@@ -14,14 +14,18 @@ var callEnableApi = rpc.declare({ object: 'xray-monitor', method: 'enable_api' }
 var callValidate  = rpc.declare({ object: 'xray-monitor', method: 'validate' });
 var callUpdChk    = rpc.declare({ object: 'xray-monitor', method: 'update_check' });
 var callUpdApply  = rpc.declare({ object: 'xray-monitor', method: 'update_apply' });
+var callE2eStatus = rpc.declare({ object: 'xray-monitor', method: 'e2e_status' });
+var callE2eStart  = rpc.declare({ object: 'xray-monitor', method: 'e2e_start' });
 
 var prev = null;  /* { ts, flat } for rate calculation */
 var root = null;  /* container element to redraw into */
+var e2eBtnEl = null;  /* "Run E2E check" button (kept across redraws) */
 var state = {
 	status: {},
 	parsed: { data: { inbound: {}, outbound: {} }, flat: {} },
 	rates: {},      /* "kind/name/dir" -> bytes/s */
 	health: {},     /* tag -> { up, ms, active } */
+	e2e: { running: false, ts: 0, results: {} },  /* last end-to-end check */
 	apiOk: null     /* derived from whether stats returned data */
 };
 
@@ -83,6 +87,35 @@ function statusCell(tag) {
 	return E('span', {}, els);
 }
 
+/* Last end-to-end verdict per exit: did real traffic FLOW through it? A TCP
+   ping can say "reachable" while DPI freezes the stream after the first few
+   KB — that shows up here as "stalled" (bytes arrived, body never finished). */
+function e2eCell(tag) {
+	var r = (state.e2e && state.e2e.results) ? state.e2e.results[tag] : null;
+	var running = !!(state.e2e && state.e2e.running);
+	if (!r) return E('span', { 'style': 'color:#888' }, running ? '…' : '–');
+	var map = {
+		ok:      { color: '#46a546', label: _('ok') },
+		stalled: { color: '#dd8500', label: _('stalled') },
+		fail:    { color: '#cc3300', label: _('fail') },
+		skipped: { color: '#888',    label: _('skipped') }
+	};
+	var m = map[r.status] || { color: '#888', label: r.status || '–' };
+	var title = _('E2E check: TTFB ') + (r.ttfb_ms || 0) + ' ms · ' +
+	            (r.bytes || 0) + ' B · ' + fmtBytes(r.speed_bps || 0) + '/s' +
+	            (state.e2e.ts ? ' · ' + new Date(state.e2e.ts * 1000).toLocaleString() : '');
+	var els = [
+		E('span', { 'style': 'color:' + m.color + ';font-weight:bold;' }, '● '),
+		E('span', {}, m.label)
+	];
+	var det = '';
+	if (r.status === 'ok')            det = fmtBytes(r.speed_bps || 0) + '/s';
+	else if (r.status === 'stalled')  det = _('froze at ') + fmtBytes(r.bytes || 0);
+	if (det)
+		els.push(E('span', { 'style': 'margin-left:6px;font-size:85%;color:#666;' }, det));
+	return E('span', { 'title': title }, els);
+}
+
 /* Per-outbound toggle for the active TCP probe. Off = the endpoint is never
    dialled (use for a "blown" exit whose handshake draws an ISP reset). */
 function pingToggle(tag) {
@@ -129,13 +162,14 @@ function buildTable(title, kind, withStatus) {
 	];
 	if (withStatus) {
 		head.push(E('th', { 'class': 'th' }, _('Status')));
+		head.push(E('th', { 'class': 'th' }, _('E2E')));
 		head.push(E('th', { 'class': 'th' }, _('Ping check')));
 	}
 	var rows = [ E('tr', { 'class': 'tr table-titles' }, head) ];
 
 	if (!names.length)
 		rows.push(E('tr', { 'class': 'tr' }, [
-			E('td', { 'class': 'td', 'colspan': withStatus ? 7 : 5 }, E('em', {}, _('No data')))
+			E('td', { 'class': 'td', 'colspan': withStatus ? 8 : 5 }, E('em', {}, _('No data')))
 		]));
 
 	names.forEach(function(name) {
@@ -149,6 +183,7 @@ function buildTable(title, kind, withStatus) {
 		];
 		if (withStatus) {
 			cells.push(E('td', { 'class': 'td' }, statusCell(name)));
+			cells.push(E('td', { 'class': 'td' }, e2eCell(name)));
 			cells.push(E('td', { 'class': 'td' }, pingToggle(name)));
 		}
 		rows.push(E('tr', { 'class': 'tr' }, cells));
@@ -267,7 +302,10 @@ function redraw() {
 		E('div', { 'style': 'margin-top:1em;color:#888;font-size:90%;' },
 			_('Traffic auto-refreshes every 5s; connectivity every 30s while “Auto-refresh ping” is on. ' +
 			  'Counters are cumulative since the last xray restart. ' +
-			  'Turn off an exit\'s Ping check to stop dialling it — useful for a blown server whose handshake draws an ISP reset.'))
+			  'Turn off an exit\'s Ping check to stop dialling it — useful for a blown server whose handshake draws an ISP reset. ' +
+			  'The E2E column shows the last end-to-end check: ok = a real body was pulled through the exit, ' +
+			  'stalled = data flowed but the body froze part-way (DPI throttling), fail = no usable connection. ' +
+			  'Use “Run E2E check” to re-measure — it pulls ~1 MB per exit and takes tens of seconds.'))
 	];
 	while (root.firstChild) root.removeChild(root.firstChild);
 	content.forEach(function(n) { if (n) root.appendChild(n); });
@@ -315,6 +353,33 @@ function refreshMeta() {
 	});
 }
 
+/* End-to-end exit check state (e2e_status = e2e.json + running flag). Cheap
+   (one small file read), so it rides the 5 s stats poll; while a check runs,
+   a faster 3 s poll fills in the per-exit verdicts as they finish. */
+function refreshE2e() {
+	return callE2eStatus().then(function(r) {
+		state.e2e = r || { running: false, ts: 0, results: {} };
+		if (state.e2e.running) startE2ePoll();
+		else                   stopE2ePoll();
+		if (e2eBtnEl) {
+			e2eBtnEl.disabled = !!state.e2e.running;
+			e2eBtnEl.firstChild.nodeValue = state.e2e.running ? _('E2E check running…') : _('Run E2E check');
+		}
+		redraw();
+	}, function() {});
+}
+var e2ePolling = false;
+function startE2ePoll() {
+	if (e2ePolling) return;
+	poll.add(refreshE2e, 3);
+	e2ePolling = true;
+}
+function stopE2ePoll() {
+	if (!e2ePolling) return;
+	poll.remove(refreshE2e);
+	e2ePolling = false;
+}
+
 /* Auto-refresh of the active connectivity probe (per-browser, like the confdir
    dismissal). Off = the page never probes on its own — handy while a suspect
    "blown" exit is under investigation; one-shot checks stay available. */
@@ -336,8 +401,9 @@ function stopHealthPoll() {
 
 return view.extend({
 	load: function() {
-		// refreshMeta is probe-free, so toggles + disabled state are ready on first paint
-		return Promise.all([ refreshStats(), refreshMeta() ]).catch(function() {});
+		// refreshMeta is probe-free, so toggles + disabled state are ready on first paint;
+		// refreshE2e just reads the results file (no traffic, no probe)
+		return Promise.all([ refreshStats(), refreshMeta(), refreshE2e() ]).catch(function() {});
 	},
 
 	render: function() {
@@ -401,6 +467,27 @@ return view.extend({
 			                     function() { pingNowBtn.disabled = false; });
 		});
 
+		/* Kick the end-to-end check (detached server-side) and follow its
+		   progress: e2e.json fills in verdict by verdict while it runs. */
+		var e2eBtn = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Run E2E check'));
+		e2eBtnEl = e2eBtn;
+		e2eBtn.disabled = !!(state.e2e && state.e2e.running);
+		e2eBtn.addEventListener('click', function() {
+			e2eBtn.disabled = true;
+			callE2eStart().then(function(res) {
+				if (!res || !res.ok) {
+					e2eBtn.disabled = false;
+					ui.addNotification(null, E('p', _('Could not start the E2E check: ') + ((res && res.msg) || _('unknown error'))), 'error');
+					return;
+				}
+				startE2ePoll();
+				return refreshE2e();
+			}, function() {
+				e2eBtn.disabled = false;
+				ui.addNotification(null, E('p', _('E2E check call failed.')), 'error');
+			});
+		});
+
 		var autoCb = E('input', { 'type': 'checkbox' });
 		autoCb.checked = pingAutoEnabled();
 		autoCb.addEventListener('change', function() {
@@ -414,7 +501,7 @@ return view.extend({
 		}, [ autoCb, E('span', {}, _('Auto-refresh ping (30s)')) ]);
 
 		var bar = E('div', { 'style': 'margin:.5em 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center;' },
-			[ updBtn, validateBtn, resetBtn, pingNowBtn, autoToggle ]);
+			[ updBtn, validateBtn, resetBtn, pingNowBtn, e2eBtn, autoToggle ]);
 		return E('div', {}, [ E('h2', {}, _('Xray Monitor')), bar, root ]);
 	},
 
