@@ -62,6 +62,9 @@ cp -a "$SHARESRC" "$SB/share/xray-monitor"
 # (write pipeline, both locks, tmpxray state, cron-sync, self-update's
 # download). post_restart_hooks gets a logging body so the scenario can
 # observe it; everything else is byte-identical to the installed script.
+# The second xray-sub rule rewrites the ESCAPED form inside cron-sync's two
+# sed-delete patterns ("." swallows the backslash): the appended cron lines
+# carry the sandbox path, so the deletions must match that form too.
 sed \
 	-e "s|^SHARE=.*|SHARE=$SB/share/xray-monitor|" \
 	-e "s|^STATE=.*|STATE=$SB/state|" \
@@ -74,6 +77,7 @@ sed \
 	-e "s|/etc/init\.d/cron|$SB/etc/init.d/cron|g" \
 	-e "s|/etc/crontabs|$SB/etc/crontabs|g" \
 	-e "s|/usr/share/xray-monitor/xray-sub|$SB/sub|g" \
+	-e "s|xray-monitor./xray-sub|sub|g" \
 	-e "s|/tmp/luci-app-xray-monitor\.ipk|$SB/tmp/luci-app-xray-monitor.ipk|g" \
 	-e 's|post_restart_hooks() { return 0; }|post_restart_hooks() { echo hook >> "${STUB_HOOK_LOG:-/dev/null}"; return 0; }|' \
 	"$SHARESRC/xray-sub" > "$SB/sub"
@@ -638,8 +642,12 @@ ok_eq "e2e: failed exit (connect error)" "fail" "$(e2efield e2e-fail 2)"
 ok_eq "e2e: probe-disabled exit" "skipped" "$(e2efield e2e-skip 2)"
 ok_eq "e2e: summary counts" "# ok=1 stalled=1 fail=1 skipped=1" \
 	"$(printf '%s\n' "$e2eout" | grep '^# ')"
+# e2e.json is one line: count OCCURRENCES (grep -c would cap every status at 1)
+e2ecount() {  # <status>
+	awk -v s="\"status\": \"$1\"" '{ n += gsub(s, "") } END { print n + 0 }' "$E2EJ" 2>/dev/null
+}
 ok_eq "e2e: e2e.json matches the summary (contract B3)" "1:1:1:1" \
-	"$(grep -c '"status": "stalled"' "$E2EJ" 2>/dev/null):$(grep -c '"status": "ok"' "$E2EJ" 2>/dev/null):$(grep -c '"status": "fail"' "$E2EJ" 2>/dev/null):$(grep -c '"status": "skipped"' "$E2EJ" 2>/dev/null)"
+	"$(e2ecount stalled):$(e2ecount ok):$(e2ecount fail):$(e2ecount skipped)"
 ok_eq "e2e: exactly the checked exits dialled (3 exits x 2 URLs)" 6 "$(lines "$STUB_CURL_LOG")"
 ok_eq "e2e: every fetch used the subscription user agent" 6 \
 	"$(grep -c 'ua=v2rayNG/1.8.0 ' "$STUB_CURL_LOG")"
@@ -667,8 +675,7 @@ else
 	out=$(runsub e2e 2>/dev/null); rc=$?
 	wait "$tholder"
 	ok_eq "e2e(busy tmpxray): rc" 1 "$rc"
-	ok_eq "e2e(busy tmpxray): every checked exit recorded as fail" 3 \
-		"$(grep -c '"status": "fail"' "$E2EJ" 2>/dev/null)"
+	ok_eq "e2e(busy tmpxray): every checked exit recorded as fail" 3 "$(e2ecount fail)"
 	is "e2e(busy tmpxray): no connection attempted" "$([ "$(lines "$STUB_CURL_LOG")" = 0 ] && echo 1 || echo 0)"
 	is "e2e(busy tmpxray): run marker removed" "$([ ! -e "$E2ERUN" ] && echo 1 || echo 0)"
 fi
