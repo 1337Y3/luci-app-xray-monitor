@@ -1,0 +1,1 @@
+{ "remove": [ "proxy-fi", "proxy-ch/vps" ], "add": [ "proxy-fi", "proxy-de" ], "changed": [ "proxy-fi" ], "first_old": "proxy-fi", "first_new": "proxy-fi", "restart_required": "tag-charset", "hot_swap": false }
