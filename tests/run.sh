@@ -1,6 +1,7 @@
 #!/bin/sh
 # Golden-output tests for the ucode helpers: parse / snapshot / diff / apply /
-# routing / balancers (status.uc imports uci and is deliberately not covered).
+# routing / balancers / balance (status.uc imports uci and is deliberately not
+# covered).
 # Runs wherever a POSIX sh and ucode exist - the CI job (ucode built from
 # source) or a router directly (BusyBox ash):
 #   sh tests/run.sh                    compare against tests/expected/
@@ -130,6 +131,28 @@ check "balancers get" "$EXP/balancers-get.json" "$W/balancers-get.json"
 "$SHARE/balancers.uc" set "$FIX/config.json" "$FIX/balancers-desired.json" "$W/balancers-set.json" proxy work >/dev/null
 check "balancers set keeps // blocks + observatory union" "$EXP/balancers-set.json" "$W/balancers-set.json"
 xraytest "balancers set output" "$W/balancers-set.json"
+echo "== balance (F15: live balancer state, sticky overrides, divergence)"
+"$SHARE/balance-cli.uc" live "$FIX/config-bal.json" "$FIX/bi" "$FIX/overrides-bal.json" 1700000000 > "$W/bal-live.json" \
+	|| { echo "FAIL   balance live exited non-zero"; fails=$((fails + 1)); }
+check "balance live: leastPing pick, failed bi call, missing pin, stale" "$EXP/bal-live.json" "$W/bal-live.json"
+"$SHARE/balance-cli.uc" live "$FIX/config.json" "$FIX/bi" "$FIX/overrides-bal2.json" 1700000000 > "$W/bal-live2.json" \
+	|| { echo "FAIL   balance live (legacy cfg) exited non-zero"; fails=$((fails + 1)); }
+check "balance live: running override wins the pick, drift + stale" "$EXP/bal-live2.json" "$W/bal-live2.json"
+"$SHARE/balance-cli.uc" applicable "$FIX/config-bal.json" "$FIX/overrides-bal.json" > "$W/bal-applicable.out"
+check "balance applicable: stale section dropped" "$EXP/bal-applicable.out" "$W/bal-applicable.out"
+v=$("$SHARE/balance-cli.uc" validate "$FIX/config-bal.json" fast proxy-ch 2>/dev/null)
+if [ "$v" = '{"ok":1}' ]; then echo "PASS   balance validate: member pair accepted"; else echo "FAIL   balance validate: member pair accepted"; fails=$((fails + 1)); fi
+v=$("$SHARE/balance-cli.uc" validate "$FIX/config-bal.json" fast "" 2>/dev/null)
+if [ "$v" = '{"ok":1}' ]; then echo "PASS   balance validate: empty outbound (clear) accepted"; else echo "FAIL   balance validate: empty outbound (clear) accepted"; fails=$((fails + 1)); fi
+v=$("$SHARE/balance-cli.uc" validate "$FIX/config-bal.json" no-such-bl proxy-ch 2>/dev/null)
+if [ "$v" = '{"ok":0,"msg":"no such balancer in the config"}' ]; then echo "PASS   balance validate: unknown balancer rejected"; else echo "FAIL   balance validate: unknown balancer rejected"; fails=$((fails + 1)); fi
+v=$("$SHARE/balance-cli.uc" validate "$FIX/config-bal.json" fast no-such-ob 2>/dev/null)
+if [ "$v" = '{"ok":0,"msg":"no such outbound in the config"}' ]; then echo "PASS   balance validate: unknown outbound rejected"; else echo "FAIL   balance validate: unknown outbound rejected"; fails=$((fails + 1)); fi
+v=$("$SHARE/balance-cli.uc" validate "$FIX/config-bal.json" "bad tag!" proxy-ch 2>/dev/null)
+if [ "$v" = '{"ok":0,"msg":"invalid balancer tag"}' ]; then echo "PASS   balance validate: bad balancer charset rejected"; else echo "FAIL   balance validate: bad balancer charset rejected"; fails=$((fails + 1)); fi
+v=$("$SHARE/balance-cli.uc" validate "$FIX/config-bal.json" fast "also bad" 2>/dev/null)
+if [ "$v" = '{"ok":0,"msg":"invalid outbound tag"}' ]; then echo "PASS   balance validate: bad outbound charset rejected"; else echo "FAIL   balance validate: bad outbound charset rejected"; fails=$((fails + 1)); fi
+
 
 echo "== enable-api (F0: StatsService + HandlerService + RoutingService)"
 "$SHARE/enable-api.uc" "$FIX/config.json" "$W/eapi.json" 10085 proxy > "$W/eapi-changed.out" 2>/dev/null

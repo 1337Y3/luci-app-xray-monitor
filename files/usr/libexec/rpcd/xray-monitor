@@ -325,6 +325,117 @@ do_reset() {
 SHARE=/usr/share/xray-monitor
 SUB=$SHARE/xray-sub
 
+# --- Balancers: live state + sticky overrides (F15) ---------------------------
+# `xray api bi/bo` talk to the RoutingService on the api inbound (loopback
+# only; enable-api.uc ships it). Every call carries xray's own -t flag, so a
+# down API fails after ~2 s instead of hanging the ubus call. bi is read-only;
+# bo mutates the RUNNING instance only - config.json is never touched here,
+# overrides persist in UCI (xray-sub overrides-*) and survive restarts via
+# post_restart_hooks.
+
+# Live snapshot for the Balancers tab: one `bi` call per configured balancer
+# (in parallel, so wall time stays one call even for several balancers) plus
+# the persisted overrides, merged by balance-cli.uc into the shape the UI
+# renders (pick / running pin / saved pin / divergence per balancer).
+get_balancers_live() {
+	local cfg tmp t ts out
+	cfg=$(config_file)
+	if ! command -v ucode >/dev/null 2>&1 || [ ! -s "$cfg" ]; then
+		printf '{"api":false,"balancers":[],"stale":[],"ts":0}'
+		return
+	fi
+	tmp=$(mktemp -d) || { printf '{"api":false,"balancers":[],"stale":[],"ts":0}'; return; }
+	for t in $(jsonfilter -i "$cfg" -e '@.routing.balancers[*].tag' 2>/dev/null); do
+		# the tag becomes a filename below: strict charset, never "." / ".."
+		case "$t" in ''|.|..|*[!A-Za-z0-9._-]*) continue ;; esac
+		(
+			out=$("$XRAY" api bi --server="$API_SERVER" -t 2 -json "$t" 2>/dev/null)
+			if [ $? -eq 0 ] && [ -n "$out" ]; then printf '%s' "$out" > "$tmp/$t.bi"
+			else printf '{"error":true}' > "$tmp/$t.bi"; fi
+		) &
+	done
+	wait
+	"$SUB" overrides-list > "$tmp/overrides.json" 2>/dev/null || printf '[]' > "$tmp/overrides.json"
+	ts=$(date +%s)
+	"$SHARE/balance-cli.uc" live "$cfg" "$tmp" "$tmp/overrides.json" "$ts" \
+		|| printf '{"api":false,"balancers":[],"stale":[],"ts":%s}' "$ts"
+	rm -rf "$tmp"
+}
+
+# Upsert the UCI side of an override: exactly one balancer_override section per
+# balancer (set the outbound on the existing one, drop accidental duplicates,
+# else add a section).
+override_upsert_uci() {  # <balancer> <outbound>
+	local id keep="" b
+	for id in $(uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=balancer_override$/\1/p'); do
+		b=$(uci -q get "xray-monitor.$id.balancer")
+		[ "$b" = "$1" ] || continue
+		if [ -z "$keep" ]; then
+			uci set "xray-monitor.$id.outbound"="$2"; keep="$id"
+		else
+			uci -q delete "xray-monitor.$id"
+		fi
+	done
+	if [ -z "$keep" ]; then
+		keep=$(uci add xray-monitor balancer_override)
+		uci set "xray-monitor.$keep.balancer"="$1"
+		uci set "xray-monitor.$keep.outbound"="$2"
+	fi
+}
+
+# Pin one balancer to one outbound: validate (charset AND membership in the
+# current config - bo would accept a nonexistent tag and the balancer would
+# route into the void), apply LIVE via bo, then persist. bo first: a failure
+# (api down, balancer just vanished) must not leave a UCI section the running
+# xray does not honor.
+do_override_set() {
+	local input bal ob v ok msg rc
+	input=$(cat)
+	bal=$(echo "$input" | jsonfilter -e '@.balancer' 2>/dev/null)
+	ob=$(echo "$input"  | jsonfilter -e '@.outbound' 2>/dev/null)
+	if [ -z "$bal" ] || [ -z "$ob" ]; then
+		json_init; json_add_boolean ok 0; json_add_string msg "missing balancer or outbound"; json_dump; return
+	fi
+	v=$("$SHARE/balance-cli.uc" validate "$(config_file)" "$bal" "$ob" 2>/dev/null)
+	ok=$(printf '%s' "$v" | jsonfilter -e '@.ok' 2>/dev/null)
+	if [ "$ok" != 1 ]; then
+		msg=$(printf '%s' "$v" | jsonfilter -e '@.msg' 2>/dev/null)
+		[ -n "$msg" ] || msg="invalid override"
+		json_init; json_add_boolean ok 0; json_add_string msg "$msg"; json_dump; return
+	fi
+	msg=$("$XRAY" api bo --server="$API_SERVER" -t 2 -b "$bal" "$ob" 2>&1); rc=$?
+	if [ "$rc" -ne 0 ]; then
+		json_init; json_add_boolean ok 0
+		json_add_string msg "xray rejected the override: $(printf '%s' "$msg" | tr -s '\r\n\t ' ' ')"
+		json_dump; return
+	fi
+	override_upsert_uci "$bal" "$ob"
+	uci commit xray-monitor
+	json_init; json_add_boolean ok 1; json_add_string msg "pinned $bal to $ob"; json_dump
+}
+
+# Remove a balancer's sticky override: clear the LIVE pin first - even when no
+# UCI section exists (it may have been set from the CLI). A bo failure is
+# tolerated when the balancer is gone from the config: that is exactly the
+# stale-section case, where dropping the section is the whole point.
+do_override_del() {
+	local input bal id b
+	input=$(cat)
+	bal=$(echo "$input" | jsonfilter -e '@.balancer' 2>/dev/null)
+	case "$bal" in
+		''|*[!A-Za-z0-9._-]*)
+			json_init; json_add_boolean ok 0; json_add_string msg "missing or invalid balancer"; json_dump
+			return ;;
+	esac
+	"$XRAY" api bo --server="$API_SERVER" -t 2 -b "$bal" -r >/dev/null 2>&1
+	for id in $(uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=balancer_override$/\1/p'); do
+		b=$(uci -q get "xray-monitor.$id.balancer")
+		if [ "$b" = "$bal" ]; then uci -q delete "xray-monitor.$id"; fi
+	done
+	uci commit xray-monitor
+	json_init; json_add_boolean ok 1; json_add_string msg "override removed from $bal"; json_dump
+}
+
 # Every xray-sub call from here serves a UI click: fail fast on a busy lock
 # instead of waiting out xray-sub's ~55 s poll inside the rpcd call (the HTTP
 # session may drop while the operation would still run afterwards). The cron
@@ -413,6 +524,12 @@ case "$1" in
 		json_add_object "routing_set"; json_add_array "inbounds"; json_close_array; json_close_object
 		json_add_object "balancers_get"; json_close_object
 		json_add_object "balancers_set"; json_add_array "balancers"; json_close_array; json_close_object
+		json_add_object "balancers_live"; json_close_object
+		json_add_object "balancer_override_set"
+			json_add_string "balancer" ""; json_add_string "outbound" ""
+		json_close_object
+		json_add_object "balancer_override_del"; json_add_string "balancer" ""; json_close_object
+		json_add_object "balancer_override_apply"; json_close_object
 		json_add_object "enable_api"; json_close_object
 		json_add_object "validate"; json_close_object
 		json_add_object "config_get"; json_close_object
@@ -564,6 +681,13 @@ case "$1" in
 				json_dump
 			;;
 			balancers_get) "$SUB" balancers-get ;;
+			balancers_live) get_balancers_live ;;
+			balancer_override_set) do_override_set ;;
+			balancer_override_del) do_override_del ;;
+			# re-apply every persisted override to the running xray (bo);
+			# serialized with config writes by the mutation lock inside
+			# xray-sub (fail-fast here: a UI click must not sit out the poll)
+			balancer_override_apply) sub_msg overrides-apply ;;
 			balancers_set)
 				input=$(cat)
 				f=$(mktemp)
