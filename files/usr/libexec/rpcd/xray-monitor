@@ -14,6 +14,20 @@ config_file() {
 	echo "/etc/xray/config.json"
 }
 
+# Change token of the config file's bytes, for optimistic locking in the raw
+# editor (F17): config_get returns it as "hash", config_save compares the
+# client's "expected_hash" against a fresh one and refuses on a mismatch, so
+# two editors cannot silently clobber each other. Deliberately md5, not sha256:
+# it is not a security digest, it only has to say "the file changed", and md5sum
+# is the cheaper applet every BusyBox build carries. Follows a symlinked config
+# (hashes the target, the same bytes `cat` shows); unreadable file -> "".
+config_hash() {  # <file> -> hex digest, empty when the file is absent/unreadable
+	local h
+	[ -f "$1" ] || { echo ""; return; }
+	h=$(md5sum "$1" 2>/dev/null | awk '{ print $1 }')
+	case "$h" in *[!0-9a-f]*|'') echo "" ;; *) echo "$h" ;; esac
+}
+
 # Detect the config double-load footgun: xray launched with -confdir D *and*
 # -config F where F lives inside D, so D/*.json loads F a second time. Harmless
 # until it isn't (inbounds, incl. the api on 10085, can fail to bind).
@@ -416,7 +430,8 @@ case "$1" in
 		json_add_object "validate"; json_close_object
 		json_add_object "config_get"; json_close_object
 		json_add_object "config_test"; json_add_string "config" ""; json_close_object
-		json_add_object "config_save"; json_add_string "config" ""; json_close_object
+		json_add_object "config_save"; json_add_string "config" ""; json_add_string "expected_hash" ""; json_close_object
+		json_add_object "config_diff_text"; json_add_string "config" ""; json_close_object
 		json_add_object "update_check"; json_close_object
 		json_add_object "update_apply"; json_close_object
 		json_add_object "backups_list"; json_close_object
@@ -440,6 +455,7 @@ case "$1" in
 				cfg=$(config_file)
 				json_init
 				json_add_string path "$cfg"
+				json_add_string hash "$(config_hash "$cfg")"
 				json_add_string config "$(cat "$cfg" 2>/dev/null)"
 				json_dump
 			;;
@@ -460,20 +476,38 @@ case "$1" in
 					json_dump
 				fi
 			;;
+			# Optimistic locking (F17): the raw editor sends the "hash" it got
+			# from config_get with the content it shows. A mismatch means the
+			# file on the router changed since (other tab, other person, cron
+			# fetch + auto-apply) - refuse instead of clobbering it. Absent or
+			# empty expected_hash = no check: the previous behavior, still
+			# allowed for scripts/older UIs (the UI always sends it). Checked
+			# here, right before the locked write, so the window is only the
+			# few ms until xray-sub takes the mutation lock.
 			config_save)
 				input=$(cat)
-				tmp=$(mktemp -d)
-				if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
-					json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp dir"; json_dump
-				else
-					tmp="$tmp/config.json"
-					printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
-					msg=$("$SUB" config-save "$tmp" 2>&1); rc=$?
-					rm -rf "${tmp%/*}"
+				exp=$(printf '%s' "$input" | jsonfilter -e '@.expected_hash' 2>/dev/null)
+				cfg=$(config_file)
+				if [ -n "$exp" ] && [ "$exp" != "$(config_hash "$cfg")" ]; then
 					json_init
-					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-					json_add_string msg "$msg"
+					json_add_boolean ok 0
+					json_add_boolean conflict 1
+					json_add_string msg "config changed on the router since you loaded it - reload and re-apply your edits"
 					json_dump
+				else
+					tmp=$(mktemp -d)
+					if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+						json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp dir"; json_dump
+					else
+						tmp="$tmp/config.json"
+						printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
+						msg=$("$SUB" config-save "$tmp" 2>&1); rc=$?
+						rm -rf "${tmp%/*}"
+						json_init
+						json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+						json_add_string msg "$msg"
+						json_dump
+					fi
 				fi
 			;;
 			sub_get)   "$SUB" status ;;
@@ -650,6 +684,32 @@ case "$1" in
 						|| { printf '{"added":[],"removed":[],"changed":[],"error":"diff failed"}'; }
 				else
 					printf '{"added":[],"removed":[],"changed":[],"error":"no such backup"}'
+				fi
+			;;
+			# Semantic diff of the raw editor's text against the LIVE config, as
+			# paths_diff(live, edited) - the save-side twin of config_diff above:
+			# added = saving the editor content would add it, removed = it would
+			# drop it, changed = differs either way. Same reply shape and error
+			# convention, so the UI renders both the same way. The text lands in
+			# a temp config.json (never next to the live config) and is parsed by
+			# the very jsondiff.uc the pipeline uses: the first self-diff only
+			# proves the text parses, so text that does not is reported as
+			# "invalid JSON" rather than a generic failure.
+			config_diff_text)
+				input=$(cat)
+				tmp=$(mktemp -d)
+				if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+					printf '{"added":[],"removed":[],"changed":[],"error":"cannot create temp dir"}'
+				else
+					tmp="$tmp/config.json"
+					printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
+					if "$SHARE/jsondiff-cli.uc" "$tmp" "$tmp" >/dev/null 2>&1; then
+						"$SHARE/jsondiff-cli.uc" "$(config_file)" "$tmp" 2>/dev/null \
+							|| { printf '{"added":[],"removed":[],"changed":[],"error":"diff failed"}'; }
+					else
+						printf '{"added":[],"removed":[],"changed":[],"error":"invalid JSON"}'
+					fi
+					rm -rf "${tmp%/*}"
 				fi
 			;;
 			*)         printf '{}' ;;

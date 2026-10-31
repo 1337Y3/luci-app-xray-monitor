@@ -19,6 +19,13 @@
 # the mutation lock itself: a held flock fails a NOWAIT writer at once and a
 # waiting writer succeeds after the holder lets go (only where flock(1) is
 # real - a stubbed flock serializes nothing).
+# F17 adds the rpcd backend's own contract, through a sandboxed copy of the
+# rpcd script driving the sandboxed xray-sub above: config_get's "hash" (md5 of
+# the file bytes, through a symlink, empty when the file is gone), config_save's
+# optimistic lock (the right hash saves, a stale one is refused with conflict=1
+# and touches nothing, no/empty hash keeps the old behavior), config_diff_text
+# (semantic diff of the editor text vs the live config, invalid JSON named as
+# such), and list/ACL consistency for every declared method.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -484,6 +491,170 @@ else
 	ok_eq "lock(free): rc" 0 "$rc"
 	fast=0; [ $((t1 - t0)) -lt 3 ] && fast=1
 	is "lock(free): lock released by the previous writer" "$fast"
+fi
+
+echo "== rpcd contract (F17): config_get hash, config_save optimistic lock, config_diff_text"
+# The rpcd backend is ash + jshn.sh + jsonfilter + the jshn binary for dumps;
+# those exist on the box the scenario is meant for (the router). Where they
+# don't (a dev container), skip the whole section rather than fake them - a
+# stubbed jshn/jsonfilter would test the stub, not the backend.
+RPCD_OK=1
+command -v jsonfilter >/dev/null 2>&1 || RPCD_OK=0
+command -v jshn >/dev/null 2>&1 || RPCD_OK=0
+[ -r /usr/share/libubox/jshn.sh ] || RPCD_OK=0
+if [ "$RPCD_OK" = 0 ]; then
+	echo "NOTE   jsonfilter/jshn unavailable - rpcd contract cases skipped"
+else
+	# Sandboxed copy of the rpcd backend: same code, its xray / SHARE / SUB and
+	# config default pointed at this sandbox ($SB/sub is already the rewritten
+	# xray-sub), jshn.sh sourced from a sandbox copy, and the one other live
+	# writable path it names (the self-update log) rewritten too.
+	sed \
+		-e "s|^XRAY=.*|XRAY=$SB/bin/xray|" \
+		-e "s|^SHARE=.*|SHARE=$SB/share/xray-monitor|" \
+		-e "s|^SUB=.*|SUB=$SB/sub|" \
+		-e "s|^\. /usr/share/libubox/jshn\.sh|. $SB/work/jshn.sh|" \
+		-e "s|/usr/share/xray-monitor/xray-sub|$SB/sub|g" \
+		-e "s|/tmp/xraymon-update\.log|$SB/tmp/xraymon-update.log|" \
+		-e "s|echo \"/etc/xray/config.json\"|echo \"$SB/etc/xray/config.json\"|" \
+		"$REPO/files/usr/libexec/rpcd/xray-monitor" > "$SB/rpcd"
+	cp /usr/share/libubox/jshn.sh "$SB/work/jshn.sh"
+	for pat in "XRAY=$SB/bin/xray" "SHARE=$SB/share" "SUB=$SB/sub" "$SB/work/jshn.sh" "$SB/etc/xray/config.json"; do
+		grep -q -- "$pat" "$SB/rpcd" || { echo "scenario setup failed, rpcd rewrite missed: $pat"; exit 1; }
+	done
+	# safety net, same masking as for the sub copy: with the sandbox references
+	# masked, no live writable path may remain reachable in the rpcd copy
+	sed -e "s|$SB|<SB>|g" -e 's|<SB>/etc||g' -e 's|<SB>/tmp||g' "$SB/rpcd" > "$SB/work/rpcd-check.txt"
+	if grep -q 'echo "/etc/xray' "$SB/work/rpcd-check.txt" \
+		|| grep -Eq '/etc/|/usr/|/var/' "$SB/work/rpcd-check.txt" \
+		|| grep -q '/tmp/' "$SB/work/rpcd-check.txt"; then
+		echo "scenario setup failed: a live writable path is still reachable in the rpcd copy"; exit 1
+	fi
+
+	rpccall() {  # <method> [stdin-file] -> the backend's stdout
+		PATH="$SB/bin:$PATH" sh "$SB/rpcd" call "$1" < "${2:-/dev/null}"
+	}
+	jget() { printf '%s' "$1" | jsonfilter -e "$2" 2>/dev/null; }
+	# A config_save / config_diff_text request: the config text JSON-encoded
+	# (the way the browser sends it), optionally with expected_hash.
+	rpcinput() {  # <out-file> <config-file> [expected_hash]
+		ucode -e 'import { readfile, writefile } from "fs";
+			let o = { config: readfile(ARGV[0]) };
+			if (length(ARGV[1])) o.expected_hash = ARGV[1];
+			writefile(ARGV[2], sprintf("%J\n", o));' "$2" "${3:-}" "$1"
+	}
+	# what the pipeline itself would install for a request: the config text as
+	# the backend decodes it out of the request JSON
+	rpcconfig() {  # <request-file> <out-file>
+		jsonfilter -i "$1" -e '@.config' > "$2"
+	}
+
+	# --- list / ACL: every declared method must be granted, new params present
+	list_out=$(PATH="$SB/bin:$PATH" sh "$SB/rpcd" list)
+	is "rpcd list: config_diff_text declared" "$(printf '%s' "$list_out" | grep -q '"config_diff_text"' && echo 1 || echo 0)"
+	is "rpcd list: config_save declares expected_hash" "$(printf '%s' "$list_out" | grep -q '"expected_hash"' && echo 1 || echo 0)"
+	printf '%s' "$list_out" > "$SB/work/list.json"
+	missing=$(ucode -e 'import { readfile } from "fs";
+		let acl = readfile(ARGV[0]), meth = keys(json(readfile(ARGV[1]))), miss = [];
+		for (let i = 0; i < length(meth); i++)
+			if (index(acl, "\"" + meth[i] + "\"") < 0) push(miss, meth[i]);
+		print(join(" ", miss));' \
+		"$REPO/files/usr/share/rpcd/acl.d/luci-app-xray-monitor.json" "$SB/work/list.json")
+	ok_eq "rpcd list: every declared method is granted by the ACL" "" "$missing"
+
+	# --- config_get: hash is the md5 of the file bytes, text round-trips
+	reset_cfg
+	out=$(rpccall config_get)
+	ok_eq "rpcd config_get: hash = md5 of the config bytes" \
+		"$(md5sum "$CFG" | awk '{ print $1 }')" "$(jget "$out" '@.hash')"
+	ok_eq "rpcd config_get: path" "$CFG" "$(jget "$out" '@.path')"
+	rpcinput "$SB/work/get-in.json" "$CFG"
+	rpcconfig "$SB/work/get-in.json" "$SB/work/get-want.json"
+	printf '%s' "$out" > "$SB/work/get-out.json"
+	rpcconfig "$SB/work/get-out.json" "$SB/work/get-got.json"
+	is "rpcd config_get: config text byte-exact through the JSON round trip" "$(same "$SB/work/get-want.json" "$SB/work/get-got.json")"
+
+	# --- config_diff_text: editor text vs the LIVE config (added = saving adds)
+	rpcinput "$SB/work/dt-same.json" "$CFG"
+	rpccall config_diff_text "$SB/work/dt-same.json" > "$SB/work/dt-out.json"
+	"$SB/share/xray-monitor/jsondiff-cli.uc" "$CFG" "$CFG" > "$SB/work/dt-want.json"
+	is "rpcd config_diff_text: identical text -> empty diff (and it parses)" "$(same "$SB/work/dt-want.json" "$SB/work/dt-out.json")"
+	ucode -e 'import { readfile, writefile } from "fs";
+		let c = json(readfile(ARGV[0]));
+		c.f17_marker = "added by the editor";
+		writefile(ARGV[1], sprintf("%.2J\n", c));' "$CFG" "$SB/work/edited.json"
+	rpcinput "$SB/work/dt-edit.json" "$SB/work/edited.json"
+	rpccall config_diff_text "$SB/work/dt-edit.json" > "$SB/work/dt-out2.json"
+	"$SB/share/xray-monitor/jsondiff-cli.uc" "$CFG" "$SB/work/edited.json" > "$SB/work/dt-want2.json"
+	is "rpcd config_diff_text: edited text -> the same paths jsondiff reports" "$(same "$SB/work/dt-want2.json" "$SB/work/dt-out2.json")"
+	ok_eq "rpcd config_diff_text: the edit shows up under added" "f17_marker" \
+		"$(jsonfilter -i "$SB/work/dt-out2.json" -e '@.added[0]' 2>/dev/null)"
+	# a comment-only change is legal in these configs and must not read as one
+	ucode -e 'import { readfile, writefile } from "fs";
+		writefile(ARGV[1], readfile(ARGV[0]) + "\n// === local ===\n");' "$CFG" "$SB/work/commented.json"
+	rpcinput "$SB/work/dt-cmt.json" "$SB/work/commented.json"
+	out=$(rpccall config_diff_text "$SB/work/dt-cmt.json")
+	is "rpcd config_diff_text: comment-only change -> no semantic diff" "$(printf '%s' "$out" | grep -q '"added": \[ \], "removed": \[ \], "changed": \[ \]' && echo 1 || echo 0)"
+	# text that does not parse is named, not a generic diff failure
+	cat > "$SB/work/dt-bad.json" <<'EOF'
+{"config":"{ \"outbounds\": [ "}
+EOF
+	out=$(rpccall config_diff_text "$SB/work/dt-bad.json")
+	is "rpcd config_diff_text: invalid JSON reported as such" "$(printf '%s' "$out" | grep -q '"invalid JSON"' && echo 1 || echo 0)"
+	is "rpcd config_diff_text: invalid JSON -> empty diff arrays" "$(printf '%s' "$out" | grep -q '"added":\[\]' && echo 1 || echo 0)"
+
+	# --- config_save: the right hash saves through the whole pipeline
+	reset_cfg
+	r0=$(restarts); h0=$(hookruns)
+	rpcinput "$SB/work/cs-ok.json" "$FIX/staged-clean.json" "$(md5sum "$CFG" | awk '{ print $1 }')"
+	out=$(rpccall config_save "$SB/work/cs-ok.json")
+	ok_eq "rpcd config_save(right hash): ok" "true" "$(jget "$out" '@.ok')"
+	ok_eq "rpcd config_save(right hash): no conflict field" "" "$(jget "$out" '@.conflict')"
+	rpcconfig "$SB/work/cs-ok.json" "$SB/work/cs-want.json"
+	is "rpcd config_save(right hash): the uploaded text is what got installed" "$(same "$CFG" "$SB/work/cs-want.json")"
+	is "rpcd config_save(right hash): manual backup created" "$([ -n "$(manual_bak)" ] && echo 1 || echo 0)"
+	ok_eq "rpcd config_save(right hash): restart issued" "$((r0 + 1))" "$(restarts)"
+	ok_eq "rpcd config_save(right hash): hooks ran" "$((h0 + 1))" "$(hookruns)"
+
+	# --- config_save: a stale hash is refused and touches NOTHING
+	reset_cfg
+	rpcinput "$SB/work/cs-stale.json" "$FIX/staged-clean.json" "$(md5sum "$CFG" | awk '{ print $1 }')"
+	cp "$FIX/staged-clean.json" "$CFG"      # meanwhile, someone else saved
+	r0=$(restarts); h0=$(hookruns); b0=$(baks)
+	out=$(rpccall config_save "$SB/work/cs-stale.json")
+	ok_eq "rpcd config_save(stale hash): ok=false" "false" "$(jget "$out" '@.ok')"
+	ok_eq "rpcd config_save(stale hash): conflict=true" "true" "$(jget "$out" '@.conflict')"
+	is "rpcd config_save(stale hash): msg says reload and re-apply" "$(printf '%s' "$out" | grep -q 'changed on the router' && echo 1 || echo 0)"
+	is "rpcd config_save(stale hash): live config untouched" "$(same "$CFG" "$FIX/staged-clean.json")"
+	is "rpcd config_save(stale hash): editor content not staged anywhere" "$([ ! -e "$CFG.new" ] && echo 1 || echo 0)"
+	ok_eq "rpcd config_save(stale hash): no backup" "$b0" "$(baks)"
+	ok_eq "rpcd config_save(stale hash): no restart" "$r0" "$(restarts)"
+	ok_eq "rpcd config_save(stale hash): no hooks" "$h0" "$(hookruns)"
+
+	# --- config_save: no hash at all / an explicitly empty one = old behavior
+	reset_cfg
+	rpcinput "$SB/work/cs-nohash.json" "$FIX/staged-clean.json"
+	out=$(rpccall config_save "$SB/work/cs-nohash.json")
+	ok_eq "rpcd config_save(no hash): ok (backward compat)" "true" "$(jget "$out" '@.ok')"
+	reset_cfg
+	ucode -e 'import { readfile, writefile } from "fs";
+		writefile(ARGV[1], sprintf("%J\n", { config: readfile(ARGV[0]), expected_hash: "" }));' \
+		"$FIX/staged-clean.json" "$SB/work/cs-emptyhash.json"
+	out=$(rpccall config_save "$SB/work/cs-emptyhash.json")
+	ok_eq "rpcd config_save(empty hash): ok (what the UI sends when it has none)" "true" "$(jget "$out" '@.ok')"
+
+	# --- hash path handling: symlinked config, and no config at all
+	rm -f "$CFG" "$CFG".bak.* "$CFG.new"
+	cp "$FIX/config.json" "$SB/etc/xray/config.real.json"
+	ln -s "$SB/etc/xray/config.real.json" "$CFG"
+	out=$(rpccall config_get)
+	ok_eq "rpcd config_get(symlink): hash = md5 of the TARGET's bytes" \
+		"$(md5sum "$SB/etc/xray/config.real.json" | awk '{ print $1 }')" "$(jget "$out" '@.hash')"
+	rm -f "$CFG" "$SB/etc/xray/config.real.json"
+	out=$(rpccall config_get)
+	ok_eq "rpcd config_get(no config file): hash empty" "" "$(jget "$out" '@.hash')"
+	ok_eq "rpcd config_get(no config file): text empty, not an error" "" "$(jget "$out" '@.config')"
+	reset_cfg
 fi
 
 echo
