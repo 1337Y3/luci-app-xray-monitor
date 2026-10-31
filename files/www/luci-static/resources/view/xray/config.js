@@ -2,15 +2,163 @@
 'require view';
 'require rpc';
 'require ui';
+'require xray-diff as XrayDiff';
 
-var callGet  = rpc.declare({ object: 'xray-monitor', method: 'config_get' });
-var callTest = rpc.declare({ object: 'xray-monitor', method: 'config_test', params: [ 'config' ] });
-var callSave = rpc.declare({ object: 'xray-monitor', method: 'config_save', params: [ 'config' ] });
+var callGet      = rpc.declare({ object: 'xray-monitor', method: 'config_get' });
+var callTest     = rpc.declare({ object: 'xray-monitor', method: 'config_test',      params: [ 'config' ] });
+var callDiffText = rpc.declare({ object: 'xray-monitor', method: 'config_diff_text', params: [ 'config' ] });
+var callSave     = rpc.declare({ object: 'xray-monitor', method: 'config_save',      params: [ 'config', 'expected_hash' ] });
 
-var ta = null;     // the textarea
+var ta = null;        // the textarea
 var pathLabel = null;
+var loadedHash = '';  // config_get "hash" of the bytes the editor was loaded from;
+                      // sent back as expected_hash, so a config that changed on the
+                      // router in the meantime refuses the save instead of clobbering
 
 function setBusy(btns, on) { btns.forEach(function(b) { b.disabled = on; }); }
+
+/* Parse the editor text with the same tolerance the write pipeline has: these
+ * configs legally carry // and block comments (the "=== subscription: ... ==="
+ * headers), and the server side reads them with ucode's json(), which also
+ * accepts trailing commas. So one string-aware pass strips comments (a
+ * "https://..." value must survive) and trailing commas (a "," inside a string
+ * must), then JSON.parse judges the rest. Throws on invalid input. */
+function parseConfigJSON(text) {
+	var s = String(text), out = '', comma = -1, i = 0, n = s.length;
+	while (i < n) {
+		var c = s.charAt(i);
+		if (c == '"') {                                  // string literal: verbatim
+			var j = i + 1;
+			while (j < n) {
+				if (s.charAt(j) == '\\') { j += 2; continue; }
+				if (s.charAt(j) == '"') break;
+				j++;
+			}
+			out += s.substring(i, Math.min(j + 1, n));
+			i = j + 1;
+			comma = -1;                                  // the comma had a value
+		}
+		else if (c == '/' && s.charAt(i + 1) == '/') {   // line comment, keep the \n
+			while (i < n && s.charAt(i) != '\n') i++;
+		}
+		else if (c == '/' && s.charAt(i + 1) == '*') {   // block comment
+			i += 2;
+			while (i < n && !(s.charAt(i) == '*' && s.charAt(i + 1) == '/')) i++;
+			i += 2;
+		}
+		else if (c == ',') {
+			out += c;
+			comma = out.length - 1;                      // dropped again if only ]/} follows
+			i++;
+		}
+		else if ((c == '}' || c == ']') && comma >= 0) {
+			out = out.substring(0, comma);               // strip the trailing comma
+			comma = -1;
+			out += c;
+			i++;
+		}
+		else {
+			if (comma >= 0 && c != ' ' && c != '\t' && c != '\n' && c != '\r') comma = -1;
+			out += c;
+			i++;
+		}
+	}
+	return JSON.parse(out);
+}
+
+/* The optimistic-locking refusal, one wording everywhere (client-side
+ * pre-check in the preview and the server's conflict reply). */
+function conflictMsg() {
+	return _('The config changed on the router since you loaded it. Reload it from disk and re-apply your edits.');
+}
+
+function modalLine(cls, strong, text) {
+	return E('p', { 'style': 'color:' + cls + ';margin:.8em 0 0;' },
+		text ? [ E('strong', {}, strong), document.createTextNode(' ' + text) ] : [ E('strong', {}, strong) ]);
+}
+
+/* Reload the editor from disk and remember the new hash (also used after a
+ * successful save: the editor then holds exactly what is installed). */
+function refreshFromDisk(silent) {
+	return callGet().then(function(res) {
+		ta.value = (res && res.config) ? res.config : '';
+		loadedHash = (res && res.hash) || '';
+		if (!silent) ui.addNotification(null, E('p', _('Reloaded from disk.')), 'info');
+	}, function() {
+		if (!silent) ui.addNotification(null, E('p', _('Reload call failed.')), 'error');
+	});
+}
+
+/* The mandatory diff preview: what saving the editor content would change,
+ * semantically (dot-paths from the backend) and as a text diff. "Apply anyway"
+ * continues into the locked save, "Keep editing" closes without saving. */
+function showPreview(testRes, diffRes, getRes) {
+	var sem  = diffRes || {};
+	var cur  = (getRes && getRes.config) || '';
+	var liveHash = (getRes && getRes.hash) || '';
+	var conflict = !!(loadedHash && liveHash && loadedHash != liveHash);
+	var badJson  = !!sem.error;
+	var testBad  = !(testRes && testRes.ok);
+	var nodes = [];
+
+	if (badJson)
+		nodes.push(E('p', {}, [ E('strong', {}, _('Cannot diff: ')), document.createTextNode(sem.error) ]));
+	else if ((!sem.added || !sem.added.length) && (!sem.removed || !sem.removed.length) && (!sem.changed || !sem.changed.length))
+		nodes.push(E('p', {}, E('em', {}, _('The editor content is semantically identical to the config on disk.'))));
+	else {
+		nodes.push(E('p', {}, _('Saving the editor content would change the config like this:')));
+		nodes.push(XrayDiff.renderSemantic(sem));
+		nodes.push(E('p', { 'style': 'margin-top:1em;' }, [
+			E('strong', {}, _('Text diff (on disk → editor')), ' — ',
+			_("lines marked '-' exist only in the config on disk, lines marked '+' only in the editor.")
+		]));
+		nodes.push(XrayDiff.renderUnified(cur, ta.value));
+	}
+
+	var notes = [];
+	if (conflict) notes.push(modalLine('#cc3300', _('Not applied:'), conflictMsg()));
+	if (testBad)  notes.push(modalLine('#cc3300', _('xray -test rejected the editor content:'), (testRes && testRes.msg) || _('unknown error')));
+
+	var errLine = E('div', {}, notes);
+	var applyBtn = E('button', { 'class': 'cbi-button cbi-button-save important' }, _('Apply anyway'));
+	var keepBtn  = E('button', { 'class': 'cbi-button cbi-button-neutral' }, _('Keep editing'));
+	keepBtn.addEventListener('click', ui.hideModal);
+	// nothing to apply behind a conflict (the save would be refused) or behind
+	// a config xray -test already rejected (the save would roll it back)
+	applyBtn.disabled = conflict || testBad;
+
+	applyBtn.addEventListener('click', function() {
+		applyBtn.disabled = true;
+		keepBtn.disabled = true;
+		callSave(ta.value, loadedHash || '').then(function(res) {
+			if (res && res.ok) {
+				ui.hideModal();
+				ui.addNotification(null, E('p', _('Saved and restarted xray. ') + (res.msg || '')), 'info');
+				refreshFromDisk(true);
+			}
+			else {
+				keepBtn.disabled = false;
+				if (res && res.conflict) {
+					errLine.appendChild(modalLine('#cc3300', _('Not applied:'), conflictMsg()));
+					// Apply stays off: re-sending the stale hash can only fail again
+				}
+				else {
+					applyBtn.disabled = false;
+					errLine.appendChild(modalLine('#cc3300', _('Save failed (not applied):'), (res && res.msg) || _('unknown error')));
+				}
+			}
+		}, function() {
+			keepBtn.disabled = false;
+			applyBtn.disabled = false;
+			errLine.appendChild(modalLine('#cc3300', _('Save call failed.'), ''));
+		});
+	});
+
+	ui.showModal(_('Save & apply: review the changes'), nodes.concat([
+		errLine,
+		E('div', { 'class': 'right', 'style': 'margin-top:1em;' }, [ keepBtn, applyBtn ])
+	]));
+}
 
 return view.extend({
 	load: function() { return callGet().catch(function() { return {}; }); },
@@ -21,7 +169,7 @@ return view.extend({
 			'style': 'width:100%;min-height:60vh;font-family:monospace;white-space:pre;overflow-wrap:normal;',
 			'spellcheck': 'false', 'wrap': 'off'
 		}, (data && data.config) ? data.config : '');
-
+		loadedHash = (data && data.hash) || '';
 		pathLabel = E('code', {}, (data && data.path) ? data.path : '/etc/xray/config.json');
 
 		var testBtn   = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Test config'));
@@ -40,23 +188,41 @@ return view.extend({
 			}, function() { setBusy(btns, false); ui.addNotification(null, E('p', _('Test call failed.')), 'error'); });
 		});
 
+		// Saving always goes through the preview modal: the diff is computed on
+		// the router against what is on disk NOW, the config must parse (with
+		// the pipeline's comment tolerance) and survive xray -test before the
+		// diff is even offered, and the actual save carries the hash of the
+		// bytes the editor was loaded from so a concurrent change refuses it.
 		saveBtn.addEventListener('click', function() {
-			if (!confirm(_('Validate, back up, write config.json and restart xray now?'))) return;
+			var perr = null;
+			try { parseConfigJSON(ta.value); }
+			catch (e) { perr = (e && e.message) ? e.message : _('parse error'); }
+			if (perr) {
+				var closeBtn = E('button', { 'class': 'cbi-button cbi-button-neutral' }, _('Keep editing'));
+				closeBtn.addEventListener('click', ui.hideModal);
+				ui.showModal(_('Invalid JSON'), [
+					E('p', {}, [
+						E('strong', {}, _('The editor content is not valid JSON (// comments are allowed): ')),
+						document.createTextNode(perr)
+					]),
+					E('p', {}, _('Nothing was saved. Fix the syntax, then save again.')),
+					E('div', { 'class': 'right' }, [ closeBtn ])
+				]);
+				return;
+			}
 			setBusy(btns, true);
-			callSave(ta.value).then(function(res) {
+			Promise.all([ callTest(ta.value), callDiffText(ta.value), callGet() ]).then(function(r) {
 				setBusy(btns, false);
-				if (res && res.ok) ui.addNotification(null, E('p', _('Saved and restarted xray. ') + (res.msg || '')), 'info');
-				else ui.addNotification(null, E('p', [ E('strong', {}, _('Save failed (not applied): ')), document.createTextNode((res && res.msg) || _('unknown error')) ]), 'error');
-			}, function() { setBusy(btns, false); ui.addNotification(null, E('p', _('Save call failed.')), 'error'); });
+				showPreview(r[0], r[1], r[2]);
+			}, function() {
+				setBusy(btns, false);
+				ui.addNotification(null, E('p', _('Preview call failed.')), 'error');
+			});
 		});
 
 		reloadBtn.addEventListener('click', function() {
 			setBusy(btns, true);
-			callGet().then(function(res) {
-				setBusy(btns, false);
-				ta.value = (res && res.config) ? res.config : '';
-				ui.addNotification(null, E('p', _('Reloaded from disk.')), 'info');
-			}, function() { setBusy(btns, false); });
+			refreshFromDisk(false).then(function() { setBusy(btns, false); });
 		});
 
 		return E('div', {}, [
@@ -64,7 +230,7 @@ return view.extend({
 			E('div', { 'class': 'cbi-section' }, [
 				E('p', {}, [ _('Editing '), pathLabel, _('. '),
 					E('strong', {}, _('Test config')), _(' runs xray -test on the editor contents without saving. '),
-					E('strong', {}, _('Save & apply')), _(' validates, backs up (config.json.bak.manual.*), writes, and restarts xray — and rolls back automatically if the test fails.') ]),
+					E('strong', {}, _('Save & apply')), _(' first shows a preview of what would change (semantic + text diff); "Apply anyway" then validates, backs up (config.json.bak.manual.*), writes, and restarts xray — and rolls back automatically if the test fails. If the config changed on the router after this page loaded it, the save is refused and you must reload it and re-apply your edits.') ]),
 				ta,
 				E('div', { 'style': 'margin-top:.6em;display:flex;gap:8px;' }, [ testBtn, saveBtn, reloadBtn ])
 			])
