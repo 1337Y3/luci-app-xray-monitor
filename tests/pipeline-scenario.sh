@@ -623,7 +623,7 @@ if [ "$seen" = 1 ]; then
 	is "e2e: skipped verdict visible before any check ran" \
 		"$("$SB/share/xray-monitor/e2e.uc" summary "$E2EJ" 2>/dev/null | awk '$1 == "e2e-skip" && $2 == "skipped"' | grep -c .)"
 	is "e2e: progress file is the contract shape (ts + results)" \
-		"$(grep -c '^{"ts":1[0-9]*,"results":{' "$E2EJ" 2>/dev/null)"
+		"$(grep -Ec '^\{"ts":[0-9]+,"results":\{|^\{ "ts": [0-9]+, "results": \{' "$E2EJ" 2>/dev/null)"
 fi
 wait "$erun"; erc=$?
 e2eout=$(cat "$SB/work/e2e.out")
@@ -639,7 +639,7 @@ ok_eq "e2e: probe-disabled exit" "skipped" "$(e2efield e2e-skip 2)"
 ok_eq "e2e: summary counts" "# ok=1 stalled=1 fail=1 skipped=1" \
 	"$(printf '%s\n' "$e2eout" | grep '^# ')"
 ok_eq "e2e: e2e.json matches the summary (contract B3)" "1:1:1:1" \
-	"$(grep -c '"status":"stalled"' "$E2EJ" 2>/dev/null):$(grep -c '"status":"ok"' "$E2EJ" 2>/dev/null):$(grep -c '"status":"fail"' "$E2EJ" 2>/dev/null):$(grep -c '"status":"skipped"' "$E2EJ" 2>/dev/null)"
+	"$(grep -c '"status": "stalled"' "$E2EJ" 2>/dev/null):$(grep -c '"status": "ok"' "$E2EJ" 2>/dev/null):$(grep -c '"status": "fail"' "$E2EJ" 2>/dev/null):$(grep -c '"status": "skipped"' "$E2EJ" 2>/dev/null)"
 ok_eq "e2e: exactly the checked exits dialled (3 exits x 2 URLs)" 6 "$(lines "$STUB_CURL_LOG")"
 ok_eq "e2e: every fetch used the subscription user agent" 6 \
 	"$(grep -c 'ua=v2rayNG/1.8.0 ' "$STUB_CURL_LOG")"
@@ -668,7 +668,7 @@ else
 	wait "$tholder"
 	ok_eq "e2e(busy tmpxray): rc" 1 "$rc"
 	ok_eq "e2e(busy tmpxray): every checked exit recorded as fail" 3 \
-		"$(grep -c '"status":"fail"' "$E2EJ" 2>/dev/null)"
+		"$(grep -c '"status": "fail"' "$E2EJ" 2>/dev/null)"
 	is "e2e(busy tmpxray): no connection attempted" "$([ "$(lines "$STUB_CURL_LOG")" = 0 ] && echo 1 || echo 0)"
 	is "e2e(busy tmpxray): run marker removed" "$([ ! -e "$E2ERUN" ] && echo 1 || echo 0)"
 fi
