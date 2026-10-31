@@ -92,9 +92,13 @@ fi
 
 cat > "$SB/bin/xray" <<'EOF'
 #!/bin/sh
-# xray stub: `-test` validates by marker, `api statsquery` pretends the stats
-# API answers. Every `-test` (and its verdict) is logged to $STUB_LOG.
+# xray stub: `-test` validates by marker, `api ...` models the HandlerService
+# (F14): the running outbound tags live in $STUB_API_OB (one per line);
+# lso prints them, rmo/ado mutate them the way the real service does (rmo of
+# an unknown tag succeeds silently, ado fails on an existing tag). Every
+# `-test` (and its verdict) is logged to $STUB_LOG.
 LOG=${STUB_LOG:-/dev/null}
+OB=${STUB_API_OB:-/dev/null}
 case "$1" in
 	-test)
 		cfg=""
@@ -108,7 +112,62 @@ case "$1" in
 		fi
 		echo "fail ${cfg:-none}" >> "$LOG"; exit 1
 		;;
-	api) exit 0 ;;
+	api)
+		sub="$2"; shift 2
+		args=""
+		for a in "$@"; do
+			case "$a" in -*) continue ;; esac
+			args="$args $a"
+		done
+		case "$sub" in
+			statsquery)
+				[ -f "${STUB_API_DOWN:-/nonexistent}" ] && exit 1
+				exit 0
+				;;
+			lso)
+				[ -f "${STUB_API_DOWN:-/nonexistent}" ] && exit 1
+				first=1
+				printf '{"outbounds":['
+				while IFS= read -r t; do
+					[ -n "$t" ] || continue
+					[ "$first" = 1 ] || printf ','
+					first=0
+					printf '{"tag":"%s"}' "$t"
+				done < "$OB"
+				printf ']}\n'
+				;;
+			rmo)
+				[ -f "${STUB_API_FAIL:-/nonexistent}" ] && exit 1
+				for f in $args; do
+					if [ -f "$f" ]; then
+						tags=$(jsonfilter -i "$f" -e '@.outbounds[*].tag' 2>/dev/null)
+					else
+						tags="$f"
+					fi
+					for t in $tags; do
+						grep -vx "$t" "$OB" > "$OB.tmp" 2>/dev/null
+						mv "$OB.tmp" "$OB"
+					done
+				done
+				exit 0
+				;;
+			ado)
+				[ -f "${STUB_API_FAIL:-/nonexistent}" ] && exit 1
+				for f in $args; do
+					[ -f "$f" ] || exit 1
+					for t in $(jsonfilter -i "$f" -e '@.outbounds[*].tag' 2>/dev/null); do
+						if grep -qx "$t" "$OB" 2>/dev/null; then
+							echo "failed to add outbound: existing tag found: $t" >&2
+							exit 1
+						fi
+						echo "$t" >> "$OB"
+					done
+				done
+				exit 0
+				;;
+		esac
+		exit 0
+		;;
 esac
 exit 0
 EOF
@@ -121,10 +180,13 @@ EOF
 cat > "$SB/bin/uci" <<'EOF'
 #!/bin/sh
 # uci stub: keeps the sandbox off the live UCI. backup_keep=3 pins the prune
-# budget so the counts below are deterministic; every other query comes back
-# empty (sub_prefixes empty = legacy "all proxy outbounds are managed" mode).
+# budget so the counts below are deterministic; hot_swap defaults to 0 so the
+# pre-F14 assertions stay byte-stable and the hot-swap cases opt in via
+# $STUB_UCI_HOTSWAP; every other query comes back empty (sub_prefixes empty =
+# legacy "all proxy outbounds are managed" mode).
 case " $* " in
 	*" get xray-monitor.sub.backup_keep "*) echo 3; exit 0 ;;
+	*" get xray-monitor.sub.hot_swap "*) echo "${STUB_UCI_HOTSWAP:-0}"; exit 0 ;;
 esac
 exit 1
 EOF
@@ -151,7 +213,11 @@ export STUB_HOOK_LOG="$SB/log/hooks.log"
 export STUB_INITD_LOG="$SB/log/initd.log"
 export STUB_PGREP_DOWN="$SB/flags/xray-down"
 export STUB_OPKG_LOG="$SB/log/opkg.log"
-: > "$STUB_LOG"; : > "$STUB_HOOK_LOG"; : > "$STUB_INITD_LOG"; : > "$STUB_OPKG_LOG"
+export STUB_API_OB="$SB/api/ob.tags"
+export STUB_API_DOWN="$SB/flags/api-down"
+export STUB_API_FAIL="$SB/flags/api-fail"
+mkdir -p "$SB/api"
+: > "$STUB_LOG"; : > "$STUB_HOOK_LOG"; : > "$STUB_INITD_LOG"; : > "$STUB_OPKG_LOG"; : > "$STUB_API_OB"
 
 CFG="$SB/etc/xray/config.json"
 fails=0
@@ -174,6 +240,10 @@ last_test() { tail -n 1 "$STUB_LOG" | cut -d' ' -f1; }
 auto_bak()   { ls "$CFG".bak.* 2>/dev/null | grep -E '\.bak\.[0-9]{8}-[0-9]{6}$' | tail -n 1; }
 manual_bak() { ls "$CFG".bak.manual.* 2>/dev/null | tail -n 1; }
 preapi_bak() { ls "$CFG".bak.preapi.* 2>/dev/null | tail -n 1; }
+# running-xray model (F14): the lso/rmo/ado stub state == the installed config
+api_sync() { jsonfilter -i "$CFG" -e '@.outbounds[*].tag' 2>/dev/null | sed '/^$/d' > "$STUB_API_OB"; }
+api_same_as_cfg() { [ "$(sort -u < "$STUB_API_OB")" = "$(jsonfilter -i "$CFG" -e '@.outbounds[*].tag' 2>/dev/null | sed '/^$/d' | sort -u)" ]; }
+la_get() { jsonfilter -i "$SB/state/last-apply.json" -e "$1" 2>/dev/null; }
 
 touch -t 202001010000 "$SB/tmp/.tprobe" 2>/dev/null && TOUCH_T=1 || TOUCH_T=0
 rm -f "$SB/tmp/.tprobe"
@@ -444,6 +514,114 @@ fb=$(PATH="$SB/bin:$PATH" sh "$SB/work/fb-run.sh" 2>/dev/null); fbrc=$?
 ok_eq "fallback: driver rc" 0 "$fbrc"
 ok_eq "fallback: restore + restart + verify healthy" 0 "$(printf '%s\n' "$fb" | sed -n 's/^fallback_rc=//p')"
 is "fallback: config back to the snapshot" "$(same "$CFG" "$FIX/config.json")"
+
+echo "== hot-swap (F14): outbound-only apply reconciles live via xray api rmo/ado"
+# hs-staged.json vs config.json (legacy mode, uci stub): proxy-fi body changed,
+# proxy-de added, proxy-ch dropped, manual-vps carried unchanged - a pure
+# managed-outbound change whose first tag is re-added -> live, no restart.
+reset_cfg
+rm -f "$SB/state/last-apply.json"
+api_sync
+cp "$CFG" "$SB/work/pre-hs.json"
+cp "$FIX/hs-staged.json" "$SB/state/staged.json"
+r0=$(restarts); h0=$(hookruns)
+STUB_UCI_HOTSWAP=1; export STUB_UCI_HOTSWAP
+out=$(runsub apply 2>/dev/null); rc=$?
+unset STUB_UCI_HOTSWAP
+ok_eq "hot-swap(live): stdout" "ok (applied live)" "$out"
+ok_eq "hot-swap(live): rc" 0 "$rc"
+ok_eq "hot-swap(live): NO restart issued" "$r0" "$(restarts)"
+ok_eq "hot-swap(live): no post_restart_hooks (no-restart mode)" "$h0" "$(hookruns)"
+is "hot-swap(live): candidate installed" "$(differs "$CFG" "$SB/work/pre-hs.json")"
+is "hot-swap(live): running set now equals the candidate" "$(api_same_as_cfg && echo 1 || echo 0)"
+ab=$(auto_bak)
+is "hot-swap(live): snapshot taken before the install" "$([ -n "$ab" ] && same "$ab" "$SB/work/pre-hs.json" || echo 0)"
+ok_eq "hot-swap(live): status=applied pending=0" "applied 0" "$(cat "$SB/state/status" 2>/dev/null) $(cat "$SB/state/pending" 2>/dev/null)"
+ok_eq "hot-swap(live): last-apply mode" "live" "$(la_get '@.mode')"
+ok_eq "hot-swap(live): last-apply removed/added" "2 2" "$(la_get '@.removed') $(la_get '@.added')"
+ok_eq "hot-swap(live): last-apply reason empty" "" "$(la_get '@.reason')"
+
+echo "== hot-swap: churn-only staged state -> live with zero API mutations"
+# hs-staged-churn.json carries every managed outbound (legacy mode includes
+# manual-vps) with bodies equal after the ignore list - nothing to rmo/ado.
+reset_cfg
+api_sync
+cp "$STUB_API_OB" "$SB/work/ob-before.tags"
+cp "$FIX/hs-staged-churn.json" "$SB/state/staged.json"
+r0=$(restarts)
+STUB_UCI_HOTSWAP=1; export STUB_UCI_HOTSWAP
+out=$(runsub apply 2>/dev/null); rc=$?
+unset STUB_UCI_HOTSWAP
+ok_eq "hot-swap(churn): stdout" "ok (applied live)" "$out"
+ok_eq "hot-swap(churn): rc" 0 "$rc"
+ok_eq "hot-swap(churn): no restart" "$r0" "$(restarts)"
+ok_eq "hot-swap(churn): nothing removed/added" "0 0" "$(la_get '@.removed') $(la_get '@.added')"
+is "hot-swap(churn): running set untouched" "$(same "$STUB_API_OB" "$SB/work/ob-before.tags")"
+
+echo "== hot-swap: running set != config.json -> restart, reason recorded"
+reset_cfg
+api_sync
+echo "ghost-tag" >> "$STUB_API_OB"
+cp "$CFG" "$SB/work/pre-mm.json"
+cp "$FIX/hs-staged.json" "$SB/state/staged.json"
+r0=$(restarts); h0=$(hookruns)
+STUB_UCI_HOTSWAP=1; export STUB_UCI_HOTSWAP
+out=$(runsub apply 2>/dev/null); rc=$?
+unset STUB_UCI_HOTSWAP
+ok_eq "hot-swap(mismatch): stdout ok (restart path)" "ok" "$out"
+ok_eq "hot-swap(mismatch): rc" 0 "$rc"
+ok_eq "hot-swap(mismatch): restart invoked once" "$((r0 + 1))" "$(restarts)"
+ok_eq "hot-swap(mismatch): hooks ran (restart path)" "$((h0 + 1))" "$(hookruns)"
+is "hot-swap(mismatch): candidate installed" "$(differs "$CFG" "$SB/work/pre-mm.json")"
+ok_eq "hot-swap(mismatch): last-apply mode/reason" "restart running-state-mismatch" "$(la_get '@.mode') $(la_get '@.reason')"
+api_sync
+
+echo "== hot-swap: handler API down -> restart, reason api-unavailable"
+reset_cfg
+api_sync
+cp "$FIX/hs-staged.json" "$SB/state/staged.json"
+r0=$(restarts)
+touch "$STUB_API_DOWN"
+STUB_UCI_HOTSWAP=1; export STUB_UCI_HOTSWAP
+out=$(runsub apply 2>/dev/null); rc=$?
+unset STUB_UCI_HOTSWAP
+rm -f "$STUB_API_DOWN"
+ok_eq "hot-swap(api-down): stdout ok (restart path)" "ok" "$out"
+ok_eq "hot-swap(api-down): rc" 0 "$rc"
+ok_eq "hot-swap(api-down): restart invoked once" "$((r0 + 1))" "$(restarts)"
+ok_eq "hot-swap(api-down): last-apply mode/reason" "restart api-unavailable" "$(la_get '@.mode') $(la_get '@.reason')"
+
+echo "== hot-swap: failing live step -> fallback restore + restart + verify"
+reset_cfg
+api_sync
+cp "$CFG" "$SB/work/pre-fb2.json"
+cp "$FIX/hs-staged.json" "$SB/state/staged.json"
+r0=$(restarts); h0=$(hookruns)
+touch "$STUB_API_FAIL"
+STUB_UCI_HOTSWAP=1; export STUB_UCI_HOTSWAP
+out=$(runsub apply 2>/dev/null); rc=$?
+unset STUB_UCI_HOTSWAP
+rm -f "$STUB_API_FAIL"
+ok_eq "hot-swap(fallback): stdout" "hot-swap failed - rolled back to the previous config and restarted xray" "$out"
+ok_eq "hot-swap(fallback): rc" 1 "$rc"
+ok_eq "hot-swap(fallback): restart invoked once (rollback)" "$((r0 + 1))" "$(restarts)"
+ok_eq "hot-swap(fallback): no hooks (rollback, not a healthy apply)" "$h0" "$(hookruns)"
+is "hot-swap(fallback): snapshot restored over the candidate" "$(same "$CFG" "$SB/work/pre-fb2.json")"
+ok_eq "hot-swap(fallback): status" "rolled-back" "$(cat "$SB/state/status" 2>/dev/null)"
+ok_eq "hot-swap(fallback): last-apply mode/reason/fallback" "restart hot-swap-failed 1" "$(la_get '@.mode') $(la_get '@.reason') $(la_get '@.fallback')"
+is "hot-swap(fallback): running set back to the restored config" "$(api_same_as_cfg && echo 1 || echo 0)"
+api_sync
+
+echo "== hot-swap off (UCI hot_swap=0): every apply restarts, pre-F14 behavior"
+reset_cfg
+api_sync
+cp "$FIX/hs-staged.json" "$SB/state/staged.json"
+r0=$(restarts)
+out=$(runsub apply 2>/dev/null); rc=$?
+ok_eq "hot-swap(off): stdout" "ok" "$out"
+ok_eq "hot-swap(off): rc" 0 "$rc"
+ok_eq "hot-swap(off): restart invoked once" "$((r0 + 1))" "$(restarts)"
+ok_eq "hot-swap(off): last-apply mode/reason" "restart " "$(la_get '@.mode') $(la_get '@.reason')"
 
 echo "== mutation lock: a held flock blocks a second writer (NOWAIT fails at once)"
 if [ "$FLOCK_STUB" = 1 ]; then

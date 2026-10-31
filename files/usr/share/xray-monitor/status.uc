@@ -34,6 +34,9 @@ uci.foreach('xray-monitor', 'subscription', function(s) {
 
 let cfg = load(cfg_path, {});
 let diff = load(diff_path, { added: [], removed: [], changed: [], total: 0 });
+// How the LAST apply hit the running xray (written by xray-sub's do_apply):
+// {"mode":"live"|"restart","reason":"",...,"fallback":0|1,"removed":N,"added":N,"ts":N}
+let last_apply = state_dir ? load(state_dir + '/last-apply.json', null) : null;
 let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
 let servers = [], obs = cfg.outbounds ?? [];
 for (let i = 0; i < length(obs); i++) {
@@ -53,10 +56,12 @@ printf('%J\n', {
 	cron: (g('cron') == '0') ? false : true,
 	cron_schedule: g('cron_schedule') ?? '0 * * * *',
 	auto_apply: (g('auto_apply') == '1') ? true : false,
+	hot_swap: (g('hot_swap') == '0') ? false : true,
 	user_agent: g('user_agent') ?? '',
 	last_fetch: int(lf) ?? 0,
 	status: (st && length(st)) ? st : 'never',
 	pending: (pending == '1') ? true : false,
 	diff: diff,
+	last_apply: last_apply,
 	servers: servers
 });

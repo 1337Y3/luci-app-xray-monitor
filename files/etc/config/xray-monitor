@@ -10,5 +10,9 @@ config xray-monitor 'sub'
 	# how many config.json.bak.* backups to keep (newest first; 0 = keep all;
 	# pinned backups never count and are never pruned)
 	option backup_keep '5'
+	# apply subscription outbound changes live via the xray API (rmo/ado) when
+	# they are hot-swappable - no xray restart; anything else still restarts
+	# (0 = always restart, the pre-F14 behavior)
+	option hot_swap '1'
 	# auto-enable the Xray Stats API in config.json on package install (1=yes)
 	option auto_enable_api '1'

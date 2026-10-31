@@ -143,6 +143,31 @@ check "enable-api: adds Handler+Routing, rest untouched" "$EXP/enable-api.json" 
 check "enable-api: all present -> unchanged" "$EXP/enable-api-unchanged.out" "$W/eapi-unchanged.out"
 check "enable-api: unchanged rewrite is byte-identical" "$EXP/enable-api.json" "$W/eapi-again.json"
 
+echo "== hotswap plan (F14: live rmo/ado vs restart-required)"
+# plan <installed> <candidate> [prefix ...]: membership/body-only changes of
+# the MANAGED outbounds are live; anything else (locals, other sections, a
+# default-outbound change) forces a restart. Same ignore list as diff.uc.
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-live.json" proxy -- > "$W/hs-live.json"
+check "hotswap: changed+added+removed, first tag re-added -> live" "$EXP/hs-plan-live.json" "$W/hs-live.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-churn.json" proxy -- > "$W/hs-churn.json"
+check "hotswap: ignored-path churn only -> nothing to do, live" "$EXP/hs-plan-churn.json" "$W/hs-churn.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-beyond.json" proxy -- > "$W/hs-beyond.json"
+check "hotswap: local outbound changed -> restart (beyond membership)" "$EXP/hs-plan-beyond.json" "$W/hs-beyond.json"
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-first.json" proxy -- > "$W/hs-first.json"
+check "hotswap: first outbound dropped, next first not (re-)added -> restart" "$EXP/hs-plan-first.json" "$W/hs-first.json"
+# legacy mode (no prefixes): every tagged proxy outbound is managed
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-live.json" -- > "$W/hs-legacy.json"
+check "hotswap: legacy (no prefixes) same plan for this pair" "$EXP/hs-plan-legacy.json" "$W/hs-legacy.json"
+# adds: full bodies for `xray api ado`, in CANDIDATE order (not argument order
+# - the order decides which outbound claims the default handler)
+"$SHARE/hotswap.uc" adds "$FIX/hs-cand-live.json" proxy-de proxy-fi > "$W/hs-adds.json"
+check "hotswap: ado payload bodies in candidate order" "$EXP/hs-adds.json" "$W/hs-adds.json"
+if "$SHARE/hotswap.uc" adds "$FIX/hs-cand-live.json" no-such-tag >/dev/null 2>&1; then
+	echo "FAIL   hotswap: unknown add tag must be rejected"; fails=$((fails + 1))
+else
+	echo "PASS   hotswap: unknown add tag rejected"
+fi
+
 echo "== tmpxray config (F0: per-exit socks test instance)"
 "$SHARE/tmpxray.uc" "$FIX/config.json" "$W/tmpxray.json" proxy-fi 10801 proxy-ch 10802
 check "tmpxray: one socks inbound + pinned rule per tag" "$EXP/tmpxray.json" "$W/tmpxray.json"
