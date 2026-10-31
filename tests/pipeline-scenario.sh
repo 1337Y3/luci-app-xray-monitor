@@ -568,7 +568,11 @@ else
 	ok_eq "rpcd config_get: hash = md5 of the config bytes" \
 		"$(md5sum "$CFG" | awk '{ print $1 }')" "$(jget "$out" '@.hash')"
 	ok_eq "rpcd config_get: path" "$CFG" "$(jget "$out" '@.path')"
-	rpcinput "$SB/work/get-in.json" "$CFG"
+	# the backend hands the text to jshn through $(cat ...), which drops the
+	# file's trailing newline(s) - the editor sees exactly that string, so the
+	# round-trip expectation must be built from the same $(cat) form
+	printf '%s' "$(cat "$CFG")" > "$SB/work/cfg-as-loaded.json"
+	rpcinput "$SB/work/get-in.json" "$SB/work/cfg-as-loaded.json"
 	rpcconfig "$SB/work/get-in.json" "$SB/work/get-want.json"
 	printf '%s' "$out" > "$SB/work/get-out.json"
 	rpcconfig "$SB/work/get-out.json" "$SB/work/get-got.json"
