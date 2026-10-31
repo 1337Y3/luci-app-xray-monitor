@@ -476,7 +476,10 @@ verify_or_rollback() {
 		sleep 1
 	done
 	[ -f "$bak" ] && install_config "$bak"
-	/etc/init.d/xray restart >/dev/null 2>&1
+	# Close the mutation-lock fds for the child: anything the init script
+	# forks must not inherit fd 3/4 - a leaked flock would outlive this
+	# xray-sub run and block the next writer. Same at every init.d call.
+	/etc/init.d/xray restart >/dev/null 2>&1 3>&- 4>&-
 	return 1
 }
 
@@ -613,7 +616,7 @@ commit_config() {  # <kind> <need_api> <candidate> [no-restart]
 	cp -pL "$CFG" "$COMMIT_BAK"
 	install_config "$cand" || return 3
 	if [ "$mode" = "no-restart" ]; then return 0; fi
-	/etc/init.d/xray restart >/dev/null 2>&1
+	/etc/init.d/xray restart >/dev/null 2>&1 3>&- 4>&-
 	verify_or_rollback "$COMMIT_BAK" "$need_api" || return 2
 	post_restart_hooks
 	prune_backups
@@ -699,7 +702,7 @@ do_apply() {
 		# that xray comes back up - on the validated candidate - which still
 		# reconciles the running state with the installed config.
 		[ -n "$COMMIT_BAK" ] && [ -f "$COMMIT_BAK" ] && install_config "$COMMIT_BAK"
-		/etc/init.d/xray restart >/dev/null 2>&1
+		/etc/init.d/xray restart >/dev/null 2>&1 3>&- 4>&-
 		verify_or_rollback "$COMMIT_BAK" "$api_before" || true
 		echo "rolled-back" > "$STATE/status"
 		write_last_apply restart "hot-swap-failed" 1 0 0
@@ -729,7 +732,7 @@ do_cron_sync() {
 	sed -i '/xray-monitor\/xray-sub e2e/d' "$CRON" 2>/dev/null
 	[ "$cron" != "0" ] && echo "$cron_schedule /usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1" >> "$CRON"
 	[ "$e2e_cron" = "1" ] && echo "$e2e_schedule /usr/share/xray-monitor/xray-sub e2e >/dev/null 2>&1" >> "$CRON"
-	/etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart 2>/dev/null
+	/etc/init.d/cron enable 2>/dev/null 3>&- 4>&-; /etc/init.d/cron restart 2>/dev/null 3>&- 4>&-
 	echo ok
 }
 

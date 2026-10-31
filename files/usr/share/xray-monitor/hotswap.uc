@@ -132,7 +132,7 @@
 'use strict';
 import { readfile } from 'fs';
 import { owner_prefix } from 'render';
-import { canonsig } from 'jsondiff';
+import { canonsig, deep_copy } from 'jsondiff';
 
 let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
 
@@ -147,8 +147,10 @@ function prune(o, path) {  // same semantics as diff.uc
 }
 
 function body_of(o, ignores) {  // whole body minus tag minus ignored dot-paths
-	let c = {};
-	for (let k in o) if (k != 'tag') c[k] = o[k];
+	// deep copy - prune() below deletes NESTED keys, and a shallow copy would
+	// corrupt the parsed document the outbound was taken from
+	let c = deep_copy(o);
+	delete c.tag;
 	for (let i = 0; i < length(ignores); i++) prune(c, ignores[i]);
 	return canonsig(c);
 }

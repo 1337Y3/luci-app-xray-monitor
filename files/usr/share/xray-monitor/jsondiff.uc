@@ -2,6 +2,10 @@
 // jsondiff-cli.uc (paths_diff, which the rpcd config_diff method calls).
 //
 // Module API:
+//   deep_copy(v)     fully independent copy of a JSON value (objects/arrays
+//                    cloned recursively) - lets callers prune ignored dot-paths
+//                    out of a value without corrupting the parsed document it
+//                    came from
 //   canonsig(v)      canonical order-independent serialization (object keys
 //                    sorted, values recursive) - two values that differ only
 //                    in object key order serialize identically
@@ -35,6 +39,22 @@ function canonsig(v) {
 		return '[' + join(',', parts) + ']';
 	}
 	return sprintf('%J', v);
+}
+
+// Fully independent copy: every nested object/array is cloned, so mutating the
+// copy (prune below, in the importers) never touches the original document.
+function deep_copy(v) {
+	if (type(v) == 'object') {
+		let c = {};
+		for (let k in v) c[k] = deep_copy(v[k]);
+		return c;
+	}
+	if (type(v) == 'array') {
+		let a = [];
+		for (let i = 0; i < length(v); i++) push(a, deep_copy(v[i]));
+		return a;
+	}
+	return v;
 }
 
 // Depth-first walk of the two trees. canonsig equality at every level makes
@@ -72,4 +92,4 @@ function paths_diff(a, b) {
 	return res;
 }
 
-export { canonsig, paths_diff };
+export { canonsig, deep_copy, paths_diff };
