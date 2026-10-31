@@ -109,9 +109,11 @@ function config_outbound_tags(cfg) {
 	return out;
 }
 
-// Selector entries are prefixes: an outbound is a member when its tag equals a
-// selector or starts with `<selector>-` (the same ownership rule render.uc
-// applies to subscription prefixes).
+// Selector entries are plain string prefixes - xray's outbound Manager does a
+// raw strings.HasPrefix(tag, selector) (app/proxyman/outbound/outbound.go), so
+// "proxy-" covers proxy-fi/proxy-ch but not a literal "proxy" tag. NOT the
+// `<prefix> or <prefix>-*` ownership rule render.uc applies to subscription
+// prefixes (that one exists to keep two subscriptions' exits apart).
 function members(selector, outbound_tags) {
 	let out = [];
 	for (let i = 0; i < length(outbound_tags); i++) {
@@ -119,7 +121,7 @@ function members(selector, outbound_tags) {
 		for (let j = 0; j < length(selector); j++) {
 			let p = selector[j];
 			if (type(p) != 'string' || !length(p)) continue;
-			if (t == p || substr(t, 0, length(p) + 1) == p + '-') { push(out, t); break; }
+			if (substr(t, 0, length(p)) == p) { push(out, t); break; }
 		}
 	}
 	return out;
