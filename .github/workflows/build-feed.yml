@@ -17,28 +17,70 @@ on:
 permissions:
   contents: write
 
+# Tests run on TWO ucode builds: the exact one shipped by OpenWrt 23.05
+# (1a8a0bcf - the oldest interpreter the package supports; among other
+# things it drops a literal `--` from a script's ARGV, which is why diff.uc
+# and hotswap.uc take ignore paths as ignore=<path> arguments) and the
+# current ucode master. Everything else in the two legs is identical.
 jobs:
   tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ucode_ref: "1a8a0bcf725520820802ad433db22d8f64fbed6c"
+            ucode_label: "ucode 23.05 (1a8a0bcf)"
+          - ucode_ref: "HEAD"
+            ucode_label: "ucode current"
+    name: tests (${{ matrix.ucode_label }})
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libjson-c-dev
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libjson-c-dev busybox-static
 
       # ucode is only packaged by OpenWrt itself; build it from source with
       # every integration module (ubus/uci/uloop/ffi/...) disabled so plain
       # ubuntu runners can run the .uc helpers. Installing to /usr matches
-      # the #!/usr/bin/ucode shebangs of the scripts under test.
+      # the #!/usr/bin/ucode shebangs of the scripts under test. The 23.05
+      # leg shallow-fetches the exact pinned commit (no branch assumptions),
+      # the other leg tracks master.
       - name: Build ucode from source
         run: |
-          git clone --depth 1 https://github.com/ucode-lang/ucode /tmp/ucode
+          git init /tmp/ucode
+          git -C /tmp/ucode remote add origin https://github.com/ucode-lang/ucode
+          git -C /tmp/ucode fetch --depth 1 origin "${{ matrix.ucode_ref }}"
+          git -C /tmp/ucode checkout --detach FETCH_HEAD
+          git -C /tmp/ucode log --oneline -1
           cmake -S /tmp/ucode -B /tmp/ucode/build -DCMAKE_INSTALL_PREFIX=/usr \
             -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF -DULOOP_SUPPORT=OFF \
             -DFFI_SUPPORT=OFF -DRTNL_SUPPORT=OFF -DNL80211_SUPPORT=OFF
           cmake --build /tmp/ucode/build -j"$(nproc)"
           sudo cmake --install /tmp/ucode/build
-          ucode -e 'print("ucode ok\n")'
+          ucode -e 'print("ucode ok")'
+          # informational: does this build keep a literal `--` in ARGV?
+          # (23.05: dropped - the reason the ignore= argument form exists)
+          printf 'print(join("|", ARGV))' > /tmp/argv.uc
+          echo "ucode ARGV(a -- b) = $(ucode /tmp/argv.uc a -- b)"
+
+      # The pipeline scenario (and xray-sub itself) lean on the OpenWrt
+      # userspace: BusyBox ash as `sh`, jshn from libubox, and jsonfilter
+      # compiled from openwrt/jsonpath (its CMake only works in-source, so
+      # `cmake .` runs inside the checkout). /usr/local/bin precedes
+      # /usr/bin in the runner PATH, so every `sh ...` below - including
+      # the two test steps - resolves to busybox ash.
+      - name: BusyBox ash, jshn and jsonfilter
+        run: |
+          sudo ln -sf /usr/bin/busybox /usr/local/bin/sh
+          echo "sh under test: $(sh -c 'echo ash ok')"
+          busybox --list | grep -qx flock || { echo "busybox lacks flock"; exit 1; }
+          git clone --depth 1 https://github.com/openwrt/libubox /tmp/libubox
+          sudo install -D -m 0644 /tmp/libubox/jshn.sh /usr/share/libubox/jshn.sh
+          git clone --depth 1 https://github.com/openwrt/jsonpath /tmp/jsonpath
+          (cd /tmp/jsonpath && cmake -DCMAKE_BUILD_TYPE=Release . && make -j"$(nproc)")
+          sudo install -m 0755 /tmp/jsonpath/jsonfilter /usr/bin/jsonfilter
+          echo '{"a":["b","c"]}' | jsonfilter -e '@.a[0]'
 
       - name: Golden tests (parse/apply/diff/routing/balancers)
         run: sh tests/run.sh
@@ -51,6 +93,12 @@ jobs:
             https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
           mkdir /tmp/xray && unzip -q /tmp/xray.zip -d /tmp/xray
           XRAY=/tmp/xray/xray sh tests/run.sh
+
+      # Full pipeline scenario under BusyBox ash: fetch/apply/hot-swap/e2e/
+      # rpcd contracts against a sandboxed xray-sub copy - the same run the
+      # router gets in /tmp/t-*, here on a GNU coreutils userspace.
+      - name: Pipeline scenario under BusyBox ash
+        run: sh tests/pipeline-scenario.sh
 
   build:
     if: github.event_name != 'pull_request'
