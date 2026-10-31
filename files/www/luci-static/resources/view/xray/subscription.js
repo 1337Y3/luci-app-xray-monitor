@@ -57,7 +57,7 @@ function decodeTitle(t) {
 		}).join(''));
 	} catch (e) { return ''; }
 }
-function statusBadge(st) {
+function statusBadge(st, la) {
 	var m = ({ ok: ['#46a546', _('fetched OK')], applied: ['#46a546', _('applied')],
 		partial: ['#cc7a00', _('partial — some failed')], never: ['#888', _('never fetched')],
 		'no-subs': ['#888', _('no subscriptions')], 'fetch-error': ['#cc3300', _('fetch error')],
@@ -66,6 +66,11 @@ function statusBadge(st) {
 		'install-failed': ['#cc3300', _('config install failed')],
 		'fetched-apply-failed': ['#cc3300', _('fetched — apply failed, changes stay staged')],
 		'rolled-back': ['#cc3300', _('applied but rolled back — xray unhealthy')] })[st] || ['#888', st];
+	// "rolled-back" has two faces: the classic restart failed its health check
+	// (xray unhealthy) - or a live apply failed and was rolled back (xray runs
+	// the PREVIOUS config and is healthy; last-apply says which one it was).
+	if (st == 'rolled-back' && la && la.fallback)
+		m = ['#cc3300', _('live apply failed — restored the previous config')];
 	return E('span', { 'style': 'background:' + m[0] + ';color:#fff;padding:2px 8px;border-radius:3px;' }, m[1]);
 }
 function tagList(a, c) {
@@ -78,6 +83,7 @@ function tagList(a, c) {
 // fallback note when a live attempt failed and was rolled back.
 var APPLY_REASONS = {
 	'changes-beyond-outbounds': _('changes beyond outbound membership'),
+	'tag-charset': _('an outbound tag cannot be applied live (letters, digits, . _ - only)'),
 	'default-outbound': _('the default outbound would change'),
 	'api-unavailable': _('xray handler API not available'),
 	'running-state-mismatch': _('running outbounds differ from config.json'),
@@ -246,7 +252,7 @@ function redraw() {
 	});
 
 	var statusRows = [
-		row(_('Last fetch'), E('span', {}, [ document.createTextNode(fmtAgo(state.last_fetch) + '  '), statusBadge(state.status) ]))
+		row(_('Last fetch'), E('span', {}, [ document.createTextNode(fmtAgo(state.last_fetch) + '  '), statusBadge(state.status, state.last_apply) ]))
 	];
 	var laBadge = applyBadge(state.last_apply);
 	if (laBadge)

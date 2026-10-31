@@ -263,7 +263,9 @@ api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
 # Everything runs inside the mutation lock the apply command already holds;
 # every xray-api child here is waited for, so none outlives fd 3.
 # On ANY step failing, fall back to the documented recipe: restore the
-# pre-change snapshot ($COMMIT_BAK) + full restart + verify_or_rollback.
+# pre-change snapshot ($COMMIT_BAK) when it exists + full restart +
+# verify_or_rollback - the restart+verify ALWAYS run, even when the snapshot
+# itself is missing (see the fallback block in do_apply).
 # hot_swap (UCI xray-monitor.sub.hot_swap, default 1) turns the whole thing
 # off - then every apply restarts, exactly as before F14.
 hot_swap=$(uci -q get xray-monitor.sub.hot_swap); [ -n "$hot_swap" ] || hot_swap=1
@@ -283,9 +285,10 @@ tags_same_set() {  # <a> <b>
 # How the last apply was applied - status.uc hands it to the subscription tab:
 #   mode: "live" (xray api rmo/ado, no restart) | "restart" (classic pipeline)
 #   reason: "" | why a restart was chosen instead of the live path
-#           ("changes-beyond-outbounds", "default-outbound", "api-unavailable",
-#            "running-state-mismatch", "plan-unavailable"), or "hot-swap-failed"
-#            together with fallback=1 when a live attempt had to roll back
+#           ("changes-beyond-outbounds", "tag-charset", "default-outbound",
+#            "api-unavailable", "running-state-mismatch", "plan-unavailable"),
+#            or "hot-swap-failed" together with fallback=1 when a live
+#            attempt had to roll back
 write_last_apply() {  # <mode> <reason> <fallback 0|1> <removed> <added>
 	printf '{"mode":"%s","reason":"%s","fallback":%s,"removed":%s,"added":%s,"ts":%s}\n' \
 		"$1" "$2" "$3" "${4:-0}" "${5:-0}" "$(date +%s)" > "$STATE/last-apply.json"
@@ -313,8 +316,11 @@ hotswap_apply() {  # <plan-json> <candidate>
 			printf '{"tag":"%s"}' "$t" >> "$STAGE_DIR/rmo.json"
 		done
 		printf ']}' >> "$STAGE_DIR/rmo.json"
-		# rmo prints a line per tag; only its rc matters here
-		"$XRAY" api rmo --server="$APISRV" "$STAGE_DIR/rmo.json" >/dev/null 2>&1 || return 1
+		# rmo prints a line per tag; only its rc matters here. -t 10: the
+		# default 3 s deadline spans dialing AND the whole batch (one context
+		# per invocation) - too tight for a large batch on slow hardware, and
+		# a timeout there would push every apply into the fallback.
+		"$XRAY" api rmo -t 10 --server="$APISRV" "$STAGE_DIR/rmo.json" >/dev/null 2>&1 || return 1
 	fi
 
 	# Adds in the plan's (candidate) order, bodies lifted verbatim from the
@@ -322,7 +328,7 @@ hotswap_apply() {  # <plan-json> <candidate>
 	# side of ado cannot choke on an unknown field.
 	if [ -n "$add_tags" ]; then
 		"$SHARE/hotswap.uc" adds "$cand" $add_tags > "$STAGE_DIR/ado.json" 2>/dev/null || return 1
-		"$XRAY" api ado --server="$APISRV" "$STAGE_DIR/ado.json" >/dev/null 2>&1 || return 1
+		"$XRAY" api ado -t 10 --server="$APISRV" "$STAGE_DIR/ado.json" >/dev/null 2>&1 || return 1
 	fi
 
 	# Verify the RUNNING set now equals the candidate's (lso order is random,
@@ -522,11 +528,16 @@ do_apply() {
 		# live reconciliation failed at some step: the candidate is already
 		# installed but the running xray may be mid-mutation - the documented
 		# fallback restores the snapshot and takes the full restart path.
-		if [ -n "$COMMIT_BAK" ] && [ -f "$COMMIT_BAK" ]; then
-			install_config "$COMMIT_BAK"
-			/etc/init.d/xray restart >/dev/null 2>&1
-			verify_or_rollback "$COMMIT_BAK" "$api_before" || true
-		fi
+		# The restart + verify run UNCONDITIONALLY: if the snapshot itself is
+		# unusable (its cp failed, e.g. disk full -> $COMMIT_BAK missing),
+		# skipping them would end the apply with $CFG holding the candidate,
+		# the running xray mid-mutated and NO restart. verify_or_rollback
+		# tolerates a missing backup: with none to restore it only demands
+		# that xray comes back up - on the validated candidate - which still
+		# reconciles the running state with the installed config.
+		[ -n "$COMMIT_BAK" ] && [ -f "$COMMIT_BAK" ] && install_config "$COMMIT_BAK"
+		/etc/init.d/xray restart >/dev/null 2>&1
+		verify_or_rollback "$COMMIT_BAK" "$api_before" || true
 		echo "rolled-back" > "$STATE/status"
 		write_last_apply restart "hot-swap-failed" 1 0 0
 		echo "hot-swap failed - rolled back to the previous config and restarted xray"

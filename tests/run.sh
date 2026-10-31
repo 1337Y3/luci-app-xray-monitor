@@ -155,6 +155,12 @@ check "hotswap: ignored-path churn only -> nothing to do, live" "$EXP/hs-plan-ch
 check "hotswap: local outbound changed -> restart (beyond membership)" "$EXP/hs-plan-beyond.json" "$W/hs-beyond.json"
 "$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-first.json" proxy -- > "$W/hs-first.json"
 check "hotswap: first outbound dropped, next first not (re-)added -> restart" "$EXP/hs-plan-first.json" "$W/hs-first.json"
+# a managed tag the shell cannot transport safely (word splitting / the
+# hand-built rmo JSON) restarts instead - caught at PLAN time, never mid-flight
+"$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-badtag.json" proxy -- > "$W/hs-badtag.json"
+check "hotswap: exotic NEW managed tag -> restart (tag-charset)" "$EXP/hs-plan-badtag.json" "$W/hs-badtag.json"
+"$SHARE/hotswap.uc" plan "$FIX/hs-inst-badtag.json" "$FIX/hs-cand-live.json" proxy -- > "$W/hs-badtag2.json"
+check "hotswap: exotic tag in the INSTALLED config -> restart (tag-charset)" "$EXP/hs-plan-badtag2.json" "$W/hs-badtag2.json"
 # legacy mode (no prefixes): every tagged proxy outbound is managed
 "$SHARE/hotswap.uc" plan "$FIX/config.json" "$FIX/hs-cand-live.json" -- > "$W/hs-legacy.json"
 check "hotswap: legacy (no prefixes) same plan for this pair" "$EXP/hs-plan-legacy.json" "$W/hs-legacy.json"

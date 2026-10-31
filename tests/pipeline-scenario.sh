@@ -114,10 +114,16 @@ case "$1" in
 		;;
 	api)
 		sub="$2"; shift 2
+		# the non-flag args (values of `-t <s>`-style flags skipped too)
 		args=""
+		skipval=0
 		for a in "$@"; do
-			case "$a" in -*) continue ;; esac
-			args="$args $a"
+			if [ "$skipval" = 1 ]; then skipval=0; continue; fi
+			case "$a" in
+				-t|-timeout) skipval=1 ;;
+				-*) ;;
+				*) args="$args $a" ;;
+			esac
 		done
 		case "$sub" in
 			statsquery)
@@ -153,6 +159,8 @@ case "$1" in
 				;;
 			ado)
 				[ -f "${STUB_API_FAIL:-/nonexistent}" ] && exit 1
+				# rmo already applied - models a batch that fails mid-mutation
+				[ -f "${STUB_API_FAIL_ADO:-/nonexistent}" ] && exit 1
 				for f in $args; do
 					[ -f "$f" ] || exit 1
 					for t in $(jsonfilter -i "$f" -e '@.outbounds[*].tag' 2>/dev/null); do
@@ -216,6 +224,7 @@ export STUB_OPKG_LOG="$SB/log/opkg.log"
 export STUB_API_OB="$SB/api/ob.tags"
 export STUB_API_DOWN="$SB/flags/api-down"
 export STUB_API_FAIL="$SB/flags/api-fail"
+export STUB_API_FAIL_ADO="$SB/flags/api-fail-ado"
 mkdir -p "$SB/api"
 : > "$STUB_LOG"; : > "$STUB_HOOK_LOG"; : > "$STUB_INITD_LOG"; : > "$STUB_OPKG_LOG"; : > "$STUB_API_OB"
 
@@ -610,6 +619,77 @@ is "hot-swap(fallback): snapshot restored over the candidate" "$(same "$CFG" "$S
 ok_eq "hot-swap(fallback): status" "rolled-back" "$(cat "$SB/state/status" 2>/dev/null)"
 ok_eq "hot-swap(fallback): last-apply mode/reason/fallback" "restart hot-swap-failed 1" "$(la_get '@.mode') $(la_get '@.reason') $(la_get '@.fallback')"
 is "hot-swap(fallback): running set back to the restored config" "$(api_same_as_cfg && echo 1 || echo 0)"
+api_sync
+
+echo "== hot-swap: rmo applied but ado fails -> fallback from a MID-MUTATED running set"
+reset_cfg
+api_sync
+cp "$CFG" "$SB/work/pre-fb3.json"
+cp "$FIX/hs-staged.json" "$SB/state/staged.json"
+r0=$(restarts)
+touch "$STUB_API_FAIL_ADO"
+STUB_UCI_HOTSWAP=1; export STUB_UCI_HOTSWAP
+out=$(runsub apply 2>/dev/null); rc=$?
+unset STUB_UCI_HOTSWAP
+rm -f "$STUB_API_FAIL_ADO"
+ok_eq "hot-swap(ado-fail): stdout" "hot-swap failed - rolled back to the previous config and restarted xray" "$out"
+ok_eq "hot-swap(ado-fail): rc" 1 "$rc"
+ok_eq "hot-swap(ado-fail): restart invoked once (rollback)" "$((r0 + 1))" "$(restarts)"
+is "hot-swap(ado-fail): rmo HAD applied before ado failed (mid-mutation)" \
+	"$(grep -qx manual-vps "$STUB_API_OB" && ! grep -qx proxy-fi "$STUB_API_OB" && ! grep -qx proxy-ch "$STUB_API_OB" && echo 1 || echo 0)"
+is "hot-swap(ado-fail): snapshot restored over the candidate" "$(same "$CFG" "$SB/work/pre-fb3.json")"
+ok_eq "hot-swap(ado-fail): last-apply mode/reason/fallback" "restart hot-swap-failed 1" "$(la_get '@.mode') $(la_get '@.reason') $(la_get '@.fallback')"
+# the rollback restart reloaded the restored config: running set matches again
+api_sync
+is "hot-swap(ado-fail): running set equals the restored config" "$(api_same_as_cfg && echo 1 || echo 0)"
+
+echo "== hot-swap: fallback with an UNUSABLE snapshot still restarts + verifies"
+# the snapshot cp fails (disk full): $COMMIT_BAK is missing when the live apply
+# fails. The fallback must not skip the restart - verify_or_rollback runs with
+# a missing backup and only demands xray come back up (on the candidate).
+reset_cfg
+api_sync
+cp "$CFG" "$SB/work/pre-nosnap.json"
+cp "$FIX/hs-staged.json" "$SB/state/staged.json"
+r0=$(restarts)
+REALCP=$(command -v cp)
+cat > "$SB/bin/cp" <<EOF
+#!/bin/sh
+# cp shim: only the SNAPSHOT copy (cp -pL <cfg> <cfg>.bak.*) fails; every
+# other copy goes to the real cp.
+[ "\$1" = "-pL" ] && case "\$3" in *.bak.*) exit 1 ;; esac
+exec "$REALCP" "\$@"
+EOF
+chmod 0755 "$SB/bin/cp"
+touch "$STUB_API_FAIL"
+STUB_UCI_HOTSWAP=1; export STUB_UCI_HOTSWAP
+out=$(runsub apply 2>/dev/null); rc=$?
+unset STUB_UCI_HOTSWAP
+rm -f "$STUB_API_FAIL" "$SB/bin/cp"
+ok_eq "hot-swap(no-snapshot): stdout" "hot-swap failed - rolled back to the previous config and restarted xray" "$out"
+ok_eq "hot-swap(no-snapshot): rc" 1 "$rc"
+ok_eq "hot-swap(no-snapshot): restart NOT skipped with the snapshot missing" "$((r0 + 1))" "$(restarts)"
+is "hot-swap(no-snapshot): nothing to restore - the validated candidate stays installed" "$(differs "$CFG" "$SB/work/pre-nosnap.json")"
+is "hot-swap(no-snapshot): no snapshot file left behind" "$([ -z "$(ls "$CFG".bak.* 2>/dev/null)" ] && echo 1 || echo 0)"
+ok_eq "hot-swap(no-snapshot): status" "rolled-back" "$(cat "$SB/state/status" 2>/dev/null)"
+ok_eq "hot-swap(no-snapshot): last-apply mode/reason/fallback" "restart hot-swap-failed 1" "$(la_get '@.mode') $(la_get '@.reason') $(la_get '@.fallback')"
+api_sync
+
+echo "== hot-swap: managed tag the shell cannot transport -> restart, reason tag-charset"
+# staged proxy-de/vps is a legal xray tag and (legacy mode) managed, but the
+# shell moves tags through unquoted lists and a hand-built rmo JSON - the plan
+# must refuse the LIVE path before anything runs (never mid-flight).
+reset_cfg
+api_sync
+cp "$FIX/hs-staged-badtag.json" "$SB/state/staged.json"
+r0=$(restarts)
+STUB_UCI_HOTSWAP=1; export STUB_UCI_HOTSWAP
+out=$(runsub apply 2>/dev/null); rc=$?
+unset STUB_UCI_HOTSWAP
+ok_eq "hot-swap(tag-charset): stdout ok (restart path)" "ok" "$out"
+ok_eq "hot-swap(tag-charset): rc" 0 "$rc"
+ok_eq "hot-swap(tag-charset): restart invoked once" "$((r0 + 1))" "$(restarts)"
+ok_eq "hot-swap(tag-charset): last-apply mode/reason" "restart tag-charset" "$(la_get '@.mode') $(la_get '@.reason')"
 api_sync
 
 echo "== hot-swap off (UCI hot_swap=0): every apply restarts, pre-F14 behavior"

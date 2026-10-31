@@ -89,6 +89,15 @@
 //   B (beyond) the candidate and the installed config must be identical once
 //     the managed outbounds are removed from both (all other sections + the
 //     local outbounds, order included). Otherwise: restart.
+//   T (tag charset) every tag in remove/add must match [A-Za-z0-9._-] (the
+//     same set the shell side builds its rmo JSON with and do_tmpxray_start
+//     pins test inbounds to). A tag with a space, quote or slash is a legal
+//     xray tag and still managed by the prefix rule, but the shell hands tags
+//     around unquoted (word splitting) - it would decompose into individually
+//     legal fragments, rmo would no-op, the set verify would fail, and the
+//     fallback would restore a config carrying the same bad tag: an
+//     apply-fails-forever loop while hot_swap=1. Detected HERE, at plan time,
+//     so such a change simply restarts (reason "tag-charset").
 //   D (default outbound) the running default handler is the first outbound of
 //     the config xray started with (= the installed config.json); a restart
 //     with the candidate would make the candidate's first outbound the
@@ -104,10 +113,14 @@
 //   hotswap.uc plan <installed.json> <candidate.json> [prefix ...] [-- dot.path ...]
 //     -> {"remove":[tag...],"add":[tag...],"changed":[tag...],
 //         "first_old":"t","first_new":"t",
-//         "restart_required":null|"changes-beyond-outbounds"|"default-outbound",
+//         "restart_required":null|"changes-beyond-outbounds"|"tag-charset"|"default-outbound",
 //         "hot_swap":true|false}
 //     remove is installed-order, add is candidate-order; restart_required is
 //     null exactly when the change is live-applicable (hot_swap true).
+//     NOTE: the first two argv are <installed> <candidate> - deliberately the
+//     reverse of the sibling diff.uc (<staged> <config>): diff shows the staged
+//     groups against the installed config, while plan must lead with the OLD
+//     installed config because that is what the RUNNING xray was started from.
 //   hotswap.uc adds <candidate.json> <tag> ...
 //     -> {"outbounds":[...]} with the full bodies of the given tags, in
 //     CANDIDATE order (not argument order) - the file for `xray api ado`.
@@ -184,6 +197,13 @@ function plan(installed, candidate, prefixes, ignores) {
 		if (!managed(new_obs[i])) push(rest_new['x-local-outbounds'], new_obs[i]);
 	let beyond = (canonsig(rest_old) != canonsig(rest_new));
 
+	// T: any tag that would travel through rmo/ado must survive the shell's
+	// unquoted word splitting AND the hand-built rmo JSON (rule T above).
+	function legal_tag(t) { return !!(match(t, /^[A-Za-z0-9._-]+$/)); }
+	let charset_ok = true;
+	for (let i = 0; i < length(remove); i++) if (!legal_tag(remove[i])) charset_ok = false;
+	for (let i = 0; i < length(add); i++) if (!legal_tag(add[i])) charset_ok = false;
+
 	// D: keep the running default outbound equal to the candidate's first.
 	let fo = length(old_obs) ? (old_obs[0].tag ?? '') : '';
 	let fn = length(new_obs) ? (new_obs[0].tag ?? '') : '';
@@ -193,6 +213,7 @@ function plan(installed, candidate, prefixes, ignores) {
 
 	let reason = null;
 	if (beyond) reason = 'changes-beyond-outbounds';
+	else if (!charset_ok) reason = 'tag-charset';
 	else if (exists(rm_set, fo)) { if (!exists(ad_set, fn)) reason = 'default-outbound'; }
 	else if (fo != fn) reason = 'default-outbound';
 

@@ -2,6 +2,10 @@
 // Diff staged (grouped) proxy outbounds against the proxies currently in config.json.
 // argv: <staged-groups.json> <config.json> [prefix ...] [-- dot.path ...]
 //   ->  { added, removed, changed, total }
+// NOTE: <staged> comes FIRST here, while the sibling hotswap.uc plan takes
+// <installed> <candidate> - the first two argv are swapped between the two
+// tools (this one diffs the staged groups against the installed config; the
+// hot-swap plan must lead with the OLD config, i.e. what xray runs).
 // With prefixes, only outbounds tagged <prefix> or <prefix>-* (the subscriptions'
 // own exits) are managed; proxy outbounds added by hand are left alone. Without
 // prefixes every proxy outbound is managed (legacy behavior).
