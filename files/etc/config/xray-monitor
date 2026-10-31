@@ -16,6 +16,16 @@ config xray-monitor 'sub'
 	option hot_swap '1'
 	# auto-enable the Xray Stats API in config.json on package install (1=yes)
 	option auto_enable_api '1'
+	# end-to-end exit check: scheduled runs are OFF by default (each run pulls
+	# a real body through every exit); e2e_schedule is its own cron expression
+	option e2e_cron '0'
+	option e2e_schedule '30 4 * * *'
+	# small always-fast URL for TTFB, and the body URL for the throughput /
+	# freeze check (%d is replaced with e2e_bytes, which makes the expected
+	# size exact; a fixed-size URL is judged by "transfer finished" instead)
+	option e2e_url_204 'https://cp.cloudflare.com/generate_204'
+	option e2e_url_bytes 'https://speed.cloudflare.com/__down?bytes=%d'
+	option e2e_bytes '1048576'
 
 # Sticky balancer overrides, managed from the Balancers tab (no defaults
 # shipped - sections appear when the user pins a balancer). One section per

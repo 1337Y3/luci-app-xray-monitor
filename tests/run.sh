@@ -1,7 +1,7 @@
 #!/bin/sh
 # Golden-output tests for the ucode helpers: parse / snapshot / diff / apply /
-# routing / balancers / balance (status.uc imports uci and is deliberately not
-# covered).
+# routing / balancers / balance / tmpxray / e2e (status.uc imports uci and is
+# deliberately not covered).
 # Runs wherever a POSIX sh and ucode exist - the CI job (ucode built from
 # source) or a router directly (BusyBox ash):
 #   sh tests/run.sh                    compare against tests/expected/
@@ -209,6 +209,56 @@ if "$SHARE/tmpxray.uc" "$FIX/config.json" "$W/tmpxray-bad.json" no-such-tag 1080
 else
 	echo "PASS   tmpxray: unknown tag rejected"
 fi
+
+echo "== e2e verdicts (F13: ok/stalled/fail from curl outcomes)"
+E="$SHARE/e2e.uc"
+"$E" verdict '{"rc":0,"http":204,"ttfb_ms":342}' '{"rc":0,"http":200,"bytes":1048576,"expected":1048576,"speed_bps":262144}' > "$W/e2e-ok.json"
+check "e2e verdict: ok (204 fast + full body)" "$EXP/e2e-ok.json" "$W/e2e-ok.json"
+"$E" verdict '{"rc":0,"http":204,"ttfb_ms":905}' '{"rc":28,"http":200,"bytes":18432,"expected":1048576,"speed_bps":409}' > "$W/e2e-stall-timeout.json"
+check "e2e verdict: stalled (timeout with bytes frozen)" "$EXP/e2e-stall-timeout.json" "$W/e2e-stall-timeout.json"
+"$E" verdict '{"rc":0,"http":204,"ttfb_ms":410}' '{"rc":0,"http":200,"bytes":524288,"expected":1048576,"speed_bps":16384}' > "$W/e2e-stall-short.json"
+check "e2e verdict: stalled (short read)" "$EXP/e2e-stall-short.json" "$W/e2e-stall-short.json"
+"$E" verdict '{"rc":7,"http":0,"ttfb_ms":0}' '{"rc":7,"http":0,"bytes":0,"expected":1048576,"speed_bps":0}' > "$W/e2e-fail-connect.json"
+check "e2e verdict: fail (connect/proxy error)" "$EXP/e2e-fail-connect.json" "$W/e2e-fail-connect.json"
+"$E" verdict '{"rc":0,"http":204,"ttfb_ms":512}' '{"rc":0,"http":404,"bytes":315,"expected":1048576,"speed_bps":1050}' > "$W/e2e-fail-http.json"
+check "e2e verdict: fail (HTTP error status)" "$EXP/e2e-fail-http.json" "$W/e2e-fail-http.json"
+"$E" verdict '{"rc":0,"http":204,"ttfb_ms":220}' '{"rc":0,"http":200,"bytes":0,"expected":1048576,"speed_bps":0}' > "$W/e2e-fail-empty.json"
+check "e2e verdict: fail (zero body bytes)" "$EXP/e2e-fail-empty.json" "$W/e2e-fail-empty.json"
+"$E" verdict '{"rc":28,"http":0,"ttfb_ms":0}' '{"rc":0,"http":200,"bytes":1048576,"expected":1048576,"speed_bps":262144}' > "$W/e2e-ok-nottfb.json"
+check "e2e verdict: ok although the 204 probe timed out" "$EXP/e2e-ok-nottfb.json" "$W/e2e-ok-nottfb.json"
+"$E" verdict '{"rc":0,"http":204,"ttfb_ms":128}' '{"rc":0,"http":200,"bytes":999,"expected":0,"speed_bps":333}' > "$W/e2e-ok-fixed.json"
+check "e2e verdict: ok with expected=0 (fixed-size URL)" "$EXP/e2e-ok-fixed.json" "$W/e2e-ok-fixed.json"
+"$E" skipped > "$W/e2e-skipped.json"
+check "e2e skipped record (probe_disabled)" "$EXP/e2e-skipped.json" "$W/e2e-skipped.json"
+if "$E" verdict '{"rc":0}' >/dev/null 2>&1; then
+	echo "FAIL   e2e verdict: bad usage must exit non-zero"; fails=$((fails + 1))
+else
+	echo "PASS   e2e verdict: bad usage rejected"
+fi
+
+echo "== e2e tag discovery (probeable exits only)"
+"$E" tags "$FIX/config.json" > "$W/e2e-tags.json"
+check "e2e tags: vnext/servers exits listed, direct/block excluded" "$EXP/e2e-tags.json" "$W/e2e-tags.json"
+"$E" tags "$FIX/e2e-config.json" > "$W/e2e-tags2.json"
+check "e2e tags: e2e fixture exits, freedom excluded" "$EXP/e2e-tags2.json" "$W/e2e-tags2.json"
+
+echo "== e2e.json merge / status / summary (contract B3)"
+# merge is the file writer: it prints the whole file, the caller moves it into
+# place. Records carry an explicit ts so the goldens are deterministic.
+"$E" merge "$W/e2e.json" 1700000000 proxy-a '{"status":"ok","ttfb_ms":342,"bytes":1048576,"speed_bps":262144,"ts":1700000005}' > "$W/e2e-m1.json"
+check "e2e merge: fresh file" "$EXP/e2e-merge1.json" "$W/e2e-m1.json"
+cp "$W/e2e-m1.json" "$W/e2e.json"
+"$E" merge "$W/e2e.json" 1700000000 proxy-b '{"status":"skipped","ttfb_ms":0,"bytes":0,"speed_bps":0,"ts":1700000001}' > "$W/e2e-m2.json"
+cp "$W/e2e-m2.json" "$W/e2e.json"
+"$E" merge "$W/e2e.json" 1700000000 proxy-a '{"status":"stalled","ttfb_ms":905,"bytes":18432,"speed_bps":409,"ts":1700000099}' > "$W/e2e-m3.json"
+check "e2e merge: tag added, earlier tag overwritten in place" "$EXP/e2e-merge.json" "$W/e2e-m3.json"
+cp "$W/e2e-m3.json" "$W/e2e.json"
+"$E" status "$W/e2e.json" 1 > "$W/e2e-status.json"
+check "e2e status: file content + running flag" "$EXP/e2e-status.json" "$W/e2e-status.json"
+"$E" status "$W/e2e-nosuchfile.json" 0 > "$W/e2e-status0.json"
+check "e2e status: missing file -> idle, empty results" "$EXP/e2e-status0.json" "$W/e2e-status0.json"
+"$E" summary "$W/e2e.json" > "$W/e2e-summary.txt"
+check "e2e summary: per-exit lines + count line" "$EXP/e2e-summary.txt" "$W/e2e-summary.txt"
 
 echo
 if [ "$fails" -eq 0 ] && [ "$xrayfails" -eq 0 ]; then

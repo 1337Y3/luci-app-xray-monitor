@@ -6,6 +6,7 @@
 #         | config-save <f> | enable-api
 #         | overrides-list | overrides-apply   (sticky balancer pins, live bo)
 #         | tmpxray start <tag>... | tmpxray stop   (short-lived per-exit test xray)
+#         | e2e [tag...]   (end-to-end exit check: pull a body through each exit)
 #         | backups-list | backups-get <name> | backups-delete <name>
 #         | backups-pin <name> <0|1> | backups-restore <name>
 # `apply` reconciles subscription-outbound-only changes live via `xray api
@@ -100,6 +101,23 @@ ua_default=$(uci -q get xray-monitor.sub.user_agent); [ -n "$ua_default" ] || ua
 cron=$(uci -q get xray-monitor.sub.cron); [ -n "$cron" ] || cron=1
 cron_schedule=$(uci -q get xray-monitor.sub.cron_schedule); [ -n "$cron_schedule" ] || cron_schedule="0 * * * *"
 auto_apply=$(uci -q get xray-monitor.sub.auto_apply); [ -n "$auto_apply" ] || auto_apply=0
+
+# --- e2e exit check options (contract B5 / F13) ------------------------------
+# e2e_cron/e2e_schedule drive the crontab line (do_cron_sync); the check is OFF
+# by default - it moves real traffic through every exit. URL defaults: a tiny
+# always-fast 204 endpoint for TTFB and a size-parameterized body URL (%d is
+# replaced with e2e_bytes, which makes the expected size exact; a fixed-size
+# custom URL without %d is instead judged by "transfer finished"). A malformed
+# value falls back to its default, so a stray UCI edit can never wedge cron.
+e2e_cron=$(uci -q get xray-monitor.sub.e2e_cron); [ -n "$e2e_cron" ] || e2e_cron=0
+e2e_schedule=$(uci -q get xray-monitor.sub.e2e_schedule); [ -n "$e2e_schedule" ] || e2e_schedule="30 4 * * *"
+e2e_url_204=$(uci -q get xray-monitor.sub.e2e_url_204)
+case "$e2e_url_204" in https://*|http://*) ;; *) e2e_url_204="https://cp.cloudflare.com/generate_204" ;; esac
+e2e_url_bytes=$(uci -q get xray-monitor.sub.e2e_url_bytes)
+case "$e2e_url_bytes" in https://*|http://*) ;; *) e2e_url_bytes="https://speed.cloudflare.com/__down?bytes=%d" ;; esac
+e2e_bytes=$(uci -q get xray-monitor.sub.e2e_bytes)
+case "$e2e_bytes" in ''|*[!0-9]*) e2e_bytes=1048576 ;; esac
+[ "$e2e_bytes" -ge 1024 ] && [ "$e2e_bytes" -le 104857600 ] || e2e_bytes=1048576
 
 fetch_url() {  # <url> <user-agent> [header-dump-file]
 	local hdr="${3:-/dev/null}"
@@ -639,11 +657,16 @@ do_apply() {
 }
 
 # cron-sync likewise: set-cfg calls it in-process instead of `"$0" cron-sync`.
+# Manages both crontab lines: the subscription fetch (sub.cron/cron_schedule)
+# and the e2e exit check (sub.e2e_cron/e2e_schedule, default off - it moves
+# real traffic through every exit, so it wants its own, calmer schedule).
 do_cron_sync() {
 	CRON=/etc/crontabs/root
 	mkdir -p /etc/crontabs; touch "$CRON"
 	sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
+	sed -i '/xray-monitor\/xray-sub e2e/d' "$CRON" 2>/dev/null
 	[ "$cron" != "0" ] && echo "$cron_schedule /usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1" >> "$CRON"
+	[ "$e2e_cron" = "1" ] && echo "$e2e_schedule /usr/share/xray-monitor/xray-sub e2e >/dev/null 2>&1" >> "$CRON"
 	/etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart 2>/dev/null
 	echo ok
 }
@@ -833,6 +856,244 @@ do_tmpxray_stop() {
 	tmpxray_take_lock || { echo "another tmpxray operation is running"; return 1; }
 	theld=1
 	tmpxray_kill
+	return 0
+}
+
+# --- e2e: does traffic actually FLOW through each exit? (F13, B3) ------------
+# The TCP probe reaches an exit's endpoint while TSPU-style DPI freezes the
+# stream after the first ~16-20 KB: "reachable" but useless. This check pulls
+# real bodies through every exit and watches whether they complete:
+#   1. ONE tmpxray instance (contract B2) carries all checked exits - a socks
+#      inbound per tag on 127.0.0.1. Its TTL is sized for the whole run; the
+#      TTL watchdog remains the backstop if this script is killed.
+#   2. Per exit, with at most 3 curls in flight overall (batch pool - no
+#      unbounded xargs -P tricks on busybox ash) and the SAME user agent as
+#      the subscription fetch:
+#        - a 204 URL -> TTFB (curl %{time_starttransfer})
+#        - a body URL -> %{size_download} / %{speed_download}; a freeze shows
+#          up as bytes arriving then curl timing out short of the expected size
+#   3. Verdicts (e2e.uc) land in $TSTATE_DIR/e2e.json incrementally - skipped
+#      exits first, then one merge per finished batch - so a polling UI sees
+#      progress. $TSTATE_DIR/e2e.run holds the runner's pid while it is live.
+# The command never takes the config LOCK: it only reads the live config (via
+# tmpxray.uc, at start) and writes its own state under /tmp.
+E2E_JSON="$TSTATE_DIR/e2e.json"
+E2E_RUN="$TSTATE_DIR/e2e.run"
+E2E_WFMT='%{http_code}|%{time_starttransfer}|%{time_total}|%{size_download}|%{speed_download}'
+E2E_WORK=""
+E2E_RUNTS=0
+e2e_tx=0   # 1 once this run started a tmpxray instance (e2e_fini must stop it)
+
+# Tags the user turned off from active probing - the same list the rpcd probe
+# honors. Matched with surrounding spaces so substrings don't hit. An exit in
+# this list is NEVER dialled by e2e either: it gets a "skipped" verdict and no
+# port on the tmpxray instance at all.
+e2e_disabled_list() {
+	printf ' %s ' "$(uci -q get xray-monitor.sub.probe_disabled 2>/dev/null)"
+}
+
+e2e_num() {  # numeric-or-0 (curl counters are strings; junk maps to 0)
+	case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac
+}
+
+# Body URL with the size substituted; whether the expected byte count is exact
+# (%d placeholder -> yes, fixed-size custom URL -> no) drives the verdict's
+# "completed" test.
+e2e_body_url() {
+	case "$e2e_url_bytes" in
+		*%d*) echo "$e2e_url_bytes" | sed "s/%d/$(e2e_num "$e2e_bytes")/g" ;;
+		*)    echo "$e2e_url_bytes" ;;
+	esac
+}
+e2e_body_expected() {
+	case "$e2e_url_bytes" in *%d*) e2e_num "$e2e_bytes" ;; *) echo 0 ;; esac
+}
+
+# Body fetch budget: 45 s per started MiB, clamped to [45, 300] - a usable exit
+# moves 1 MiB in a few seconds, while a DPI trickle needs minutes and is
+# exactly what the timeout must cut off.
+e2e_body_maxtime() {
+	local t=$(( 45 * e2e_bytes / 1048576 ))
+	[ "$t" -lt 45 ] && t=45
+	[ "$t" -gt 300 ] && t=300
+	echo "$t"
+}
+
+# Merge one finished record into e2e.json (atomic: .new + mv).
+e2e_merge() {  # <tag> <record-json>
+	"$SHARE/e2e.uc" merge "$E2E_JSON" "$E2E_RUNTS" "$1" "$2" > "$E2E_JSON.new" 2>/dev/null \
+		&& mv "$E2E_JSON.new" "$E2E_JSON"
+}
+
+# One exit, as a background child of the batch pool: 204 fetch (TTFB) then the
+# body fetch through this exit's socks port, each bounded by --max-time so a
+# frozen stream cannot hang the run. Runs in a subshell: results go through
+# e2e.uc verdict into $E2E_WORK/<tag>.json, which the parent merges in order.
+e2e_check_one() {  # <tag> <port> <body-url> <expected> <body-maxtime>
+	trap - EXIT INT TERM HUP   # a pool child must not run the runner's EXIT trap
+	local tag="$1" port="$2" url_b="$3" expected="$4" bmax="$5"
+	local out rc f1 f2 f4 f5 r204 rbody rec
+	out=$(curl -sL -o /dev/null --max-time 10 --socks5-hostname "127.0.0.1:$port" \
+		-A "$ua_default" -w "$E2E_WFMT" "$e2e_url_204" 2>/dev/null); rc=$?
+	f1=$(printf '%s' "$out" | cut -d'|' -f1)
+	f2=$(printf '%s' "$out" | cut -d'|' -f2)
+	r204=$(printf '{"rc":%s,"http":%s,"ttfb_ms":%s}' \
+		"$(e2e_num "$rc")" "$(e2e_num "$f1")" \
+		"$(awk -v s="$(printf '%s' "$f2" | tr -d ' ')" 'BEGIN { printf "%d", (s + 0) * 1000 + 0.5 }')")
+	out=$(curl -sL -o /dev/null --max-time "$bmax" --socks5-hostname "127.0.0.1:$port" \
+		-A "$ua_default" -w "$E2E_WFMT" "$url_b" 2>/dev/null); rc=$?
+	f1=$(printf '%s' "$out" | cut -d'|' -f1)
+	f4=$(printf '%s' "$out" | cut -d'|' -f4)
+	f5=$(printf '%s' "$out" | cut -d'|' -f5)
+	rbody=$(printf '{"rc":%s,"http":%s,"bytes":%s,"expected":%s,"speed_bps":%s}' \
+		"$(e2e_num "$rc")" "$(e2e_num "$f1")" "$(e2e_num "$f4")" "$(e2e_num "$expected")" \
+		"$(awk -v s="$(printf '%s' "$f5" | tr -d ' ')" 'BEGIN { printf "%d", (s + 0) + 0.5 }')")
+	rec=$("$SHARE/e2e.uc" verdict "$r204" "$rbody" 2>/dev/null) \
+		|| rec='{"status":"fail","ttfb_ms":0,"bytes":0,"speed_bps":0}'
+	printf '%s\n' "$rec" > "$E2E_WORK/$tag.json"
+}
+
+# EXIT trap for the e2e command only (it replaces cleanup): stop the tmpxray
+# instance we started on EVERY path - success, failure, signal - then drop the
+# run marker and scratch dir, then the usual cleanup (locks/staging).
+e2e_fini() {
+	local rc=$?
+	[ "$e2e_tx" = 1 ] && { e2e_tx=0; do_tmpxray_stop >/dev/null 2>&1; }
+	rm -f "$E2E_RUN"
+	[ -n "$E2E_WORK" ] && rm -rf "$E2E_WORK"
+	E2E_WORK=""
+	cleanup
+	return 0
+}
+
+# The e2e command's body. Owns no config LOCK (read-only on $CFG). Explicit
+# tags narrow the check to those exits; without arguments every probeable exit
+# of the live config is checked.
+do_e2e() {  # [tag ...]
+	local tags_all tags_chk tag dlist known runts msg ports_json port
+	local nchk bttl burl bexp bmax batch i mtxrc wpids wp
+	if [ $# -gt 0 ]; then
+		for tag in "$@"; do
+			case "$tag" in *[!A-Za-z0-9._-]*) echo "invalid tag: $tag"; return 1 ;; esac
+		done
+		known=$("$SHARE/e2e.uc" tags "$CFG" 2>/dev/null)
+		for tag in "$@"; do
+			printf '%s\n' "$known" | grep -qx "$tag" || { echo "no such exit: $tag"; return 1; }
+		done
+		tags_all="$*"
+	else
+		tags_all=$("$SHARE/e2e.uc" tags "$CFG" 2>/dev/null)
+	fi
+	[ -n "$tags_all" ] || { echo "no exits to check"; return 0; }
+	[ -s "$CFG" ] || { echo "xray config not found at $CFG"; return 1; }
+
+	# probe_disabled exits are never dialled: they get a skipped verdict right
+	# away (visible to a polling UI before any connection is attempted)
+	dlist=$(e2e_disabled_list)
+	tags_chk=""
+	for tag in $tags_all; do
+		case "$dlist" in *" $tag "*) ;; *) tags_chk="$tags_chk $tag" ;; esac
+	done
+	tags_chk=${tags_chk# }
+
+	E2E_RUNTS=$(date +%s)
+	mkdir -p "$TSTATE_DIR"
+	printf '%s\n' "$$" > "$E2E_RUN"
+	E2E_WORK=$(mktemp -d "${TMPDIR:-/tmp}/e2e.XXXXXX") || { echo "mktemp failed"; return 1; }
+	printf '{"ts":%s,"results":{}}\n' "$E2E_RUNTS" > "$E2E_JSON.new" && mv "$E2E_JSON.new" "$E2E_JSON"
+	for tag in $tags_all; do
+		case "$dlist" in *" $tag "*)
+			e2e_merge "$tag" '{"status":"skipped","ttfb_ms":0,"bytes":0,"speed_bps":0}'
+			;; esac
+	done
+
+	if [ -z "$tags_chk" ]; then
+		echo "e2e: nothing to check (every exit is probe-disabled)"
+		"$SHARE/e2e.uc" summary "$E2E_JSON" 2>/dev/null
+		return 0
+	fi
+
+	# ONE tmpxray instance for all checked exits. The TTL covers the worst-case
+	# run length (ceil(n/3) batches x per-exit curl budget + slack) so the
+	# watchdog cannot kill it mid-run - and still reaps it if we crash.
+	set -- $tags_chk
+	nchk=$#
+	bmax=$(e2e_body_maxtime)
+	bttl=$(( (nchk + 2) / 3 * (10 + bmax) + 75 ))
+	[ "$bttl" -lt 120 ] && bttl=120
+	[ "$bttl" -gt 1800 ] && bttl=1800
+	XRAYMON_TMPXRAY_TTL=$bttl
+	export XRAYMON_TMPXRAY_TTL
+	msg=$(do_tmpxray_start $tags_chk)
+	mtxrc=$?
+	unset XRAYMON_TMPXRAY_TTL
+	if [ "$mtxrc" -ne 0 ]; then
+		echo "$msg" >&2
+		for tag in $tags_chk; do
+			e2e_merge "$tag" '{"status":"fail","ttfb_ms":0,"bytes":0,"speed_bps":0}'
+		done
+		return 1
+	fi
+	e2e_tx=1
+	# do_tmpxray_start leaves the mini-lock fd open (it cannot know the caller
+	# is about to run for minutes); release it so other tmpxray users are not
+	# blocked for the whole check. The instance itself closed fd 3/4 at spawn.
+	flock -u 4 2>/dev/null
+	exec 4>&-
+	theld=0
+
+	# tag -> port map from the start reply {"pid":N,"ports":{"<tag>":port}}
+	ports_json=${msg#*'"ports":{'}
+	ports_json=${ports_json%\}}
+	ports_json=${ports_json%\}}
+
+	# batch pool: 3 exits at a time, 2 sequential curls each -> at most 3
+	# concurrent curls. Children write per-exit records; the parent merges them
+	# into e2e.json in order after each batch (no concurrent file rewrites).
+	burl=$(e2e_body_url)
+	bexp=$(e2e_body_expected)
+	set -- $tags_chk
+	while [ $# -gt 0 ]; do
+		batch=""
+		i=0
+		while [ $# -gt 0 ] && [ "$i" -lt 3 ]; do
+			batch="$batch $1"
+			shift
+			i=$((i + 1))
+		done
+		wpids=""
+		for tag in $batch; do
+			port=$(printf '%s\n' "$ports_json" | tr ',' '\n' \
+				| sed -n "s/^[[:space:]]*\"$(printf '%s' "$tag" | sed 's/\./\\./g')\":[[:space:]]*//p" \
+				| tr -d '[:space:]')
+			port=$(e2e_num "$port")
+			if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+				e2e_check_one "$tag" "$port" "$burl" "$bexp" "$bmax" &
+				wpids="$wpids $!"
+			else
+				printf '%s\n' '{"status":"fail","ttfb_ms":0,"bytes":0,"speed_bps":0}' > "$E2E_WORK/$tag.json"
+			fi
+		done
+		# wait for THIS batch's pool children only: the tmpxray instance and its
+		# TTL watchdog are our children too, and a bare `wait` would sit out the
+		# whole TTL
+		for wp in $wpids; do wait "$wp"; done
+		for tag in $batch; do
+			if [ -s "$E2E_WORK/$tag.json" ]; then
+				e2e_merge "$tag" "$(cat "$E2E_WORK/$tag.json")"
+			else
+				e2e_merge "$tag" '{"status":"fail","ttfb_ms":0,"bytes":0,"speed_bps":0}'
+			fi
+		done
+	done
+
+	# stop the instance now (not only via the EXIT trap): polite to the box and
+	# frees the ports immediately; e2e_tx=0 keeps e2e_fini from double-stopping
+	do_tmpxray_stop >/dev/null 2>&1
+	e2e_tx=0
+
+	"$SHARE/e2e.uc" summary "$E2E_JSON" 2>/dev/null
+	echo "e2e: results in $E2E_JSON"
 	return 0
 }
 
@@ -1103,6 +1364,30 @@ case "$1" in
 		esac
 		;;
 
+	# End-to-end exit check (F13): runs synchronously (cron form). Tens of
+	# seconds for a handful of exits - the rpcd e2e_start method detaches it
+	# for the UI. Its own EXIT trap (e2e_fini) guarantees the tmpxray instance
+	# is stopped on every path; the run marker $E2E_RUN makes double starts
+	# fail fast.
+	e2e)
+		command -v ucode >/dev/null 2>&1 || { echo "ucode not installed"; exit 1; }
+		command -v curl >/dev/null 2>&1 || { echo "curl not installed"; exit 1; }
+		if [ -s "$E2E_RUN" ]; then
+			pid=$(cat "$E2E_RUN" 2>/dev/null)
+			if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+				&& tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "xray-sub.* e2e"; then
+				echo "an e2e check is already running (pid $pid)"
+				exit 1
+			fi
+			rm -f "$E2E_RUN"
+		fi
+		shift
+		trap e2e_fini EXIT
+		trap 'exit 1' INT TERM HUP
+		do_e2e "$@"
+		exit $?
+		;;
+
 	backups-list)
 		first=1
 		printf '{"backups":['
@@ -1173,5 +1458,5 @@ case "$1" in
 		;;
 
 	*)
-		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api|overrides-list|overrides-apply|tmpxray start <tag>...|tmpxray stop|backups-list|backups-get <name>|backups-delete <name>|backups-pin <name> <0|1>|backups-restore <name>"; exit 1 ;;
+		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api|overrides-list|overrides-apply|tmpxray start <tag>...|tmpxray stop|e2e [tag...]|backups-list|backups-get <name>|backups-delete <name>|backups-pin <name> <0|1>|backups-restore <name>"; exit 1 ;;
 esac

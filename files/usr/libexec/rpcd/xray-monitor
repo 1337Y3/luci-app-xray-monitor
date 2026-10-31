@@ -436,6 +436,26 @@ do_override_del() {
 	json_init; json_add_boolean ok 1; json_add_string msg "override removed from $bal"; json_dump
 }
 
+# --- e2e exit check (F13, contract B3) ---------------------------------------
+# e2e.json / e2e.run live next to the tmpxray state in /tmp (xray-sub owns the
+# files; this backend only reads them and kicks the detached run). The run
+# marker is a pid file whose process must still look like `xray-sub e2e` - a
+# reused pid must not read as "running" (same cmdline guard idea as
+# tmpxray_pid_ours in xray-sub).
+E2E_STATE=/tmp/xray-monitor
+e2e_pid_ours() {  # <pid>
+	tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "xray-sub.* e2e"
+}
+e2e_running() {
+	local pid
+	[ -s "$E2E_STATE/e2e.run" ] || return 1
+	pid=$(cat "$E2E_STATE/e2e.run" 2>/dev/null)
+	case "$pid" in ''|*[!0-9]*) rm -f "$E2E_STATE/e2e.run"; return 1 ;; esac
+	if e2e_pid_ours "$pid" && kill -0 "$pid" 2>/dev/null; then return 0; fi
+	rm -f "$E2E_STATE/e2e.run"
+	return 1
+}
+
 # Every xray-sub call from here serves a UI click: fail fast on a busy lock
 # instead of waiting out xray-sub's ~55 s poll inside the rpcd call (the HTTP
 # session may drop while the operation would still run afterwards). The cron
@@ -543,6 +563,8 @@ case "$1" in
 		json_add_object "backups_pin"; json_add_string "name" ""; json_add_string "pinned" ""; json_close_object
 		json_add_object "backups_restore"; json_add_string "name" ""; json_close_object
 		json_add_object "config_diff"; json_add_string "name" ""; json_close_object
+		json_add_object "e2e_start"; json_close_object
+		json_add_object "e2e_status"; json_close_object
 		json_dump
 	;;
 	call)
@@ -776,6 +798,43 @@ case "$1" in
 						|| { printf '{"added":[],"removed":[],"changed":[],"error":"diff failed"}'; }
 				else
 					printf '{"added":[],"removed":[],"changed":[],"error":"no such backup"}'
+				fi
+			;;
+			# Kick the end-to-end exit check in the background (F13): it takes
+			# tens of seconds (one tmpxray + 2 curls per exit) and must never
+			# run synchronously inside the ubus call. Detached exactly like
+			# update_apply: trap "" HUP survives the caller's death, and
+			# XRAYMON_NOWAIT is dropped so the run behaves like the cron one.
+			# Progress/results are polled via e2e_status (e2e.json + e2e.run).
+			# A run already in flight is reported, not restarted.
+			e2e_start)
+				if e2e_running; then
+					json_init
+					json_add_boolean ok 1
+					json_add_boolean running 1
+					json_add_string msg "An E2E check is already running"
+					json_dump
+				else
+					mkdir -p "$E2E_STATE"
+					sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; exec /usr/share/xray-monitor/xray-sub e2e' \
+						>"$E2E_STATE/e2e.log" 2>&1 </dev/null &
+					json_init
+					json_add_boolean ok 1
+					json_add_boolean running 1
+					json_add_string msg "E2E check started"
+					json_dump
+				fi
+			;;
+			# e2e.json (contract B3) plus the running flag (from e2e.run); the
+			# flag deliberately lives outside e2e.json so the file stays exactly
+			# the contract shape for F18.
+			e2e_status)
+				running=0; e2e_running && running=1
+				if command -v ucode >/dev/null 2>&1; then
+					"$SHARE/e2e.uc" status "$E2E_STATE/e2e.json" "$running" 2>/dev/null \
+						|| printf '{"running":%s,"ts":0,"results":{}}' "$running"
+				else
+					printf '{"running":%s,"ts":0,"results":{}}' "$running"
 				fi
 			;;
 			*)         printf '{}' ;;

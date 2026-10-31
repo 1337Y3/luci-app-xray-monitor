@@ -20,6 +20,12 @@
 # UCI), and the mutation lock itself: a held flock fails a NOWAIT writer at once and a
 # waiting writer succeeds after the holder lets go (only where flock(1) is
 # real - a stubbed flock serializes nothing).
+# F13 adds the e2e exit check: the real runner (tmpxray start via stubbed
+# xray/netstat + stubbed curl) producing ok / stalled / fail verdicts and a
+# skipped verdict for a probe_disabled exit that is never dialled, the run
+# marker + progress file while running, tmpxray stopped afterwards, and the
+# cron-sync line for the e2e schedule (needs ucode + ucode-mod-fs + jsonfilter
+# + busybox tools).
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -36,17 +42,30 @@ SB=${1:-}
 mkdir -p "$SB" 2>/dev/null && SB=$(cd "$SB" && pwd) || { echo "cannot use sandbox dir: $SB"; exit 1; }
 case "$SB" in *'|'*|*'&'*) echo "sandbox path must not contain | or &"; exit 1 ;; esac
 KEEP=${KEEP_SB:-0}
-cleanup() { [ "$KEEP" = 1 ] || rm -rf "$SB"; return 0; }
+cleanup() {
+	[ "$KEEP" = 1 ] || rm -rf "$SB"
+	# The pgrep stub hides tmpxray TTL watchdogs from xray-sub's stop sweep, so
+	# a leftover `sleep <ttl>` could outlive the sandbox. Reap them by cmdline
+	# via the busybox multicall (not shadowed by $SB/bin) where available.
+	if command -v busybox >/dev/null 2>&1; then
+		busybox pgrep -f "$SB/tmp/tmpxray\\." 2>/dev/null \
+			| while IFS= read -r p; do kill "$p" 2>/dev/null; done
+	fi
+	return 0
+}
 trap cleanup EXIT
 
 mkdir -p "$SB/bin" "$SB/etc/init.d" "$SB/etc/xray" "$SB/state" "$SB/lock" "$SB/log" \
-	"$SB/work" "$SB/tmp" "$SB/share" "$SB/flags" "$SB/tmp/xray-monitor"
+	"$SB/work" "$SB/tmp" "$SB/share" "$SB/flags" "$SB/tmp/xray-monitor" "$SB/curltab"
 cp -a "$SHARESRC" "$SB/share/xray-monitor"
 
 # The sandboxed copy: same code, every writable path pointed into the sandbox
 # (write pipeline, both locks, tmpxray state, cron-sync, self-update's
 # download). post_restart_hooks gets a logging body so the scenario can
 # observe it; everything else is byte-identical to the installed script.
+# The second xray-sub rule rewrites the ESCAPED form inside cron-sync's two
+# sed-delete patterns ("." swallows the backslash): the appended cron lines
+# carry the sandbox path, so the deletions must match that form too.
 sed \
 	-e "s|^SHARE=.*|SHARE=$SB/share/xray-monitor|" \
 	-e "s|^STATE=.*|STATE=$SB/state|" \
@@ -59,6 +78,7 @@ sed \
 	-e "s|/etc/init\.d/cron|$SB/etc/init.d/cron|g" \
 	-e "s|/etc/crontabs|$SB/etc/crontabs|g" \
 	-e "s|/usr/share/xray-monitor/xray-sub|$SB/sub|g" \
+	-e "s|xray-monitor./xray-sub|sub|g" \
 	-e "s|/tmp/luci-app-xray-monitor\.ipk|$SB/tmp/luci-app-xray-monitor.ipk|g" \
 	-e 's|^post_restart_hooks() {$|post_restart_hooks() { echo hook >> "${STUB_HOOK_LOG:-/dev/null}";|' \
 	"$SHARESRC/xray-sub" > "$SB/sub"
@@ -181,6 +201,11 @@ case "$1" in
 		esac
 		exit 0
 		;;
+	run)
+		# tmpxray instance: pretend to serve until signalled. The real one
+		# listens on the ports the netstat stub below claims.
+		while :; do sleep 10; done
+		;;
 esac
 exit 0
 EOF
@@ -197,12 +222,19 @@ cat > "$SB/bin/uci" <<'EOF'
 # pre-F14 assertions stay byte-stable and the hot-swap cases opt in via
 # $STUB_UCI_HOTSWAP; balancer_override sections come from $STUB_UCI_STATE (a
 # file in `uci show xray-monitor` format) so the F15 override cases can vary
-# them; every other query comes back empty (sub_prefixes empty = legacy "all
-# proxy outbounds are managed" mode).
+# them; probe_disabled names the exit the e2e cases expect to be skipped;
+# STUB_UCI_E2E_CRON flips e2e_cron on for the cron-sync case; every other
+# query comes back empty (sub_prefixes empty = legacy "all proxy outbounds
+# are managed" mode).
 state="${STUB_UCI_STATE:-/nonexistent}"
 case " $* " in
 	*" get xray-monitor.sub.backup_keep "*) echo 3; exit 0 ;;
 	*" get xray-monitor.sub.hot_swap "*) echo "${STUB_UCI_HOTSWAP:-0}"; exit 0 ;;
+	*" get xray-monitor.sub.probe_disabled "*) echo "e2e-skip"; exit 0 ;;
+	*" get xray-monitor.sub.e2e_cron "*)
+		[ -n "${STUB_UCI_E2E_CRON:-}" ] && { echo 1; exit 0; }
+		exit 1
+		;;
 	*" show xray-monitor "*)
 		[ -f "$state" ] && cat "$state"
 		exit 0
@@ -230,6 +262,69 @@ cat > "$SB/bin/opkg" <<'EOF'
 echo "opkg $*" >> "${STUB_OPKG_LOG:-/dev/null}"
 exit 0
 EOF
+cat > "$SB/bin/netstat" <<'EOF'
+#!/bin/sh
+# netstat stub: every port named by any sandboxed tmpxray config counts as
+# listening. Both tmpxray_pick_ports (avoid busy ports) and tmpxray_wait_ports
+# (wait for the bind) read this; the config exists before the instance is
+# spawned, so "listening" appears the moment xray (stub) starts.
+printf 'Active Internet connections (only servers)\n'
+printf 'Proto Recv-Q Send-Q Local Address           Foreign Address         State\n'
+for cfg in "${TMPDIR:-/tmp}"/tmpxray.*/config.json; do
+	[ -r "$cfg" ] || continue
+	for p in $(jsonfilter -i "$cfg" -e '@.inbounds[*].port' 2>/dev/null); do
+		printf 'tcp        0      0 127.0.0.1:%-20d 0.0.0.0:*               LISTEN\n' "$p"
+	done
+done
+exit 0
+EOF
+cat > "$SB/bin/curl" <<'EOF'
+#!/bin/sh
+# curl stub for the e2e cases: resolves the exit tag from the tmpxray state
+# file's port map, then answers from $STUB_CURL_DIR/<tag>.204 or <tag>.body:
+#   line 1: curl exit code (0 ok, 28 timeout mid-transfer, 7 connect fail, ...)
+#   line 2: the -w line "http|ttfb_s|total_s|size_download|speed_download"
+#   line 3: optional seconds to sleep first (simulates a slow/frozen exit)
+# An unknown tag gets a resolve failure, like a dead socks port. Every call is
+# logged ($STUB_CURL_LOG) so the scenario can prove a probe_disabled exit is
+# never dialled.
+LOG=${STUB_CURL_LOG:-/dev/null}
+DIR=${STUB_CURL_DIR:-/nonexistent}
+args="$*"
+port=$(printf '%s' "$args" | sed -n 's/.*--socks5-hostname 127\.0\.0\.1:\([0-9][0-9]*\).*/\1/p')
+url=$(printf '%s' "$args" | tr ' ' '\n' | grep -E '^https?://' | head -n 1)
+ua=$(printf '%s' "$args" | sed -n 's/.*-A \([^ ]*\).*/\1/p')
+kind=body
+case "$url" in *204*) kind=204 ;; esac
+tag=""
+if [ -n "$port" ] && [ -s "${STUB_TMPXRAY_STATE:-/nonexistent}" ]; then
+	# "ports" content of the tmpxray state: strip the prefix up to the object,
+	# then the outer closing brace, then everything from the ports' own brace
+	ports=$(cat "${STUB_TMPXRAY_STATE}" 2>/dev/null)
+	ports=${ports#*'"ports":{'}
+	ports=${ports%\}}
+	ports=${ports%%\}*}
+	for pair in $(printf '%s' "$ports" | tr ',' '\n'); do
+		if [ "$(printf '%s' "$pair" | cut -d':' -f2)" = "$port" ]; then
+			tag=$(printf '%s' "$pair" | cut -d'"' -f2)
+			break
+		fi
+	done
+fi
+echo "tag=$tag kind=$kind port=$port ua=$ua url=$url" >> "$LOG"
+f="$DIR/$tag.$kind"
+if [ -s "$f" ] && [ -n "$tag" ]; then
+	rc=$(sed -n '1p' "$f")
+	case "$rc" in ''|*[!0-9]*) rc=0 ;; esac
+	sl=$(sed -n '3p' "$f")
+	case "$sl" in ''|*[!0-9]*) sl=0 ;; esac
+	[ "$sl" -gt 0 ] && sleep "$sl"
+	sed -n '2p' "$f"
+	exit "$rc"
+fi
+echo "000|0.000|0.000|0|0"
+exit 6
+EOF
 cat > "$SB/etc/init.d/xray" <<'EOF'
 #!/bin/sh
 # init script stub: records what it was asked to do instead of restarting xray
@@ -238,6 +333,7 @@ exit 0
 EOF
 cp "$SB/etc/init.d/xray" "$SB/etc/init.d/cron"
 chmod 0755 "$SB/bin/xray" "$SB/bin/pgrep" "$SB/bin/uci" "$SB/bin/opkg" \
+	"$SB/bin/netstat" "$SB/bin/curl" \
 	"$SB/etc/init.d/xray" "$SB/etc/init.d/cron" "$SB/sub"
 touch "$SB/lock/xray-monitor"
 
@@ -256,6 +352,10 @@ export STUB_API_FAIL_ADO="$SB/flags/api-fail-ado"
 export STUB_API_LOG="$SB/log/api.log"
 export STUB_BO_FAIL="$SB/flags/bo-fail"
 export STUB_UCI_STATE="$SB/work/uci-state"
+# F13: curl stub table + log, tmpxray state file location
+export STUB_CURL_DIR="$SB/curltab"
+export STUB_CURL_LOG="$SB/log/curl.log"
+export STUB_TMPXRAY_STATE="$SB/tmp/xray-monitor/tmpxray.json"
 mkdir -p "$SB/api"
 : > "$STUB_LOG"; : > "$STUB_HOOK_LOG"; : > "$STUB_INITD_LOG"; : > "$STUB_OPKG_LOG"; : > "$STUB_API_OB"; : > "$STUB_API_LOG"
 rm -f "$STUB_BO_FAIL" "$STUB_UCI_STATE"
@@ -812,6 +912,114 @@ else
 	fast=0; [ $((t1 - t0)) -lt 3 ] && fast=1
 	is "lock(free): lock released by the previous writer" "$fast"
 fi
+
+echo "== e2e exit check (F13): verdicts through the real runner"
+# Fixture: e2e-ok (full body at speed), e2e-stall (18 KB arrive, then the
+# transfer times out - the DPI freeze signature), e2e-fail (connect refused),
+# e2e-skip (in probe_disabled: must never be dialled) and a freedom "direct"
+# outbound (not an exit: no port, no curl). e2e-ok's fetches sleep 3 s so the
+# runner is observably "running" and its progress file can be polled mid-run.
+rm -f "$CFG".bak.* "$CFG.new"
+cp "$FIX/e2e-config.json" "$CFG"
+printf '0\n204|0.342|0.351|0|0\n3\n'            > "$SB/curltab/e2e-ok.204"
+printf '0\n200|0.610|3.980|1048576|262144\n3\n' > "$SB/curltab/e2e-ok.body"
+printf '0\n204|0.905|0.918|0|0\n'               > "$SB/curltab/e2e-stall.204"
+printf '28\n200|1.120|45.000|18432|409\n'       > "$SB/curltab/e2e-stall.body"
+printf '7\n000|0.000|0.000|0|0\n'               > "$SB/curltab/e2e-fail.204"
+printf '7\n000|0.000|0.000|0|0\n'               > "$SB/curltab/e2e-fail.body"
+: > "$STUB_CURL_LOG"
+E2EJ="$SB/tmp/xray-monitor/e2e.json"
+E2ERUN="$SB/tmp/xray-monitor/e2e.run"
+rm -f "$E2EJ" "$E2EJ.new" "$E2ERUN" "$STUB_TMPXRAY_STATE"
+
+# field of one exit's line in the runner's summary output
+e2efield() {  # <tag> <column>
+	printf '%s\n' "$e2eout" | awk -v t="$1" -v c="$2" '$1 == t { print $c }'
+}
+
+runsub e2e > "$SB/work/e2e.out" 2>/dev/null &
+erun=$!
+# while it runs: the pid marker exists and the skipped verdict is already in
+# e2e.json (skipped exits are recorded before any connection is attempted)
+i=0; seen=0
+while [ "$i" -lt 10 ]; do
+	if [ -s "$E2ERUN" ]; then
+		seen=1
+		break
+	fi
+	sleep 1
+	i=$((i + 1))
+done
+is "e2e: run marker (e2e.run) appears while running" "$seen"
+if [ "$seen" = 1 ]; then
+	is "e2e: skipped verdict visible before any check ran" \
+		"$("$SB/share/xray-monitor/e2e.uc" summary "$E2EJ" 2>/dev/null | awk '$1 == "e2e-skip" && $2 == "skipped"' | grep -c .)"
+	is "e2e: progress file is the contract shape (ts + results)" \
+		"$(grep -Ec '^\{"ts":[0-9]+,"results":\{|^\{ "ts": [0-9]+, "results": \{' "$E2EJ" 2>/dev/null)"
+fi
+wait "$erun"; erc=$?
+e2eout=$(cat "$SB/work/e2e.out")
+ok_eq "e2e: rc" 0 "$erc"
+ok_eq "e2e: ok exit (full body at speed)" "ok" "$(e2efield e2e-ok 2)"
+ok_eq "e2e: ok exit TTFB (ms)" "342" "$(e2efield e2e-ok 3)"
+ok_eq "e2e: ok exit body bytes" "1048576" "$(e2efield e2e-ok 5)"
+ok_eq "e2e: ok exit speed (B/s)" "262144" "$(e2efield e2e-ok 7)"
+ok_eq "e2e: stalled exit (bytes froze mid-body)" "stalled" "$(e2efield e2e-stall 2)"
+ok_eq "e2e: stalled exit bytes received" "18432" "$(e2efield e2e-stall 5)"
+ok_eq "e2e: failed exit (connect error)" "fail" "$(e2efield e2e-fail 2)"
+ok_eq "e2e: probe-disabled exit" "skipped" "$(e2efield e2e-skip 2)"
+ok_eq "e2e: summary counts" "# ok=1 stalled=1 fail=1 skipped=1" \
+	"$(printf '%s\n' "$e2eout" | grep '^# ')"
+# e2e.json is one line: count OCCURRENCES (grep -c would cap every status at 1)
+e2ecount() {  # <status>
+	awk -v s="\"status\": \"$1\"" '{ n += gsub(s, "") } END { print n + 0 }' "$E2EJ" 2>/dev/null
+}
+ok_eq "e2e: e2e.json matches the summary (contract B3)" "1:1:1:1" \
+	"$(e2ecount stalled):$(e2ecount ok):$(e2ecount fail):$(e2ecount skipped)"
+ok_eq "e2e: exactly the checked exits dialled (3 exits x 2 URLs)" 6 "$(lines "$STUB_CURL_LOG")"
+ok_eq "e2e: every fetch used the subscription user agent" 6 \
+	"$(grep -c 'ua=v2rayNG/1.8.0 ' "$STUB_CURL_LOG")"
+is "e2e: probe-disabled exit never dialled" "$([ "$(grep -c 'tag=e2e-skip ' "$STUB_CURL_LOG")" = 0 ] && echo 1 || echo 0)"
+is "e2e: non-exit outbound (direct) never dialled" "$([ "$(grep -c 'tag=direct ' "$STUB_CURL_LOG")" = 0 ] && echo 1 || echo 0)"
+is "e2e: tmpxray instance stopped after the run" "$([ ! -e "$STUB_TMPXRAY_STATE" ] && echo 1 || echo 0)"
+is "e2e: run marker removed after the run" "$([ ! -e "$E2ERUN" ] && echo 1 || echo 0)"
+ok_eq "e2e: default 204 URL used (3 checked exits)" 3 \
+	"$(grep -c 'url=https://cp.cloudflare.com/generate_204' "$STUB_CURL_LOG")"
+
+echo "== e2e: bad tag argument + tmpxray start failure both fail closed"
+out=$(runsub e2e no-such-tag 2>/dev/null); rc=$?
+ok_eq "e2e(bad tag): rc" 1 "$rc"
+ok_eq "e2e(bad tag): stdout" "no such exit: no-such-tag" "$out"
+is "e2e(bad tag): no curl ran" "$([ "$(lines "$STUB_CURL_LOG")" = 6 ] && echo 1 || echo 0)"
+if [ "$FLOCK_STUB" = 1 ]; then
+	echo "NOTE   flock(1) is a no-op stub here - busy-tmpxray case skipped"
+else
+	: > "$STUB_CURL_LOG"
+	# hold the tmpxray mini-lock: start fails after its bounded poll, every
+	# checked exit gets a fail verdict, nothing is dialled, state is cleaned
+	( exec 4>>"$SB/lock/xray-monitor-tmpxray"; flock -n 4 || exit 1; sleep 14 ) &
+	tholder=$!
+	sleep 1
+	out=$(runsub e2e 2>/dev/null); rc=$?
+	wait "$tholder"
+	ok_eq "e2e(busy tmpxray): rc" 1 "$rc"
+	ok_eq "e2e(busy tmpxray): every checked exit recorded as fail" 3 "$(e2ecount fail)"
+	is "e2e(busy tmpxray): no connection attempted" "$([ "$(lines "$STUB_CURL_LOG")" = 0 ] && echo 1 || echo 0)"
+	is "e2e(busy tmpxray): run marker removed" "$([ ! -e "$E2ERUN" ] && echo 1 || echo 0)"
+fi
+
+echo "== cron-sync: fetch line always, e2e line only when enabled"
+runsub cron-sync >/dev/null 2>&1
+ok_eq "cron: fetch line present" 1 "$(grep -c "$SB/sub fetch" "$SB/etc/crontabs/root" 2>/dev/null)"
+ok_eq "cron: no e2e line while e2e_cron=0" 0 "$(grep -c "$SB/sub e2e" "$SB/etc/crontabs/root" 2>/dev/null)"
+STUB_UCI_E2E_CRON=1 runsub cron-sync >/dev/null 2>&1
+ok_eq "cron: e2e line when e2e_cron=1" 1 "$(grep -c "$SB/sub e2e" "$SB/etc/crontabs/root" 2>/dev/null)"
+is "cron: e2e line uses the (default) e2e_schedule" \
+	"$(grep -c '^30 4 \* \* \* '"$SB"'/sub e2e' "$SB/etc/crontabs/root" 2>/dev/null)"
+# and off again: the line is removed, the fetch line survives
+STUB_UCI_E2E_CRON= runsub cron-sync >/dev/null 2>&1
+ok_eq "cron: e2e line removed again" 0 "$(grep -c "$SB/sub e2e" "$SB/etc/crontabs/root" 2>/dev/null)"
+ok_eq "cron: fetch line still there" 1 "$(grep -c "$SB/sub fetch" "$SB/etc/crontabs/root" 2>/dev/null)"
 
 echo
 if [ "$fails" -eq 0 ]; then
