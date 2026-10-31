@@ -10,5 +10,15 @@ config xray-monitor 'sub'
 	# how many config.json.bak.* backups to keep (newest first; 0 = keep all;
 	# pinned backups never count and are never pruned)
 	option backup_keep '5'
+	# how subscription fetches reach the panel when the router itself cannot:
+	# direct (default) | proxy (always through a temporary xray socks instance)
+	# | auto (try direct, retry through xray on failure)
+	option fetch_via 'direct'
+	# same choice for self-update downloads only (0/direct = default; opkg
+	# install itself always stays local)
+	option fetch_via_update '0'
+	# which exit the proxy path uses: an outbound tag, or 'auto' = best ok exit
+	# from /tmp/xray-monitor/e2e.json, else the first outbound probing up
+	option fetch_via_exit 'auto'
 	# auto-enable the Xray Stats API in config.json on package install (1=yes)
 	option auto_enable_api '1'

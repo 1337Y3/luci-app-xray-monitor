@@ -34,6 +34,12 @@ uci.foreach('xray-monitor', 'subscription', function(s) {
 
 let cfg = load(cfg_path, {});
 let diff = load(diff_path, { added: [], removed: [], changed: [], total: 0 });
+// Which transport the last fetch / self-update actually used (F18): the exact
+// tokens xray-sub writes are "direct", "via <tag>" and "direct, retried via
+// <tag>"; an empty file / missing file = no fetch moved any bytes yet.
+function readtok(p) { let s = p ? readfile(p) : null; return s ? trim(s) : ''; }
+let fetch_path = state_dir ? readtok(state_dir + '/fetch_path') : '';
+let update_path = state_dir ? readtok(state_dir + '/update_path') : '';
 let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
 let servers = [], obs = cfg.outbounds ?? [];
 for (let i = 0; i < length(obs); i++) {
@@ -56,6 +62,8 @@ printf('%J\n', {
 	user_agent: g('user_agent') ?? '',
 	last_fetch: int(lf) ?? 0,
 	status: (st && length(st)) ? st : 'never',
+	fetch_path: fetch_path,
+	update_path: update_path,
 	pending: (pending == '1') ? true : false,
 	diff: diff,
 	servers: servers
