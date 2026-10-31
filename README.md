@@ -3,6 +3,27 @@
 A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 **Services → Xray Monitor**:
 
+> **1.22 — live hot-swap, balancer pins, E2E exit checks, config editor with
+> optimistic locking, fetch-through-proxy.** Subscription outbound changes now
+> apply **live via the xray API** (rmo/ado, no restart) whenever they are
+> hot-swappable — anything else still restarts, with an honest reason shown
+> (`changes beyond outbound membership`, `tag charset`, `default outbound`,
+> …) and a snapshot+rollback fallback. The Balancers tab shows the **live**
+> per-balancer pick and lets you **pin** a balancer to one outbound (applied
+> live via `bo`, persisted in UCI, re-applied after every restart). The
+> Overview gains an **E2E column**: a real body is pulled through every exit
+> (204 probe for TTFB + a size-exact download) and judged `ok / stalled /
+> fail / skipped` — a DPI freeze that kills transfers mid-body shows as
+> `stalled`, not "reachable". The Config editor now detects concurrent edits
+> (md5 optimistic lock: a stale save is refused with a reload hint instead of
+> overwriting) and always shows a semantic diff before saving. Fetches and
+> self-update downloads can go **through a proxy exit** (`fetch_via
+> proxy|auto`) for routers whose own path to the panel/GitHub is blocked —
+> the exit is picked from the freshest E2E results, and a configured proxy
+> path that cannot be established fails honestly, never silently falling back
+> to direct. Plus: timestamped `config.json` backups with pin/restore from
+> the UI, symlink-safe snapshots, and flock(2)-based mutation locking.
+>
 > **1.21 — subscriptions hardened.** Fixes the `xray -test` breakage on save
 > ("unsupported config file extension") — every temp config now lives as
 > `config.json` inside a private `mktemp -d` dir and is installed atomically.
@@ -47,6 +68,16 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
   can download + install the latest `.ipk` in place)
 - An **Enable Stats API** banner/button if the API isn't detected
 - Traffic refreshes every 5 s; connectivity every 30 s while Auto-refresh ping is on
+- An **E2E column** (end-to-end check): pulls a real body through every exit —
+  a tiny always-fast 204 URL for TTFB and a size-exact download for
+  throughput — and shows `ok / stalled / fail / skipped` per exit. `stalled`
+  means bytes arrived and then the transfer died short of the expected size:
+  the TSPU/DPI "reachable but useless" signature a bare TCP probe can't see.
+  Probe-disabled exits are never dialled (`skipped`). Run it from the button
+  (detached; progress visible while it runs) or schedule it
+  (`uci set xray-monitor.sub.e2e_cron='1'` + an `e2e_schedule` cron
+  expression — off by default, each run moves real traffic). Results stay in
+  `/tmp/xray-monitor/e2e.json` and also feed the fetch-via exit choice.
 
 **Graphs**
 - Rolling per-outbound throughput charts (down/up), ~10 min window, 5 s
@@ -88,6 +119,28 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 - The server list shown is the **installed** set (from the live config); the
   diff shows what a pending fetch would change. State lives in
   `/etc/xray-monitor/` (persists across reboots/upgrades).
+- **Hot-swap (live apply, on by default)**: when a fetch/apply only changes
+  which outbounds a subscription owns — members added/removed, bodies
+  unchanged — the running xray is reconciled **via its API** (`RemoveOutbound`
+  / `AddOutbound`, batch timeout 10 s) with **no restart**; the status row
+  shows `applied live (hot-swap) · -N/+M`. Anything not hot-swappable falls
+  back to the classic restart pipeline, with the reason shown (changes beyond
+  outbound membership, a tag outside `[A-Za-z0-9._-]`, the default outbound
+  changing, API unavailable, running set ≠ config). A failed live attempt
+  restores the snapshot and restarts + verifies unconditionally. Turn it off
+  with `option hot_swap '0'` (always restart, the previous behavior).
+- **Fetch through a proxy exit** (`fetch_via`): `direct` (default) | `proxy`
+  (always through a temporary one-exit socks instance) | `auto` (try direct,
+  retry through xray on failure) — for routers whose own path to the panel is
+  blocked but whose exits reach it. The exit is chosen per run: your explicit
+  `fetch_via_exit` tag, else the best `ok` exit from the freshest E2E results,
+  else the first outbound the probe reports up. The same user agent, timeout
+  and header capture apply on the proxied path, and the status row shows which
+  transport actually moved bytes (`direct` / `via <tag>` / `direct, retried
+  via <tag>`). Self-update downloads have their own switch
+  (`fetch_via_update`; `opkg install` itself always stays local). A
+  configured proxy path that cannot be established is an **honest failure** —
+  never a silent direct fallback that would leak the fetch to a blocking ISP.
 
 **Routing**
 - Manage the tproxy **dokodemo-door inbounds**: add, rename, set the tproxy
@@ -98,9 +151,30 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 
 **Config**
 - A raw **`config.json` editor** with a **Test config** button (runs `xray -test`
-  on the editor contents without saving) and **Save & apply** (validate → back up
-  `config.json.bak.manual.*` → write → restart xray, auto-rollback if the test fails),
-  plus **Reload from disk**.
+  on the editor contents without saving) and **Save & apply**, plus
+  **Reload from disk**.
+- **Concurrent-edit protection**: the editor carries the md5 of the config it
+  loaded; saving with a stale hash (the file changed on the router after you
+  opened it — another admin, a subscription apply) is **refused** with a
+  conflict notice instead of silently overwriting. Reload, re-apply your edit,
+  save.
+- **Mandatory diff before save**: saving always shows a semantic diff (added /
+  removed / changed paths) of your text vs the live config; text that doesn't
+  parse is named as invalid JSON rather than a generic failure. The save itself
+  is the standard pipeline: `xray -test` → timestamped `manual` backup → atomic
+  write → restart → verify, auto-rollback on failure.
+
+**Backups**
+- Every config write (apply, routing/balancers save, config editor, restore)
+  leaves a timestamped `config.json.bak.<kind>.<ts>` next to the config
+  (`auto` for subscription applies, `manual` for everything else; restore
+  makes its own `manual` backup of what was live first).
+- Browse the list with size/age, **pin** the ones you want to keep (pinned
+  backups never count against `backup_keep` and are never pruned), **restore**
+  one (it goes through the same validate-first pipeline with rollback), or
+  delete. `backup_keep '0'` keeps everything.
+- Snapshots are taken symlink-safe (`cp -pL`), so a symlinked `config.json`
+  backs up the target's bytes, not the link.
 
 **Balancers**
 - **Combine outbounds** into a balancer: name it, pick members (checkboxes),
@@ -108,6 +182,14 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
   optional fallback. Balancers appear as selectable exits in the Routing tab.
 - `leastPing`/`leastLoad` members are auto-added to the **observatory**
   subjectSelector so they're probed. Same backup + `xray -test` + rollback.
+- **Live view + sticky pins**: the tab reads each balancer's **live** state
+  from the running xray (`xray api bi`): which outbound the strategy currently
+  picks, right now. **Pin** a balancer to one member (applied live via
+  `xray api bo` immediately — no restart — and persisted in UCI, so the pin is
+  re-applied after every restart or config apply); **Unpin** releases it back
+  to the strategy. Divergences are surfaced (saved pin ≠ running pick, stale
+  balancer gone from the config, API down). Pins survive reboots; deleting the
+  balancer or the outbound clears them with it.
 
 It reads traffic from Xray's built-in **Stats API** over `127.0.0.1:10085`, and
 detects per-outbound connectivity with an active **TCP probe** of each endpoint
@@ -276,8 +358,16 @@ Pure data package (`Architecture: all`), so the SDK isn't required.
 | `/www/luci-static/resources/view/xray/subscription.js` | Subscription page |
 | `/www/luci-static/resources/view/xray/routing.js` | Routing page |
 | `/www/luci-static/resources/view/xray/balancers.js` | Balancers page |
+| `/www/luci-static/resources/view/xray/backups.js` | Backups page |
 | `/www/luci-static/resources/view/xray/config.js` | Config editor page |
+| `/www/luci-static/resources/xray-diff.js` | shared diff renderer (line + semantic) |
 | `/usr/share/xray-monitor/{parse,apply,diff,snapshot,status,routing,balancers,enable-api,render,probe}.uc` | ucode JSON transforms (render = shared outbounds renderer, probe = TCP probe backend) |
+| `/usr/share/xray-monitor/hotswap.uc` | live-apply plan + ordered adds (hot-swap) |
+| `/usr/share/xray-monitor/e2e.uc` | E2E exit-check verdicts / merge / summary |
+| `/usr/share/xray-monitor/pickexit.uc` | choose the exit for proxied fetches (freshness-bounded e2e.json reader) |
+| `/usr/share/xray-monitor/{balance,balance-cli}.uc` | live balancer view + override merge |
+| `/usr/share/xray-monitor/{jsondiff,jsondiff-cli}.uc` | semantic path diff (editor diff, backup diff) |
+| `/usr/share/xray-monitor/tmpxray.uc` | temporary one-exit socks instance builder (e2e, proxied fetch) |
 | `/usr/share/xray-monitor/xray-sub` | fetch/stage/apply helper (+ hourly cron) |
 | `/etc/config/xray-monitor` | UCI config (sub URL, user-agent, cron) — conffile |
 | `/etc/xray-monitor/overrides.json` | optional per-tag outbound overrides (see above) |
