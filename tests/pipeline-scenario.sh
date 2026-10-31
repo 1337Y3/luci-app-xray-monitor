@@ -15,8 +15,9 @@
 # invoked, post_restart_hooks fired, prune_backups run; plus the test-failed
 # path, the verify-failed (rollback) path, a config.json that is a SYMLINK
 # (snapshot must dereference, rollback must restore through the link),
-# no-restart (install only), a prune failure that must not fail the write, and
-# the mutation lock itself: a held flock fails a NOWAIT writer at once and a
+# no-restart (install only), a prune failure that must not fail the write,
+# the F15 sticky-override re-apply in post_restart_hooks (stubbed bo + sandbox
+# UCI), and the mutation lock itself: a held flock fails a NOWAIT writer at once and a
 # waiting writer succeeds after the holder lets go (only where flock(1) is
 # real - a stubbed flock serializes nothing).
 set -u
@@ -59,7 +60,7 @@ sed \
 	-e "s|/etc/crontabs|$SB/etc/crontabs|g" \
 	-e "s|/usr/share/xray-monitor/xray-sub|$SB/sub|g" \
 	-e "s|/tmp/luci-app-xray-monitor\.ipk|$SB/tmp/luci-app-xray-monitor.ipk|g" \
-	-e 's|post_restart_hooks() { return 0; }|post_restart_hooks() { echo hook >> "${STUB_HOOK_LOG:-/dev/null}"; return 0; }|' \
+	-e 's|^post_restart_hooks() {$|post_restart_hooks() { echo hook >> "${STUB_HOOK_LOG:-/dev/null}";|' \
 	"$SHARESRC/xray-sub" > "$SB/sub"
 for pat in "SHARE=$SB" "STATE=$SB" "XRAY=$SB" "LOCK=$SB" "TLOCK=$SB" "TSTATE_DIR=$SB" \
 	"$SB/etc/xray/config.json" "$SB/etc/init.d/xray" "$SB/etc/crontabs/root" \
@@ -108,7 +109,11 @@ case "$1" in
 		fi
 		echo "fail ${cfg:-none}" >> "$LOG"; exit 1
 		;;
-	api) exit 0 ;;
+	api)
+		echo "api $*" >> "${STUB_API_LOG:-/dev/null}"
+		[ -f "${STUB_BO_FAIL:-/nonexistent}" ] && exit 1
+		exit 0
+		;;
 esac
 exit 0
 EOF
@@ -121,10 +126,31 @@ EOF
 cat > "$SB/bin/uci" <<'EOF'
 #!/bin/sh
 # uci stub: keeps the sandbox off the live UCI. backup_keep=3 pins the prune
-# budget so the counts below are deterministic; every other query comes back
-# empty (sub_prefixes empty = legacy "all proxy outbounds are managed" mode).
+# budget so the counts below are deterministic; balancer_override sections
+# come from $STUB_UCI_STATE (a file in `uci show xray-monitor` format) so the
+# F15 override cases can vary them; every other query comes back empty
+# (sub_prefixes empty = legacy "all proxy outbounds are managed" mode).
+state="${STUB_UCI_STATE:-/nonexistent}"
 case " $* " in
 	*" get xray-monitor.sub.backup_keep "*) echo 3; exit 0 ;;
+	*" show xray-monitor "*)
+		[ -f "$state" ] && cat "$state"
+		exit 0
+		;;
+esac
+# uci [-q] get xray-monitor.<section>.<option> -> the quoted value, rc 1 if absent
+prev="" want=""
+for a in "$@"; do
+	case "$prev" in get) want="$a" ;; esac
+	prev="$a"
+done
+case "$want" in
+	xray-monitor.*)
+		if [ -f "$state" ]; then
+			val=$(sed -n "s/^$(printf '%s' "$want" | sed 's/[.]/\\./g')='\\(.*\\)'$/\\1/p" "$state")
+			if [ -n "$val" ]; then echo "$val"; exit 0; fi
+		fi
+		;;
 esac
 exit 1
 EOF
@@ -151,7 +177,13 @@ export STUB_HOOK_LOG="$SB/log/hooks.log"
 export STUB_INITD_LOG="$SB/log/initd.log"
 export STUB_PGREP_DOWN="$SB/flags/xray-down"
 export STUB_OPKG_LOG="$SB/log/opkg.log"
+# F15: api-call log of the xray stub, its bo-failure flag, and the uci state
+# file the override cases fill in (absent until then = no overrides)
+export STUB_API_LOG="$SB/log/api.log"
+export STUB_BO_FAIL="$SB/flags/bo-fail"
+export STUB_UCI_STATE="$SB/work/uci-state"
 : > "$STUB_LOG"; : > "$STUB_HOOK_LOG"; : > "$STUB_INITD_LOG"; : > "$STUB_OPKG_LOG"
+: > "$STUB_API_LOG"; rm -f "$STUB_BO_FAIL" "$STUB_UCI_STATE"
 
 CFG="$SB/etc/xray/config.json"
 fails=0
@@ -371,6 +403,43 @@ is "symlink(healthy): config.json is still a symlink" "$([ -L "$CFG" ] && echo 1
 # back to a plain file for the sections below
 rm -f "$CFG" "$CFG".bak.* "$REAL" "$REAL.new"
 cp "$FIX/config.json" "$CFG"
+
+echo "== F15 overrides: a restart-triggering command re-applies the sticky pins"
+reset_cfg
+cat > "$STUB_UCI_STATE" <<'EOV'
+xray-monitor.cfg03d1=balancer_override
+xray-monitor.cfg03d1.balancer='any-balancer'
+xray-monitor.cfg03d1.outbound='proxy-ch'
+xray-monitor.cfg04a2=balancer_override
+xray-monitor.cfg04a2.balancer='ghost-balancer'
+xray-monitor.cfg04a2.outbound='proxy-fi'
+EOV
+exp=$(printf '[\n{"balancer":"any-balancer","outbound":"proxy-ch"},\n{"balancer":"ghost-balancer","outbound":"proxy-fi"}\n]')
+out=$(runsub overrides-list 2>/dev/null)
+ok_eq "overrides-list: JSON of every balancer_override section" "$exp" "$out"
+: > "$STUB_API_LOG"
+r0=$(restarts); h0=$(hookruns)
+out=$(runsub config-save "$FIX/config.json" 2>/dev/null); rc=$?
+ok_eq "hook(config-save): stdout still exactly the writer's message" "saved and restarted xray" "$out"
+ok_eq "hook(config-save): rc" 0 "$rc"
+ok_eq "hook: post_restart_hooks ran" "$((h0 + 1))" "$(hookruns)"
+ok_eq "hook: bo called once (the stale section is skipped)" 1 "$(grep -c ' bo ' "$STUB_API_LOG" 2>/dev/null)"
+is "hook: bo carries the persisted balancer+outbound" "$(grep -q -- '-b any-balancer proxy-ch' "$STUB_API_LOG" && echo 1 || echo 0)"
+is "hook: stale override never sent to the api" "$(grep -q 'ghost-balancer' "$STUB_API_LOG" && echo 0 || echo 1)"
+
+echo "== overrides-apply: on-demand re-apply (and its failure path)"
+: > "$STUB_API_LOG"
+out=$(runsub overrides-apply 2>/dev/null); rc=$?
+ok_eq "overrides-apply: stdout" "ok - applied 1 override(s), skipped 1 (balancer not in config)" "$out"
+ok_eq "overrides-apply: rc" 0 "$rc"
+ok_eq "overrides-apply: one bo call" 1 "$(grep -c ' bo ' "$STUB_API_LOG" 2>/dev/null)"
+touch "$STUB_BO_FAIL"
+: > "$STUB_API_LOG"
+out=$(runsub overrides-apply 2>/dev/null); rc=$?
+ok_eq "overrides-apply(failing bo): rc" 1 "$rc"
+ok_eq "overrides-apply(failing bo): message names the failed balancer" "applied 0, failed: any-balancer" "$out"
+rm -f "$STUB_BO_FAIL"
+rm -f "$STUB_UCI_STATE"
 
 echo "== no-restart: test + backup + atomic install, no restart / verify / hooks / prune"
 reset_cfg

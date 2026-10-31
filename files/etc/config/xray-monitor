@@ -12,3 +12,11 @@ config xray-monitor 'sub'
 	option backup_keep '5'
 	# auto-enable the Xray Stats API in config.json on package install (1=yes)
 	option auto_enable_api '1'
+
+# Sticky balancer overrides, managed from the Balancers tab (no defaults
+# shipped - sections appear when the user pins a balancer). One section per
+# balancer, applied live via the RoutingService (bo) and re-applied after
+# every restart:
+#   config balancer_override
+#       option balancer '<balancer tag>'
+#       option outbound '<outbound tag>'

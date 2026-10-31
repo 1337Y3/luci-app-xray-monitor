@@ -1,0 +1,13 @@
+{
+	"outbounds": [
+		{ "tag": "proxy-fi", "protocol": "vless", "settings": {} },
+		{ "tag": "proxy-ch", "protocol": "vless", "settings": {} },
+		{ "tag": "direct", "protocol": "freedom", "settings": {} }
+	],
+	"routing": {
+		"balancers": [
+			{ "tag": "fast", "selector": [ "proxy-" ], "strategy": { "type": "leastPing" }, "fallbackTag": "proxy-ch" },
+			{ "tag": "spread", "selector": [ "proxy-" ], "strategy": { "type": "roundRobin" } }
+		]
+	}
+}

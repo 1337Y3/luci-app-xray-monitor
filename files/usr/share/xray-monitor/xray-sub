@@ -4,6 +4,7 @@
 #         | sub-add <prefix> <url> | sub-del <id> | sub-edit <id> <prefix> <url> <enabled>
 #         | routing-get | routing-set <f> | balancers-get | balancers-set <f>
 #         | config-save <f> | enable-api
+#         | overrides-list | overrides-apply   (sticky balancer pins, live bo)
 #         | tmpxray start <tag>... | tmpxray stop   (short-lived per-exit test xray)
 #         | backups-list | backups-get <name> | backups-delete <name>
 #         | backups-pin <name> <0|1> | backups-restore <name>
@@ -23,8 +24,9 @@ CFG=$(config_file)
 mkdir -p "$STATE"
 
 # Mutating commands (fetch/apply/sub-*/set-cfg/routing-set/balancers-set/
-# config-save/enable-api/cron-sync/backups-delete/backups-pin/backups-restore)
-# serialize on this lock so concurrent cron fetches and UI/RPC clicks can't
+# config-save/enable-api/cron-sync/backups-delete/backups-pin/backups-restore/
+# overrides-apply) serialize on this lock so concurrent cron fetches and UI/RPC
+# clicks can't
 # interleave uci commits, staging and config
 # renames. Read-only commands skip it. The lock is a kernel flock held on fd 3
 # of this process (busybox `flock -n 3`): the kernel drops it when the holder
@@ -303,12 +305,93 @@ verify_or_rollback() {
 	return 1
 }
 
-# Extension point (F15): invoked under the write lock after every successful
+# --- sticky balancer overrides (F15) -----------------------------------------
+# A sticky override pins one balancer to one outbound: applied LIVE through the
+# RoutingService (`xray api bo`) and persisted as a UCI `balancer_override`
+# section (options: balancer, outbound) so it survives restarts. The override
+# table lives in the RUNNING xray's memory only - it is not part of
+# config.json, so every restart (ours or an external one) drops it and UCI is
+# the only durable copy. The Balancers tab drives this through the rpcd
+# methods balancer_override_set / _del / _apply; post_restart_hooks re-applies
+# the persisted set after every config-writing restart.
+
+# Persisted overrides as JSON, one object per line inside an array. Only
+# sections carrying a valid-charset balancer+outbound pair are emitted: a
+# hand-edited UCI value must never break the JSON document this feeds.
+overrides_list() {
+	local id first=1 b o
+	printf '[\n'
+	for id in $(uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=balancer_override$/\1/p'); do
+		b=$(uci -q get "xray-monitor.$id.balancer"); o=$(uci -q get "xray-monitor.$id.outbound")
+		echo "$b" | grep -qE '^[A-Za-z0-9_.-]+$' || continue
+		echo "$o" | grep -qE '^[A-Za-z0-9_.-]+$' || continue
+		[ "$first" = 1 ] || printf ',\n'
+		first=0
+		printf '{"balancer":"%s","outbound":"%s"}' "$b" "$o"
+	done
+	printf '\n]\n'
+}
+
+# Re-apply every persisted override to the RUNNING xray via bo. Sections whose
+# balancer no longer exists in the config are skipped (bo rejects unknown
+# balancer tags; a stale section must not read as a failure on every restart).
+# Sets OV_APPLIED / OV_SKIPPED / OV_FAILED; returns 0 = everything applicable
+# applied (or nothing to do), 1 = some bo call failed, 2 = cannot start.
+# Called by post_restart_hooks (in-process, under the caller's lock; output
+# must go to stderr only - stdout belongs to the writer's message) and by the
+# overrides-apply command.
+OV_APPLIED=0
+OV_SKIPPED=0
+OV_FAILED=""
+overrides_apply() {
+	local tmp appl bal out total nfail
+	OV_APPLIED=0; OV_SKIPPED=0; OV_FAILED=""
+	command -v ucode >/dev/null 2>&1 || return 2
+	[ -f "$CFG" ] || return 2
+	tmp=$(mktemp "${TMPDIR:-/tmp}/xraymon.ovr.XXXXXX") || return 2
+	overrides_list > "$tmp"
+	total=$(grep -c '"balancer":' "$tmp" 2>/dev/null); total=${total:-0}
+	# stale-section filter (pure logic, golden-tested in balance.uc)
+	appl=$("$SHARE/balance-cli.uc" applicable "$CFG" "$tmp" 2>/dev/null)
+	rm -f "$tmp"
+	if [ -n "$appl" ]; then
+		# each bo is bounded by xray's own -t: a down API fails after ~2 s
+		# instead of hanging. Values come back from ucode with a validated
+		# charset, so word-splitting the two columns is safe.
+		while read -r bal out; do
+			[ -n "$bal" ] || continue
+			if "$XRAY" api bo --server="$APISRV" -t 2 -b "$bal" "$out" >/dev/null 2>&1; then
+				OV_APPLIED=$((OV_APPLIED + 1))
+			else
+				OV_FAILED="$OV_FAILED $bal"
+			fi
+		done <<EOF
+$appl
+EOF
+	fi
+	nfail=$(printf '%s' "$OV_FAILED" | wc -w | tr -d ' ')
+	OV_SKIPPED=$((total - OV_APPLIED - nfail))
+	[ -z "$OV_FAILED" ] || return 1
+	return 0
+}
+
+# Extension point: invoked under the write lock after every successful
 # restart+verify, before prune_backups - $CFG already holds the new config and
-# xray is confirmed healthy. Empty for now; later features append their own
-# steps here. Its return value is ignored (the change is already live), hooks
-# report their own failures.
-post_restart_hooks() { return 0; }
+# xray is confirmed healthy. Its return value is ignored (the change is already
+# live), hooks report their own failures - and must stay silent on stdout: the
+# writer's message ("ok", "saved and restarted xray", ...) is what the rpcd
+# layer relays. F15: a restart always drops xray's in-memory override table,
+# so the persisted sticky overrides are re-applied here (bo).
+post_restart_hooks() {
+	local hookrc
+	hookrc=0; overrides_apply || hookrc=$?
+	case "$hookrc" in
+		0) [ "$OV_APPLIED" -gt 0 ] && echo "xray-monitor: re-applied $OV_APPLIED balancer override(s) after restart" >&2 ;;
+		2) echo "xray-monitor: could not re-apply balancer overrides (ucode not installed)" >&2 ;;
+		*) echo "xray-monitor: balancer override re-apply failed:$OV_FAILED" >&2 ;;
+	esac
+	return 0
+}
 
 # --- Config write pipeline ----------------------------------------------
 # One place for everything that happens AFTER a writer has produced its
@@ -583,7 +666,7 @@ do_tmpxray_stop() {
 }
 
 case "$1" in
-	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync|backups-delete|backups-pin|backups-restore)
+	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync|backups-delete|backups-pin|backups-restore|overrides-apply)
 		take_lock || {
 			if [ "$XRAYMON_NOWAIT" = 1 ]; then
 				echo "another xray-monitor operation is running, try again in a moment"
@@ -819,6 +902,25 @@ case "$1" in
 		esac
 		;;
 
+	# Sticky balancer overrides (F15). Read-only listing for the rpcd
+	# balancers_live snapshot; the apply re-pins everything persisted to the
+	# running xray (used by the tab's "re-apply" button after an EXTERNAL
+	# restart - the post_restart_hooks path already covers our own restarts).
+	# overrides-apply takes the mutation lock: a config write restarting xray
+	# underneath a bo would just race the restart.
+	overrides-list)
+		overrides_list
+		;;
+	overrides-apply)
+		rc=0; overrides_apply || rc=$?
+		case "$rc" in
+			0) skip=""; [ "$OV_SKIPPED" -gt 0 ] && skip=", skipped $OV_SKIPPED (balancer not in config)"
+				echo "ok - applied $OV_APPLIED override(s)$skip" ;;
+			2) echo "ucode not installed"; exit 1 ;;
+			*) echo "applied $OV_APPLIED, failed:$OV_FAILED"; exit 1 ;;
+		esac
+		;;
+
 	tmpxray)
 		case "$2" in
 			start) shift 2; do_tmpxray_start "$@" ;;
@@ -897,5 +999,5 @@ case "$1" in
 		;;
 
 	*)
-		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api|tmpxray start <tag>...|tmpxray stop|backups-list|backups-get <name>|backups-delete <name>|backups-pin <name> <0|1>|backups-restore <name>"; exit 1 ;;
+		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api|overrides-list|overrides-apply|tmpxray start <tag>...|tmpxray stop|backups-list|backups-get <name>|backups-delete <name>|backups-pin <name> <0|1>|backups-restore <name>"; exit 1 ;;
 esac
