@@ -8,7 +8,14 @@
  *  - a renderer for the semantic (JSON dot-path) diff produced by the rpcd
  *    config_diff method (jsondiff.uc paths_diff)
  * Depends only on luci.js built-ins: the baseclass module and the
- * globals E() and _(). *
+ * globals E() and _(). */
+
+/* Baked by build-ipk.sh at package time (the literal placeholder survives in
+ * git and in tests). Every view carries the same constant and compares it
+ * with status.app_version: LuCI 23.05 serves modules without a cache buster,
+ * so after an upgrade the browser may keep running the previous JS until a
+ * hard reload - the banner from staleVersion() says exactly that. */
+var UI_VERSION = '__XRAY_MONITOR_VER__';
 
 var MAX_COST = 1024;   /* Myers edit-distance cap per input pair; beyond it the
                           fallback emits one delete+add block for the whole
@@ -181,11 +188,25 @@ function renderSemantic(diff) {
 	return E('table', { 'class': 'table' }, rows);
 }
 
+/* The reload banner for a stale UI, or null when the versions agree. The
+ * caller passes ITS OWN baked UI_VERSION - a stale cached view then flags
+ * itself even when this shared module was fetched fresh (mixed cache). */
+function staleVersion(appVersion, uiVersion) {
+	if (!appVersion || !uiVersion || uiVersion.charAt(0) === '_' || appVersion === uiVersion)
+		return null;
+	return E('div', { 'class': 'alert-message warning', 'style': 'margin:1em 0;' },
+		_('The web UI is outdated: the router runs version ') + appVersion +
+		_(', the browser has loaded ') + uiVersion +
+		_(' — press Ctrl+Shift+R to reload the page.'));
+}
+
 /* luci.js require() only accepts Class subclasses (Class.isSubclass), so the
  * module must extend baseclass; callers get the instantiated module and use
- * the three methods off its prototype. */
+ * the methods off its prototype. */
 return baseclass.extend({
 	unifiedDiff: unifiedDiff,
 	renderUnified: renderUnified,
-	renderSemantic: renderSemantic
+	renderSemantic: renderSemantic,
+	version: UI_VERSION,
+	staleVersion: staleVersion
 });

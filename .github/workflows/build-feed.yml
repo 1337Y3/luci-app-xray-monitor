@@ -37,6 +37,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The 475d8a1 regression (an unclosed block comment swallowing a var
+      # definition) was syntactically valid JS - only EXECUTING the module
+      # catches it. Node is preinstalled on the runner.
+      - name: JS checks (xray-diff functional, view syntax)
+        run: sh tests/js-test.sh
+
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y build-essential cmake libjson-c-dev busybox-static
 
