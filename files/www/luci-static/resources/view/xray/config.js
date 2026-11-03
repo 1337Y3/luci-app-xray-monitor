@@ -72,9 +72,53 @@ function conflictMsg() {
 	return _('The config changed on the router since you loaded it. Reload it from disk and re-apply your edits.');
 }
 
+/* Changed dot-paths that fall inside subscription-managed outbounds. The next
+ * fetch - auto-apply especially - regenerates exactly those bodies from the
+ * panel, so a hand edit there survives only until then; overrides.json is the
+ * supported way to keep a per-tag tweak. Prefixes are read from the editor
+ * text itself (render.uc writes each managed block under a
+ * "// === subscription: <prefix> ===" header) and ownership is the same rule
+ * the pipeline applies: tag == prefix or tag starts "<prefix>-". Added paths
+ * index the editor's array, changed/removed the on-disk one, so both are
+ * consulted; a bare "outbounds" (whole section reshaped) counts as a hit.
+ * Returns the offending paths, [] when none or when nothing is managed. */
+function managedChangedPaths(paths, editorText, diskText) {
+	var pfx = [], m, re = /\/\/\s*===\s*subscription:\s*(.+?)\s*===/g;
+	while ((m = re.exec(editorText)) !== null)
+		if (m[1] && pfx.indexOf(m[1]) < 0) pfx.push(m[1]);
+	if (!pfx.length) return [];
+	var outs;
+	try {
+		outs = [ parseConfigJSON(editorText).outbounds || [], parseConfigJSON(diskText).outbounds || [] ];
+	}
+	catch (e) { return []; }
+	var hit = [], i, j, k, pm, tag, managed;
+	for (i = 0; i < (paths || []).length; i++) {
+		managed = paths[i] == 'outbounds';   // the whole outbounds section
+		pm = /^outbounds\.(\d+)(?:\.|$)/.exec(paths[i]);
+		if (!managed && !pm) continue;
+		for (k = 0; !managed && k < outs.length; k++) {
+			tag = (outs[k][+pm[1]] && typeof outs[k][+pm[1]] == 'object') ? (outs[k][+pm[1]].tag || '') : '';
+			for (j = 0; j < pfx.length; j++)
+				if (tag == pfx[j] || tag.indexOf(pfx[j] + '-') === 0) { managed = true; break; }
+		}
+		if (managed) hit.push(paths[i]);
+	}
+	return hit;
+}
+
 function modalLine(cls, strong, text) {
 	return E('p', { 'style': 'color:' + cls + ';margin:.8em 0 0;' },
 		text ? [ E('strong', {}, strong), document.createTextNode(' ' + text) ] : [ E('strong', {}, strong) ]);
+}
+
+/* The subscription-management warning, amber like a "changed" path: which
+ * paths are affected and what to do instead. No-op for an empty list. */
+function noteManaged(notes, paths) {
+	if (!paths || !paths.length) return;
+	notes.push(modalLine('#cc7a00',
+		_('Subscription-managed outbound(s) in this diff:'),
+		_('the next fetch (auto-apply runs it by itself) rebuilds these outbounds from the panel and will revert this edit. For a permanent per-tag tweak use /etc/xray-monitor/overrides.json (see the README). Affected: ') + paths.join(', ')));
 }
 
 /* Reload the editor from disk and remember the new hash (also used after a
@@ -118,6 +162,12 @@ function showPreview(testRes, diffRes, getRes) {
 	var notes = [];
 	if (conflict) notes.push(modalLine('#cc3300', _('Not applied:'), conflictMsg()));
 	if (testBad)  notes.push(modalLine('#cc3300', _('xray -test rejected the editor content:'), (testRes && testRes.msg) || _('unknown error')));
+	// a hand edit inside a subscription-managed outbound is real but short-
+	// lived: the next fetch (auto-apply applies it by itself) rebuilds those
+	// bodies from the panel - say so here, not as a change that vanished later
+	if (!badJson)
+		noteManaged(notes, managedChangedPaths(
+			[].concat(sem.changed || [], sem.removed || [], sem.added || []), ta.value, cur));
 
 	var errLine = E('div', {}, notes);
 	var applyBtn = E('button', { 'class': 'cbi-button cbi-button-save important' }, _('Apply anyway'));
@@ -213,7 +263,16 @@ return view.extend({
 			setBusy(btns, true);
 			Promise.all([ callTest(ta.value), callDiffText(ta.value), callGet() ]).then(function(r) {
 				setBusy(btns, false);
-				showPreview(r[0], r[1], r[2]);
+				// a throw inside this success handler is NOT caught by the
+				// rejection handler below - without this try/catch it used to
+				// vanish without a trace, leaving a button that "does nothing"
+				try { showPreview(r[0], r[1], r[2]); }
+				catch (e) {
+					ui.addNotification(null, E('p', [
+						E('strong', {}, _('Preview failed: ')),
+						document.createTextNode((e && e.message) ? e.message : String(e))
+					]), 'error');
+				}
 			}, function() {
 				setBusy(btns, false);
 				ui.addNotification(null, E('p', _('Preview call failed.')), 'error');
@@ -230,7 +289,8 @@ return view.extend({
 			E('div', { 'class': 'cbi-section' }, [
 				E('p', {}, [ _('Editing '), pathLabel, _('. '),
 					E('strong', {}, _('Test config')), _(' runs xray -test on the editor contents without saving. '),
-					E('strong', {}, _('Save & apply')), _(' first shows a preview of what would change (semantic + text diff); "Apply anyway" then validates, backs up (config.json.bak.manual.*), writes, and restarts xray — and rolls back automatically if the test fails. If the config changed on the router after this page loaded it, the save is refused and you must reload it and re-apply your edits.') ]),
+					E('strong', {}, _('Save & apply')), _(' first shows a preview of what would change (semantic + text diff); "Apply anyway" then validates, backs up (config.json.bak.manual.*), writes, and restarts xray — and rolls back automatically if the test fails. If the config changed on the router after this page loaded it, the save is refused and you must reload it and re-apply your edits. '),
+					_('Edits inside a "// === subscription: <prefix> ===" block are reverted by the next fetch — auto-apply runs it by itself; keep per-tag tweaks in /etc/xray-monitor/overrides.json instead.') ]),
 				ta,
 				E('div', { 'style': 'margin-top:.6em;display:flex;gap:8px;' }, [ testBtn, saveBtn, reloadBtn ])
 			])
