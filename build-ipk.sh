@@ -18,6 +18,14 @@ trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/data" "$WORK/control"
 cp -a "$HERE/files/." "$WORK/data/"
 cp -a "$HERE/CONTROL/." "$WORK/control/"
+# Force LF into the package. A Windows checkout (core.autocrlf=true in older
+# clones) hands us CRLF files, and BusyBox sh on the router refuses to run
+# scripts with \r line endings - the 1.22-2 dist build died on its postinst
+# that way. Every file in files/ and CONTROL/ is text, so an unconditional
+# strip is safe; cat-in-place keeps the copied file modes.
+find "$WORK/data" "$WORK/control" -type f -exec sh -c '
+	tr -d "\r" < "$1" > "$1.lf" && cat "$1.lf" > "$1" && rm -f "$1.lf"
+' sh {} \;
 chmod 0755 "$WORK/data/usr/libexec/rpcd/xray-monitor"
 chmod 0755 "$WORK"/data/usr/share/xray-monitor/*.uc \
            "$WORK"/data/usr/share/xray-monitor/xray-sub
