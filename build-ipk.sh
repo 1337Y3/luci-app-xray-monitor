@@ -21,11 +21,26 @@ cp -a "$HERE/CONTROL/." "$WORK/control/"
 # Force LF into the package. A Windows checkout (core.autocrlf=true in older
 # clones) hands us CRLF files, and BusyBox sh on the router refuses to run
 # scripts with \r line endings - the 1.22-2 dist build died on its postinst
-# that way. Every file in files/ and CONTROL/ is text, so an unconditional
-# strip is safe; cat-in-place keeps the copied file modes.
+# that way. Text files (no NUL bytes) are stripped in place, modes kept. A
+# file that looks binary AND carries CR is a packaging mistake: abort rather
+# than silently corrupt it with a blanket tr.
+CRFAIL="$WORK/crfail"
 find "$WORK/data" "$WORK/control" -type f -exec sh -c '
-	tr -d "\r" < "$1" > "$1.lf" && cat "$1.lf" > "$1" && rm -f "$1.lf"
-' sh {} \;
+	if [ "$(tr -dc "\0" < "$2" | wc -c)" -eq 0 ]; then
+		tr -d "\r" < "$2" > "$2.lf" && cat "$2.lf" > "$2" && rm -f "$2.lf"
+	elif [ "$(tr -dc "\r" < "$2" | wc -c)" -ne 0 ]; then
+		echo "ERROR: CR bytes in binary-looking file: $2" >&2
+		: > "$1"
+	fi
+' sh "$CRFAIL" {} \;
+if [ -e "$CRFAIL" ]; then
+	echo "build aborted: refusing to strip CR from binary-looking files" >&2
+	exit 1
+fi
+
+# Bake the package version into the UI so a stale cached view can detect
+# itself against status.app_version (see staleVersion() in xray-diff.js).
+find "$WORK/data/www" -type f -name '*.js' -exec sed -i "s/__XRAY_MONITOR_VER__/${VER}/g" {} \;
 chmod 0755 "$WORK/data/usr/libexec/rpcd/xray-monitor"
 chmod 0755 "$WORK"/data/usr/share/xray-monitor/*.uc \
            "$WORK"/data/usr/share/xray-monitor/xray-sub
