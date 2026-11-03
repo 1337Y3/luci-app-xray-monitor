@@ -3,6 +3,7 @@
 'require rpc';
 'require ui';
 'require poll';
+'require xray-diff as XrayDiff';
 
 var callGet = rpc.declare({ object: 'xray-monitor', method: 'balancers_get' });
 var callSet = rpc.declare({ object: 'xray-monitor', method: 'balancers_set', params: [ 'balancers' ] });
@@ -10,6 +11,19 @@ var callLive = rpc.declare({ object: 'xray-monitor', method: 'balancers_live' })
 var callOvSet = rpc.declare({ object: 'xray-monitor', method: 'balancer_override_set', params: [ 'balancer', 'outbound' ] });
 var callOvDel = rpc.declare({ object: 'xray-monitor', method: 'balancer_override_del', params: [ 'balancer' ] });
 var callOvApply = rpc.declare({ object: 'xray-monitor', method: 'balancer_override_apply' });
+var callStatus = rpc.declare({ object: 'xray-monitor', method: 'status' });
+
+/* Baked by build-ipk.sh; compared with status.app_version in load(). LuCI
+ * serves modules without a cache buster, so after an upgrade the browser
+ * may still run the previous JS - the banner asks for a hard reload. */
+var UI_VERSION = '__XRAY_MONITOR_VER__';
+var staleUI = null;
+
+function checkUIVersion() {
+	return callStatus().then(function(s) {
+		staleUI = (XrayDiff.staleVersion && s) ? XrayDiff.staleVersion(s.app_version, UI_VERSION) : null;
+	}, function() {});
+}
 
 var STRATEGIES = [ 'leastPing', 'leastLoad', 'roundRobin', 'random' ];
 
@@ -305,14 +319,18 @@ function refresh() {
 }
 
 return view.extend({
-	load: function() { return refresh().catch(function() {}); },
+	load: function() {
+		return Promise.all([ refresh().catch(function() {}), checkUIVersion() ]);
+	},
 	render: function() {
 		root = E('div', { 'class': 'cbi-section' });
 		liveRoot = E('div', { 'class': 'cbi-section' });
 		redraw();
 		redrawLive();
 		poll.add(refreshLive, 10);   // live picks + pin divergence, 10 s
-		return E('div', {}, [ E('h2', {}, _('Xray Balancers')), liveRoot, root ]);
+		var nodes = [ E('h2', {}, _('Xray Balancers')), liveRoot, root ];
+		if (staleUI) nodes.unshift(staleUI);
+		return E('div', {}, nodes);
 	},
 	handleSaveApply: null, handleSave: null, handleReset: null
 });

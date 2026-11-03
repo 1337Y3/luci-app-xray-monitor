@@ -286,7 +286,11 @@ Most people should just use the one-line installer above instead.
 4. `git commit` + `git push`. Routers pick it up on `opkg update && opkg upgrade`.
 
 Then open LuCI → **Services → Xray Monitor** (hard-refresh the browser if the
-menu doesn't appear immediately).
+menu doesn't appear immediately). After an upgrade every tab also compares its
+own baked version with the one the router reports (`status.app_version`): if
+the browser is still running the previous JS — LuCI serves its modules without
+a cache buster, so that can happen — a warning banner at the top of the page
+asks for a Ctrl+Shift+R instead of failing mysteriously.
 
 ## Xray Stats API — enabled automatically on install
 

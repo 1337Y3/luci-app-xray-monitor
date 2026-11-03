@@ -2,8 +2,22 @@
 'require view';
 'require rpc';
 'require poll';
+'require xray-diff as XrayDiff';
 
 var callStats = rpc.declare({ object: 'xray-monitor', method: 'stats' });
+var callStatus = rpc.declare({ object: 'xray-monitor', method: 'status' });
+
+/* Baked by build-ipk.sh; compared with status.app_version in load(). LuCI
+ * serves modules without a cache buster, so after an upgrade the browser
+ * may still run the previous JS - the banner asks for a hard reload. */
+var UI_VERSION = '__XRAY_MONITOR_VER__';
+var staleUI = null;
+
+function checkUIVersion() {
+	return callStatus().then(function(s) {
+		staleUI = (XrayDiff.staleVersion && s) ? XrayDiff.staleVersion(s.app_version, UI_VERSION) : null;
+	}, function() {});
+}
 
 var MAX  = 120;    /* samples kept (~10 min at 5s) */
 var prev = null;   /* { ts, flat } */
@@ -118,13 +132,17 @@ function refresh() {
 }
 
 return view.extend({
-	load: function() { return refresh().catch(function() {}); },
+	load: function() {
+		return Promise.all([ refresh().catch(function() {}), checkUIVersion() ]);
+	},
 
 	render: function() {
 		root = E('div', { 'class': 'cbi-section' });
 		redraw();
 		poll.add(refresh, 5);
-		return E('div', {}, [ E('h2', {}, _('Xray Graphs — per-outbound throughput')), root ]);
+		var nodes = [ E('h2', {}, _('Xray Graphs — per-outbound throughput')), root ];
+		if (staleUI) nodes.unshift(staleUI);
+		return E('div', {}, nodes);
 	},
 
 	handleSaveApply: null,

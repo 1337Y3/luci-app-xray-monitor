@@ -3,6 +3,7 @@
 'require rpc';
 'require poll';
 'require ui';
+'require xray-diff as XrayDiff';
 
 var callGet    = rpc.declare({ object: 'xray-monitor', method: 'sub_get' });
 var callFetch  = rpc.declare({ object: 'xray-monitor', method: 'sub_fetch' });
@@ -11,6 +12,19 @@ var callSetCfg = rpc.declare({ object: 'xray-monitor', method: 'sub_setcfg', par
 var callAdd    = rpc.declare({ object: 'xray-monitor', method: 'sub_add',  params: [ 'prefix', 'url' ] });
 var callDel    = rpc.declare({ object: 'xray-monitor', method: 'sub_del',  params: [ 'id' ] });
 var callEdit   = rpc.declare({ object: 'xray-monitor', method: 'sub_edit', params: [ 'id', 'prefix', 'url', 'enabled' ] });
+var callStatus = rpc.declare({ object: 'xray-monitor', method: 'status' });
+
+/* Baked by build-ipk.sh; compared with status.app_version in load(). LuCI
+ * serves modules without a cache buster, so after an upgrade the browser
+ * may still run the previous JS - the banner asks for a hard reload. */
+var UI_VERSION = '__XRAY_MONITOR_VER__';
+var staleUI = null;
+
+function checkUIVersion() {
+	return callStatus().then(function(s) {
+		staleUI = (XrayDiff.staleVersion && s) ? XrayDiff.staleVersion(s.app_version, UI_VERSION) : null;
+	}, function() {});
+}
 
 var SCHEDS = [
 	[ '*/15 * * * *', 'Every 15 minutes' ], [ '*/30 * * * *', 'Every 30 minutes' ],
@@ -303,12 +317,16 @@ function redraw() {
 }
 
 return view.extend({
-	load: function() { return refresh().catch(function() {}); },
+	load: function() {
+		return Promise.all([ refresh().catch(function() {}), checkUIVersion() ]);
+	},
 	render: function() {
 		root = E('div', { 'class': 'cbi-section' });
 		redraw();
 		poll.add(refresh, 15);
-		return E('div', {}, [ E('h2', {}, _('Xray Subscriptions')), root ]);
+		var nodes = [ E('h2', {}, _('Xray Subscriptions')), root ];
+		if (staleUI) nodes.unshift(staleUI);
+		return E('div', {}, nodes);
 	},
 	handleSaveApply: null, handleSave: null, handleReset: null
 });

@@ -8,6 +8,19 @@ var callGet      = rpc.declare({ object: 'xray-monitor', method: 'config_get' })
 var callTest     = rpc.declare({ object: 'xray-monitor', method: 'config_test',      params: [ 'config' ] });
 var callDiffText = rpc.declare({ object: 'xray-monitor', method: 'config_diff_text', params: [ 'config' ] });
 var callSave     = rpc.declare({ object: 'xray-monitor', method: 'config_save',      params: [ 'config', 'expected_hash' ] });
+var callStatus   = rpc.declare({ object: 'xray-monitor', method: 'status' });
+
+/* Baked by build-ipk.sh; compared with status.app_version in load(). LuCI
+ * serves modules without a cache buster, so after an upgrade the browser
+ * may still run the previous JS - the banner asks for a hard reload. */
+var UI_VERSION = '__XRAY_MONITOR_VER__';
+var staleUI = null;
+
+function checkUIVersion() {
+	return callStatus().then(function(s) {
+		staleUI = (XrayDiff.staleVersion && s) ? XrayDiff.staleVersion(s.app_version, UI_VERSION) : null;
+	}, function() {});
+}
 
 var ta = null;        // the textarea
 var pathLabel = null;
@@ -211,7 +224,10 @@ function showPreview(testRes, diffRes, getRes) {
 }
 
 return view.extend({
-	load: function() { return callGet().catch(function() { return {}; }); },
+	load: function() {
+		return Promise.all([ callGet().catch(function() { return {}; }), checkUIVersion() ])
+			.then(function(r) { return r[0]; });
+	},
 
 	render: function(data) {
 		ta = E('textarea', {
@@ -284,7 +300,7 @@ return view.extend({
 			refreshFromDisk(false).then(function() { setBusy(btns, false); });
 		});
 
-		return E('div', {}, [
+		var nodes = [
 			E('h2', {}, _('Xray Config')),
 			E('div', { 'class': 'cbi-section' }, [
 				E('p', {}, [ _('Editing '), pathLabel, _('. '),
@@ -294,7 +310,9 @@ return view.extend({
 				ta,
 				E('div', { 'style': 'margin-top:.6em;display:flex;gap:8px;' }, [ testBtn, saveBtn, reloadBtn ])
 			])
-		]);
+		];
+		if (staleUI) nodes.unshift(staleUI);
+		return E('div', {}, nodes);
 	},
 
 	handleSaveApply: null, handleSave: null, handleReset: null

@@ -3,6 +3,7 @@
 'require rpc';
 'require poll';
 'require ui';
+'require xray-diff as XrayDiff';
 
 var callStatus    = rpc.declare({ object: 'xray-monitor', method: 'status' });
 var callStats     = rpc.declare({ object: 'xray-monitor', method: 'stats' });
@@ -16,6 +17,18 @@ var callUpdChk    = rpc.declare({ object: 'xray-monitor', method: 'update_check'
 var callUpdApply  = rpc.declare({ object: 'xray-monitor', method: 'update_apply' });
 var callE2eStatus = rpc.declare({ object: 'xray-monitor', method: 'e2e_status' });
 var callE2eStart  = rpc.declare({ object: 'xray-monitor', method: 'e2e_start' });
+
+/* Baked by build-ipk.sh; compared with status.app_version in load(). LuCI
+ * serves modules without a cache buster, so after an upgrade the browser
+ * may still run the previous JS - the banner asks for a hard reload. */
+var UI_VERSION = '__XRAY_MONITOR_VER__';
+var staleUI = null;
+
+function checkUIVersion() {
+	return callStatus().then(function(s) {
+		staleUI = (XrayDiff.staleVersion && s) ? XrayDiff.staleVersion(s.app_version, UI_VERSION) : null;
+	}, function() {});
+}
 
 var prev = null;  /* { ts, flat } for rate calculation */
 var root = null;  /* container element to redraw into */
@@ -403,7 +416,7 @@ return view.extend({
 	load: function() {
 		// refreshMeta is probe-free, so toggles + disabled state are ready on first paint;
 		// refreshE2e just reads the results file (no traffic, no probe)
-		return Promise.all([ refreshStats(), refreshMeta(), refreshE2e() ]).catch(function() {});
+		return Promise.all([ refreshStats(), refreshMeta(), refreshE2e(), checkUIVersion() ]).catch(function() {});
 	},
 
 	render: function() {
@@ -502,7 +515,9 @@ return view.extend({
 
 		var bar = E('div', { 'style': 'margin:.5em 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center;' },
 			[ updBtn, validateBtn, resetBtn, pingNowBtn, e2eBtn, autoToggle ]);
-		return E('div', {}, [ E('h2', {}, _('Xray Monitor')), bar, root ]);
+		var nodes = [ E('h2', {}, _('Xray Monitor')), bar, root ];
+		if (staleUI) nodes.unshift(staleUI);
+		return E('div', {}, nodes);
 	},
 
 	handleSaveApply: null,

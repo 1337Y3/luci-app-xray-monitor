@@ -11,6 +11,19 @@ var callPin     = rpc.declare({ object: 'xray-monitor', method: 'backups_pin',  
 var callRestore = rpc.declare({ object: 'xray-monitor', method: 'backups_restore', params: [ 'name' ] });
 var callDiff    = rpc.declare({ object: 'xray-monitor', method: 'config_diff', params: [ 'name' ] });
 var callGetCfg  = rpc.declare({ object: 'xray-monitor', method: 'config_get' });
+var callStatus  = rpc.declare({ object: 'xray-monitor', method: 'status' });
+
+/* Baked by build-ipk.sh; compared with status.app_version in load(). LuCI
+ * serves modules without a cache buster, so after an upgrade the browser
+ * may still run the previous JS - the banner asks for a hard reload. */
+var UI_VERSION = '__XRAY_MONITOR_VER__';
+var staleUI = null;
+
+function checkUIVersion() {
+	return callStatus().then(function(s) {
+		staleUI = (XrayDiff.staleVersion && s) ? XrayDiff.staleVersion(s.app_version, UI_VERSION) : null;
+	}, function() {});
+}
 
 var KIND_LABEL = { auto: _('Auto'), manual: _('Manual'), preapi: _('Pre-API') };
 
@@ -216,12 +229,15 @@ function refresh() {
 }
 
 return view.extend({
-	load: function() { return callList().catch(function() { return {}; }); },
+	load: function() {
+		return Promise.all([ callList().catch(function() { return {}; }), checkUIVersion() ])
+			.then(function(r) { return r[0]; });
+	},
 
 	render: function(data) {
 		listData = (data && data.backups) ? data.backups : [];
 		redraw(listData);
-		return E('div', {}, [
+		var nodes = [
 			E('h2', {}, _('Backups')),
 			E('div', { 'class': 'cbi-section' }, [
 				E('p', {}, [
@@ -237,7 +253,9 @@ return view.extend({
 				]),
 				tableBox
 			])
-		]);
+		];
+		if (staleUI) nodes.unshift(staleUI);
+		return E('div', {}, nodes);
 	},
 
 	handleSaveApply: null, handleSave: null, handleReset: null
