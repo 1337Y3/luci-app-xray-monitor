@@ -1,8 +1,9 @@
 name: build-feed
 
-# Rebuild the .ipk + opkg index whenever the package source changes.
-# Skips when only the generated feed (docs/) changes, so the auto-commit
-# below can't trigger an infinite loop. PRs only run the tests job.
+# Rebuild the packages (.ipk for opkg, .apk for apk) + feed indexes whenever
+# the package source changes. Skips when only the generated feed (docs/)
+# changes, so the auto-commit below can't trigger an infinite loop. PRs only
+# run the tests job.
 on:
   push:
     branches: [ main ]
@@ -150,10 +151,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build .ipk and regenerate feed index
+      # apk-tools is needed to BUILD the .apk (mkpkg) and its feed index
+      # (mkndx); the router's own apk is compiled -Dminimal=true and drops
+      # both applets, so the runner builds the full tool. v3.0.5 = the apk
+      # OpenWrt itself ships (package/system/apk). fakeroot: mkpkg records
+      # file uid/gid from the staging tree, and the runner is not root.
+      - name: Build apk-tools from source
         run: |
-          rm -f docs/*.ipk
+          sudo apt-get update && sudo apt-get install -y meson ninja-build libssl-dev zlib1g-dev fakeroot
+          curl -fsSL --retry 3 -o /tmp/apk-tools.tar.gz \
+            https://github.com/alpinelinux/apk-tools/archive/refs/tags/v3.0.5.tar.gz
+          mkdir /tmp/apk-tools && tar -xzf /tmp/apk-tools.tar.gz -C /tmp/apk-tools --strip-components=1
+          # -Dhelp needs lua; docs need scdoc; url_backend=wget drops libfetch
+          meson setup /tmp/apk-tools/build /tmp/apk-tools \
+            -Ddocs=disabled -Dhelp=disabled -Dlua=disabled -Dpython=disabled \
+            -Dtests=disabled -Durl_backend=wget
+          meson compile -C /tmp/apk-tools/build -j"$(nproc)"
+          sudo meson install -C /tmp/apk-tools/build
+          apk --version
+
+      - name: Build .ipk + .apk and regenerate feed indexes
+        run: |
+          rm -f docs/*.ipk docs/*.apk docs/packages.adb docs/luci-app-xray-monitor.apk.sha256
           sh build-ipk.sh docs
+          sh build-apk.sh docs
           sh make-feed.sh
 
       - name: Commit updated feed
@@ -164,26 +185,31 @@ jobs:
           if git diff --cached --quiet; then
             echo "feed unchanged"
           else
-            ver=$(sed -n 's/^VER="\(.*\)"/\1/p' build-ipk.sh)
+            ver=$(sed -n 's/^VER="\(.*\)"/\1/p' build-common.sh)
             git commit -m "feed: rebuild ${ver} [skip ci]"
             git push
           fi
 
-      - name: Publish GitHub Release (stable-named asset + sha256 sidecar)
+      - name: Publish GitHub Release (stable-named assets + sha256 sidecars)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ver=$(sed -n 's/^VER="\(.*\)"/\1/p' build-ipk.sh)
+          ver=$(sed -n 's/^VER="\(.*\)"/\1/p' build-common.sh)
           tag="v${ver}"
-          # stable asset name so /releases/latest/download/<name> is constant
+          # stable asset names so /releases/latest/download/<name> is constant;
+          # sidecars gate `xray-sub self-update` before the package manager
+          # gets the file (fallback: SHA256sum in docs/Packages, apk sidecar
+          # in docs/)
           cp "docs/luci-app-xray-monitor_${ver}_all.ipk" luci-app-xray-monitor.ipk
-          # sidecar consumed by `xray-sub self-update` before handing the
-          # package to opkg (fallback: the SHA256sum in docs/Packages)
           sha256sum luci-app-xray-monitor.ipk > luci-app-xray-monitor.ipk.sha256
+          cp docs/luci-app-xray-monitor-*.apk luci-app-xray-monitor.apk
+          sha256sum luci-app-xray-monitor.apk > luci-app-xray-monitor.apk.sha256
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" luci-app-xray-monitor.ipk luci-app-xray-monitor.ipk.sha256 --clobber
+            gh release upload "$tag" luci-app-xray-monitor.ipk luci-app-xray-monitor.ipk.sha256 \
+              luci-app-xray-monitor.apk luci-app-xray-monitor.apk.sha256 --clobber
             gh release edit "$tag" --latest
           else
             gh release create "$tag" luci-app-xray-monitor.ipk luci-app-xray-monitor.ipk.sha256 \
+              luci-app-xray-monitor.apk luci-app-xray-monitor.apk.sha256 \
               --title "$tag" --notes "Automated build of ${ver}. Install/upgrade: see README." --latest
           fi

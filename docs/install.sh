@@ -1,16 +1,18 @@
 #!/bin/sh
-# Install or upgrade luci-app-xray-monitor from the GitHub-hosted .ipk.
-# Installs the package file directly (opkg install <file>), which does NOT need
-# a signed opkg feed — so it works with the default `option check_signature` on.
-# Deps (curl, ucode-mod-fs, ucode-mod-uci, luci-base, xray-core) come from your
-# normal OpenWrt feeds, so run `opkg update` once first if any are missing.
+# Install or upgrade luci-app-xray-monitor from the GitHub-hosted packages.
+# Installs the package FILE directly (opkg install <file> on OpenWrt <= 24.10,
+# apk add --allow-untrusted <file> on apk-based 25.06+), which does NOT need a
+# signed feed — no security changes. Deps (curl, ucode-mod-fs, ucode-mod-uci,
+# luci-base, xray-core) come from your normal OpenWrt feeds, so run
+# `opkg update` (or `apk update`) once first if any are missing.
 #
 #   wget -qO- https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs/install.sh | sh
 
 BASE="https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs"
 REL="https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.ipk"
+REL_APK="https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.apk"
 
-# fetch <url> -> stdout, trying curl/wget/uclient-fetch with retries
+# fetch <url> -> stdout, trying curl/wget with retries
 fetch() {
 	url="$1"; i=1
 	while [ "$i" -le 3 ]; do
@@ -35,25 +37,60 @@ fetch_file() {
 	return 1
 }
 
-tmp="/tmp/luci-app-xray-monitor.ipk"
+# Whoever owns the installed package wins (25.06+ may carry an opkg compat
+# package); on a fresh box either manager is fine.
+if command -v apk >/dev/null 2>&1 && apk info -e luci-app-xray-monitor >/dev/null 2>&1; then
+	ext=apk
+elif command -v opkg >/dev/null 2>&1; then
+	ext=ipk
+elif command -v apk >/dev/null 2>&1; then
+	ext=apk
+else
+	echo "No package manager found (neither opkg nor apk)."; exit 1
+fi
+if [ "$ext" = apk ]; then
+	tmp="/tmp/luci-app-xray-monitor.apk"; rel=$REL_APK
+else
+	tmp="/tmp/luci-app-xray-monitor.ipk"; rel=$REL
+fi
+pkg_ok() {  # cheap container sanity (apk v3 packages are an ADB container, not tar)
+	if [ "$ext" = apk ]; then
+		[ "$(head -c3 "$tmp" 2>/dev/null)" = "ADB" ]
+	else
+		tar -tzf "$tmp" >/dev/null 2>&1
+	fi
+}
 
 # 1) preferred: the stable GitHub Release asset (single redirect, robust)
 echo "Downloading latest package (GitHub Releases) ..."
-if ! { fetch_file "$REL" "$tmp" && tar -tzf "$tmp" >/dev/null 2>&1; }; then
-	# 2) fallback: the opkg feed (raw)
+if ! { fetch_file "$rel" "$tmp" && pkg_ok; }; then
+	# 2) fallback: the raw feed (opkg: filename from the Packages index;
+	#    apk: the stable-named copy, see make-feed.sh)
 	echo "Releases unavailable — trying the feed ..."
-	pkgs=$(fetch "$BASE/Packages") || { echo "Could not reach GitHub (Releases or feed) — it may be blocked/flaky here; try again in a minute."; exit 1; }
-	ipk=$(printf '%s\n' "$pkgs" | sed -n 's/^Filename: //p' | tail -n1)
-	[ -n "$ipk" ] || { echo "Package list had no entries (feed may be updating) — try again shortly."; exit 1; }
-	fetch_file "$BASE/$ipk" "$tmp" || { rm -f "$tmp"; echo "Download failed — try again in a minute."; exit 1; }
-	tar -tzf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "Downloaded file is not a valid package — try again shortly."; exit 1; }
+	if [ "$ext" = apk ]; then
+		fetch_file "$BASE/luci-app-xray-monitor.apk" "$tmp" || { rm -f "$tmp"; echo "Download failed — try again in a minute."; exit 1; }
+		pkg_ok || { rm -f "$tmp"; echo "Downloaded file is not a valid package — try again shortly."; exit 1; }
+	else
+		pkgs=$(fetch "$BASE/Packages") || { echo "Could not reach GitHub (Releases or feed) — it may be blocked/flaky here; try again in a minute."; exit 1; }
+		ipk=$(printf '%s\n' "$pkgs" | sed -n 's/^Filename: //p' | tail -n1)
+		[ -n "$ipk" ] || { echo "Package list had no entries (feed may be updating) — try again shortly."; exit 1; }
+		fetch_file "$BASE/$ipk" "$tmp" || { rm -f "$tmp"; echo "Download failed — try again in a minute."; exit 1; }
+		tar -tzf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "Downloaded file is not a valid package — try again shortly."; exit 1; }
+	fi
 fi
 
 echo "Installing (deps come from your normal feeds) ..."
-# Plain `opkg install` upgrades in place and runs the OLD package's prerm with
-# "upgrade" (which skips the removal-only cleanup). Do NOT use --force-reinstall:
-# it makes opkg run prerm with "remove", which wipes persisted state under
-# /etc/xray-monitor on every installer-driven upgrade.
-opkg install "$tmp"
+if [ "$ext" = apk ]; then
+	# The Release/feed files are unsigned (checksum-gated by self-update, not
+	# key-signed), hence --allow-untrusted for the direct file install.
+	apk add --allow-untrusted "$tmp"
+else
+	# Plain `opkg install` upgrades in place and runs the OLD package's prerm with
+	# "upgrade" (which skips the removal-only cleanup). Do NOT use --force-reinstall:
+	# it makes opkg run prerm with "remove", which wipes persisted state under
+	# /etc/xray-monitor on every installer-driven upgrade.
+	opkg install "$tmp"
+fi
+rc=$?
 rm -f "$tmp"
-echo "Done — open LuCI: Services -> Xray Monitor."
+[ "$rc" -eq 0 ] && echo "Done — open LuCI: Services -> Xray Monitor."
