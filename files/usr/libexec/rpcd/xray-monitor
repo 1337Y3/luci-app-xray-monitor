@@ -81,13 +81,12 @@ get_api_services() {  # -> api_services, api_missing
 }
 
 # Installed package version in ipk spelling ("1.23-1"), regardless of the
-# package manager. The manager itself comes from xray-sub's pkg-manager
-# (whoever owns the installed package wins - single source of truth, shared
-# with self-update). apk versions carry the release as "-rN" (apk rejects
-# bare "-N"), normalized back so app_version, the baked UI_VERSION and
+# package manager (pkg_manager, sourced above: whoever owns the installed
+# package wins). apk versions carry the release as "-rN" (apk rejects bare
+# "-N"), normalized back so app_version, the baked UI_VERSION and
 # `xray-sub latest-version` all compare equal.
 pkg_version() {
-	case "$("$SUB" pkg-manager 2>/dev/null)" in
+	case "$(pkg_manager)" in
 		apk)
 			apk list --installed "$PKG" 2>/dev/null \
 				| sed -n "s/^${PKG}-\([^ ]*\) .*/\1/p" | head -n1 \
@@ -357,6 +356,12 @@ do_reset() {
 }
 
 SHARE=/usr/share/xray-monitor
+# pkg_manager(): the apk/opkg pick, shared with xray-sub. Sourced fresh on
+# every ubus call (the 5 s status polls included), so the file stays tiny
+# and no xray-sub fork happens just to learn the manager. Sourced here (not
+# at the top) because it rides on $SHARE; pkg_version() above only CALLS
+# pkg_manager at request time, well after this line has run.
+. "$SHARE/pkgmgr.sh"
 SUB=$SHARE/xray-sub
 
 # --- Balancers: live state + sticky overrides (F15) ---------------------------

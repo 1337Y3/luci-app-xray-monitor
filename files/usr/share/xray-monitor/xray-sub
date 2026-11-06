@@ -3,7 +3,7 @@
 # Commands: fetch | apply | status | set-cfg ... | cron-sync
 #         | sub-add <prefix> <url> | sub-del <id> | sub-edit <id> <prefix> <url> <enabled>
 #         | routing-get | routing-set <f> | balancers-get | balancers-set <f>
-#         | config-save <f> | enable-api | pkg-manager  (apk|opkg, for the rpcd)
+#         | config-save <f> | enable-api
 #         | overrides-list | overrides-apply   (sticky balancer pins, live bo)
 #         | tmpxray start <tag>... | tmpxray stop   (short-lived per-exit test xray)
 #         | e2e [tag...]   (end-to-end exit check: pull a body through each exit)
@@ -126,22 +126,10 @@ e2e_bytes=$(uci -q get xray-monitor.sub.e2e_bytes)
 case "$e2e_bytes" in ''|*[!0-9]*) e2e_bytes=1048576 ;; esac
 [ "$e2e_bytes" -ge 1024 ] && [ "$e2e_bytes" -le 104857600 ] || e2e_bytes=1048576
 
-# --- package manager (single source of truth for ipk/apk choices) ------------
-# Whoever OWNS the installed package wins: apk's db is asked first (25.06+
-# may carry an opkg compat package; a 24.10 box with an unused apk answers
-# "not installed" and falls through), then opkg, then apk (fresh installs).
-# `add`/`info`/`list` are all in the router apk's minimal applet set.
-pkg_manager() {  # -> stdout: apk | opkg; rc 1 = neither found
-	if command -v apk >/dev/null 2>&1 && apk info -e "$PKG" >/dev/null 2>&1; then
-		echo apk
-	elif command -v opkg >/dev/null 2>&1; then
-		echo opkg
-	elif command -v apk >/dev/null 2>&1; then
-		echo apk
-	else
-		return 1
-	fi
-}
+# --- package manager (shared with the rpcd backend) ---------------------------
+# pkg_manager() lives in its own tiny file: the rpcd sources it too - on
+# every ubus call - so forking this whole script for the pick is off limits.
+. "$SHARE/pkgmgr.sh"
 
 # --- fetch / self-update through xray (F18) ----------------------------------
 # Routers whose own internet path to the panel or GitHub is blocked, but whose
@@ -1491,11 +1479,6 @@ case "$1" in
 
 	latest-version)
 		curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Version: //p' | tail -n1
-		;;
-
-	pkg-manager)
-		# consumer: the rpcd backend's pkg_version() (see $RPCD pkg_version)
-		pkg_manager || { echo "none"; exit 1; }
 		;;
 
 	self-update)

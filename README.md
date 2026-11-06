@@ -291,10 +291,12 @@ opkg update && opkg install luci-app-xray-monitor
 
 Two apk behaviors make a native feed much less useful than the opkg one:
 
-1. **apk silently ignores an unsigned index.** `apk update` prints
-   `UNTRUSTED signature` and still exits 0; a following plain
-   `apk add luci-app-xray-monitor` then answers *no such package*. Every
-   command touching the feed needs `--allow-untrusted`.
+1. **apk only reads an unsigned index under `--allow-untrusted`.** Without
+   the flag, `apk update` exits 0 but silently skips the repo (at best an
+   `UNTRUSTED signature` warning), and a plain `apk add
+   luci-app-xray-monitor` answers *no such package*. An `add` running with
+   the flag re-reads the index itself, so a plain earlier `apk update` does
+   no harm — but flagging both is the least surprising form.
 2. **`apk upgrade` never updates a file-installed package.** Installing via
    `apk add <file>` (what the installer and self-update do) pins the package
    in `/etc/apk/world` by checksum (`luci-app-xray-monitor><Q1…>`), so a newer
@@ -310,7 +312,7 @@ name-based fresh installs and dependency resolution:
 ```sh
 echo 'https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs/packages.adb' \
   >> /etc/apk/repositories.d/customfeeds.list
-apk update && apk add --allow-untrusted luci-app-xray-monitor
+apk update --allow-untrusted && apk add --allow-untrusted luci-app-xray-monitor
 ```
 
 (Repository lines are used verbatim by apk, and the `.adb` suffix is what makes

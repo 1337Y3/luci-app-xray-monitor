@@ -424,9 +424,16 @@ EOF
 
 cat > "$SB/bin/opkg" <<'EOF'
 #!/bin/sh
-# opkg stub: even if a future case reaches self-update, nothing gets installed.
-# Calls also mark the tmpxray log so the F18 cases can assert ordering (the
-# proxied self-update must stop the instance BEFORE handing the file to opkg).
+# opkg stub: `status <pkg>` serves a control-style stanza (the rpcd's
+# pkg_version reads the Version line); everything else only logs, so even if
+# a future case reaches self-update, nothing gets installed. Calls also mark
+# the tmpxray log so the F18 cases can assert ordering (the proxied
+# self-update must stop the instance BEFORE handing the file to opkg).
+if [ "$1" = status ]; then
+	printf 'Package: %s\nStatus: install ok installed\nVersion: %s\nArchitecture: all\n' \
+		"$2" "${STUB_OPKG_VERSION:-9.9.9-1}"
+	exit 0
+fi
 echo "opkg $*" >> "${STUB_OPKG_LOG:-/dev/null}"
 echo "opkg-mark" >> "${STUB_TMPXRAY_LOG:-/dev/null}"
 exit 0
@@ -435,11 +442,16 @@ cat > "$SB/bin/apk" <<'EOF'
 #!/bin/sh
 # apk stub: `info -e <pkg>` answers from $STUB_APK_OWNS so a case can flip the
 # manager detection (whoever owns the installed package wins - the apk path
-# must be taken even with the opkg stub present). Everything else logs like
-# the opkg stub, so the ordering assertions are shared.
+# must be taken even with the opkg stub present); `list --installed <pkg>`
+# serves the version line the rpcd's pkg_version parses. Everything else
+# logs like the opkg stub, so the ordering assertions are shared.
 if [ "$1 $2" = "info -e" ]; then
 	[ -f "${STUB_APK_OWNS:-/nonexistent}" ] && exit 0
 	exit 1
+fi
+if [ "$1 $2" = "list --installed" ]; then
+	printf '%s-%s noarch {%s} () [installed]\n' "$3" "${STUB_APK_VERSION:-1.23-r2}" "$3"
+	exit 0
 fi
 echo "apk $*" >> "${STUB_APK_LOG:-/dev/null}"
 echo "apk-mark" >> "${STUB_TMPXRAY_LOG:-/dev/null}"
@@ -1345,6 +1357,19 @@ EOF
 		"$FIX/staged-clean.json" "$SB/work/cs-emptyhash.json"
 	out=$(rpccall config_save "$SB/work/cs-emptyhash.json")
 	ok_eq "rpcd config_save(empty hash): ok (what the UI sends when it has none)" "true" "$(jget "$out" '@.ok')"
+
+	# --- status -> app_version reads the version from whoever owns the
+	# package (pkgmgr.sh): opkg spelling straight from `opkg status`, apk
+	# spelling normalized -rN -> -N so it compares equal with the baked
+	# UI_VERSION and `xray-sub latest-version` on apk-based releases
+	out=$(rpccall status)
+	ok_eq "rpcd(app_version, opkg-owned): straight from opkg status" \
+		"9.9.9-1" "$(printf '%s' "$out" | jget '@.app_version')"
+	touch "$STUB_APK_OWNS"
+	out=$(rpccall status)
+	rm -f "$STUB_APK_OWNS"
+	ok_eq "rpcd(app_version, apk-owned): -rN normalized to ipk spelling" \
+		"1.23-2" "$(printf '%s' "$out" | jget '@.app_version')"
 
 	# --- hash path handling: symlinked config, and no config at all
 	rm -f "$CFG" "$CFG".bak.* "$CFG.new"

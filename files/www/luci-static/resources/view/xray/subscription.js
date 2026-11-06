@@ -14,7 +14,7 @@ var callDel    = rpc.declare({ object: 'xray-monitor', method: 'sub_del',  param
 var callEdit   = rpc.declare({ object: 'xray-monitor', method: 'sub_edit', params: [ 'id', 'prefix', 'url', 'enabled' ] });
 var callStatus = rpc.declare({ object: 'xray-monitor', method: 'status' });
 
-/* Baked by build-ipk.sh; compared with status.app_version in load(). LuCI
+/* Baked by build-common.sh; compared with status.app_version in load(). LuCI
  * serves modules without a cache buster, so after an upgrade the browser
  * may still run the previous JS - the banner asks for a hard reload. */
 var UI_VERSION = '__XRAY_MONITOR_VER__';
