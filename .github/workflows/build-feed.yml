@@ -85,6 +85,10 @@ jobs:
             https://busybox.net/downloads/busybox-1.38.0.tar.bz2
           mkdir /tmp/busybox && tar -xjf /tmp/busybox.tar.bz2 -C /tmp/busybox --strip-components=1
           make -C /tmp/busybox defconfig
+          # 1.38's networking/tc.c still uses CBQ uapi constants that linux
+          # >=6.15 headers (ubuntu-26.04) dropped; the suite never needs tc.
+          sed -i 's/^CONFIG_TC=y$/# CONFIG_TC is not set/' /tmp/busybox/.config
+          yes '' | make -C /tmp/busybox oldconfig
           make -C /tmp/busybox -j"$(nproc)"
           sudo install -m 0755 /tmp/busybox/busybox /usr/local/bin/busybox
           /usr/local/bin/busybox | sed -n '1p'
