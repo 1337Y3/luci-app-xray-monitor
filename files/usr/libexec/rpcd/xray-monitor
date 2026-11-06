@@ -81,20 +81,22 @@ get_api_services() {  # -> api_services, api_missing
 }
 
 # Installed package version in ipk spelling ("1.23-1"), regardless of the
-# package manager. Whoever owns the package wins: apk's db first (25.06+ may
-# carry an opkg compat package; 24.10 with an unused apk answers "not
-# installed"), then opkg, then plain apk (fresh install). apk versions carry
-# the release as "-rN" (apk rejects bare "-N"), normalized back so
-# app_version, the baked UI_VERSION and `xray-sub latest-version` all
-# compare equal.
+# package manager. The manager itself comes from xray-sub's pkg-manager
+# (whoever owns the installed package wins - single source of truth, shared
+# with self-update). apk versions carry the release as "-rN" (apk rejects
+# bare "-N"), normalized back so app_version, the baked UI_VERSION and
+# `xray-sub latest-version` all compare equal.
 pkg_version() {
-	if command -v apk >/dev/null 2>&1 && apk info -e "$PKG" >/dev/null 2>&1; then
-		apk list --installed "$PKG" 2>/dev/null | sed -n "s/^${PKG}-\([^ ]*\) .*/\1/p" | head -n1 | sed 's/-r\([0-9][0-9]*\)$/-\1/'
-	elif command -v opkg >/dev/null 2>&1; then
-		opkg status "$PKG" 2>/dev/null | sed -n 's/^Version: //p' | head -n1
-	elif command -v apk >/dev/null 2>&1; then
-		apk list --installed "$PKG" 2>/dev/null | sed -n "s/^${PKG}-\([^ ]*\) .*/\1/p" | head -n1 | sed 's/-r\([0-9][0-9]*\)$/-\1/'
-	fi
+	case "$("$SUB" pkg-manager 2>/dev/null)" in
+		apk)
+			apk list --installed "$PKG" 2>/dev/null \
+				| sed -n "s/^${PKG}-\([^ ]*\) .*/\1/p" | head -n1 \
+				| sed 's/-r\([0-9][0-9]*\)$/-\1/'
+			;;
+		opkg)
+			opkg status "$PKG" 2>/dev/null | sed -n 's/^Version: //p' | head -n1
+			;;
+	esac
 }
 
 get_status() {

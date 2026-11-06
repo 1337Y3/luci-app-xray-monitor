@@ -93,4 +93,9 @@ else
 fi
 rc=$?
 rm -f "$tmp"
-[ "$rc" -eq 0 ] && echo "Done — open LuCI: Services -> Xray Monitor."
+if [ "$rc" -eq 0 ]; then
+	echo "Done — open LuCI: Services -> Xray Monitor."
+else
+	echo "Install failed (rc=$rc) — the download is in the log above; re-run to retry."
+fi
+exit "$rc"

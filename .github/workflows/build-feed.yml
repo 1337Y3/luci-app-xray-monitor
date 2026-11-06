@@ -146,7 +146,9 @@ jobs:
         run: sh tests/pipeline-scenario.sh
 
   build:
-    if: github.event_name != 'pull_request'
+    # Package builds run on PRs too (they need apk-tools, fakeroot and the
+    # ld'd libapk.so - things the tests legs never touch); only the feed
+    # commit and the Release publish are main-only.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -168,6 +170,9 @@ jobs:
             -Dtests=disabled -Durl_backend=wget
           meson compile -C /tmp/apk-tools/build -j"$(nproc)"
           sudo meson install -C /tmp/apk-tools/build
+          # install puts libapk.so into /usr/local/lib/<triple> - without
+          # ldconfig every apk invocation dies loading the shared library
+          sudo ldconfig
           apk --version
 
       - name: Build .ipk + .apk and regenerate feed indexes
@@ -178,6 +183,7 @@ jobs:
           sh make-feed.sh
 
       - name: Commit updated feed
+        if: github.event_name != 'pull_request'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -191,6 +197,7 @@ jobs:
           fi
 
       - name: Publish GitHub Release (stable-named assets + sha256 sidecars)
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

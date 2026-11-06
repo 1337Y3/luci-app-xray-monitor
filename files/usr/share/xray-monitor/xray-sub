@@ -3,7 +3,7 @@
 # Commands: fetch | apply | status | set-cfg ... | cron-sync
 #         | sub-add <prefix> <url> | sub-del <id> | sub-edit <id> <prefix> <url> <enabled>
 #         | routing-get | routing-set <f> | balancers-get | balancers-set <f>
-#         | config-save <f> | enable-api
+#         | config-save <f> | enable-api | pkg-manager  (apk|opkg, for the rpcd)
 #         | overrides-list | overrides-apply   (sticky balancer pins, live bo)
 #         | tmpxray start <tag>... | tmpxray stop   (short-lived per-exit test xray)
 #         | e2e [tag...]   (end-to-end exit check: pull a body through each exit)
@@ -125,6 +125,23 @@ case "$e2e_url_bytes" in https://*|http://*) ;; *) e2e_url_bytes="https://speed.
 e2e_bytes=$(uci -q get xray-monitor.sub.e2e_bytes)
 case "$e2e_bytes" in ''|*[!0-9]*) e2e_bytes=1048576 ;; esac
 [ "$e2e_bytes" -ge 1024 ] && [ "$e2e_bytes" -le 104857600 ] || e2e_bytes=1048576
+
+# --- package manager (single source of truth for ipk/apk choices) ------------
+# Whoever OWNS the installed package wins: apk's db is asked first (25.06+
+# may carry an opkg compat package; a 24.10 box with an unused apk answers
+# "not installed" and falls through), then opkg, then apk (fresh installs).
+# `add`/`info`/`list` are all in the router apk's minimal applet set.
+pkg_manager() {  # -> stdout: apk | opkg; rc 1 = neither found
+	if command -v apk >/dev/null 2>&1 && apk info -e "$PKG" >/dev/null 2>&1; then
+		echo apk
+	elif command -v opkg >/dev/null 2>&1; then
+		echo opkg
+	elif command -v apk >/dev/null 2>&1; then
+		echo apk
+	else
+		return 1
+	fi
+}
 
 # --- fetch / self-update through xray (F18) ----------------------------------
 # Routers whose own internet path to the panel or GitHub is blocked, but whose
@@ -1476,21 +1493,15 @@ case "$1" in
 		curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Version: //p' | tail -n1
 		;;
 
+	pkg-manager)
+		# consumer: the rpcd backend's pkg_version() (see $RPCD pkg_version)
+		pkg_manager || { echo "none"; exit 1; }
+		;;
+
 	self-update)
-		# Package manager: whoever owns the installed package wins - apk's
-		# db is asked first (25.06+ may carry an opkg compat package; a 24.10
-		# box with an unused apk answers "not installed" and falls through).
-		# `add` is in the router apk's minimal applet set. The manager picks
-		# the release artifact extension.
-		if command -v apk >/dev/null 2>&1 && apk info -e "$PKG" >/dev/null 2>&1; then
-			upd_ext=apk
-		elif command -v opkg >/dev/null 2>&1; then
-			upd_ext=ipk
-		elif command -v apk >/dev/null 2>&1; then
-			upd_ext=apk
-		else
-			echo "no package manager (opkg/apk) found"; exit 1
-		fi
+		# The package manager (pkg_manager, shared with the rpcd backend)
+		# picks the release artifact extension: .ipk for opkg, .apk for apk.
+		upd_ext=$(pkg_manager) || { echo "no package manager (opkg/apk) found"; exit 1; }
 		if [ "$upd_ext" = apk ]; then
 			tmp="/tmp/luci-app-xray-monitor.apk"
 			upd_rel=$REL_APK
@@ -1565,7 +1576,10 @@ case "$1" in
 		exp=""
 		if [ "$upd_src" = release ]; then
 			exp=$(via_curl -fsSL --max-time 20 "$upd_rel.sha256" 2>/dev/null | awk 'NR==1 { print $1 }')
-		elif [ "$upd_ext" = apk ]; then
+		fi
+		# apk: release sidecar unreachable -> the feed sidecar, whatever the
+		# download source (mirrors the ipk path's release->feed resilience)
+		if [ -z "$exp" ] && [ "$upd_ext" = apk ]; then
 			exp=$(via_curl -s --max-time 20 "$FEED/luci-app-xray-monitor.apk.sha256" 2>/dev/null | awk 'NR==1 { print $1 }')
 		fi
 		if [ -z "$exp" ] && [ "$upd_ext" = ipk ]; then

@@ -287,20 +287,36 @@ echo 'src/gz xraymon https://1337y3.github.io/luci-app-xray-monitor' >> /etc/opk
 opkg update && opkg install luci-app-xray-monitor
 ```
 
-### apk (OpenWrt 25.06+)
+### apk (OpenWrt 25.06+) — read this first
 
-The apk feed index is `docs/packages.adb`. Repository lines are used verbatim by
-apk, and the `.adb` suffix is what makes it read the v3 index — add the FULL URL
-ending in `packages.adb` (not just the directory):
+Two apk behaviors make a native feed much less useful than the opkg one:
+
+1. **apk silently ignores an unsigned index.** `apk update` prints
+   `UNTRUSTED signature` and still exits 0; a following plain
+   `apk add luci-app-xray-monitor` then answers *no such package*. Every
+   command touching the feed needs `--allow-untrusted`.
+2. **`apk upgrade` never updates a file-installed package.** Installing via
+   `apk add <file>` (what the installer and self-update do) pins the package
+   in `/etc/apk/world` by checksum (`luci-app-xray-monitor><Q1…>`), so a newer
+   version in the feed is visible in `apk list --upgradable` but `apk upgrade`
+   skips it. Self-update/installer runs rewrite the pin to the new checksum —
+   that's the supported update path on apk.
+
+So on apk-based releases, **update via the one-line installer or the in-app
+Check-for-updates button** (both verified to rewrite the pin). The feed index
+`docs/packages.adb` still exists — with `--allow-untrusted` it works for
+name-based fresh installs and dependency resolution:
 
 ```sh
 echo 'https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs/packages.adb' \
   >> /etc/apk/repositories.d/customfeeds.list
-apk update && apk add luci-app-xray-monitor
+apk update && apk add --allow-untrusted luci-app-xray-monitor
 ```
 
-The index is unsigned, so if you ever install from it directly, use
-`apk add --allow-untrusted luci-app-xray-monitor`.
+(Repository lines are used verbatim by apk, and the `.adb` suffix is what makes
+it read the v3 index — the URL must be the FULL path to `packages.adb`, not
+just the directory. Making the feed signed — key in CI, public key shipped in
+`/etc/apk/keys` — would remove caveat 1 but not 2; possible future work.)
 
 Most people should just use the one-line installer above instead.
 
@@ -315,8 +331,9 @@ Most people should just use the one-line installer above instead.
 3. `sh make-feed.sh` — regenerates `docs/Packages[.gz]` (opkg),
    `docs/packages.adb` (apk) and the stable-named `.apk` + `.sha256` sidecar
    for the self-update feed fallback.
-4. `git commit` + `git push`. Routers pick it up on `opkg update && opkg upgrade`
-   / `apk update && apk upgrade`.
+4. `git commit` + `git push`. opkg routers pick it up on
+   `opkg update && opkg upgrade`; apk routers update through the one-line
+   installer or in-app self-update (see the apk feed caveats above).
 
 Then open LuCI → **Services → Xray Monitor** (hard-refresh the browser if the
 menu doesn't appear immediately). After an upgrade every tab also compares its

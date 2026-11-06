@@ -22,11 +22,12 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 stage_package "$HERE" "${1:-$HERE}"   # also installs the $WORK cleanup trap
 
 command -v apk >/dev/null 2>&1 || { echo "ERROR: apk-tools not found in PATH" >&2; exit 1; }
-# applet help exits 1; --version is the cheap "applet exists" probe
-apk mkpkg --version >/dev/null 2>&1 || {
+# NOTE: `apk mkpkg --version` exits 0 even for unknown applets - the only
+# reliable "applet exists" probe is apk's own unknown-applet message
+if apk mkpkg 2>&1 | grep -q 'is not an apk command'; then
 	echo "ERROR: this apk build has no mkpkg applet (the router's minimal apk drops it)" >&2
 	exit 1
-}
+fi
 
 APKVER=$(printf '%s' "$VER" | sed -n 's/-\([0-9][0-9]*\)$/-r\1/p')
 [ -n "$APKVER" ] || APKVER=$VER
@@ -65,10 +66,10 @@ cp "$WORK/control/postinst" "$SCR/post-install"
 cp "$WORK/control/postrm" "$SCR/post-deinstall"
 
 # ---- metadata + assembly ----
-# One-line description; keep in sync with build-ipk.sh's control block.
-# Escape like OpenWrt's description_escape (backslash, ", $, backtick).
+# One-line description; keep in sync with build-ipk.sh's control block. No
+# escaping needed: the value goes straight into argv (OpenWrt's Make-level
+# description_escape exists because ITS value passes through shell+make).
 DESC='LuCI app to monitor and manage Xray: service status, live traffic + rates (Stats API), connectivity probes, graphs, Remnawave subscription parser, routing/balancers, config editor. Pages under Services -> Xray Monitor.'
-DESC=$(printf '%s' "$DESC" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/\$/\\$/g' -e 's/`/\\`/g')
 
 OUT="$OUTDIR/${PKG}-${APKVER}.apk"
 set -- mkpkg -q \
