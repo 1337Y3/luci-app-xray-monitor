@@ -105,7 +105,11 @@ jobs:
           echo "sh under test: $(sh -c 'echo ash ok')"
           busybox --list | grep -qx flock || { echo "busybox lacks flock"; exit 1; }
           git clone --depth 1 https://github.com/openwrt/libubox /tmp/libubox
-          sudo install -D -m 0644 /tmp/libubox/jshn.sh /usr/share/libubox/jshn.sh
+          # libubox master moved jshn.sh from the repo root into sh/ - take
+          # it from wherever this clone keeps it.
+          JSHN_SH="$(find /tmp/libubox -maxdepth 2 -name jshn.sh | head -n1)"
+          [ -n "$JSHN_SH" ] || { echo "jshn.sh not found in libubox"; exit 1; }
+          sudo install -D -m 0644 "$JSHN_SH" /usr/share/libubox/jshn.sh
           git clone --depth 1 https://github.com/openwrt/jsonpath /tmp/jsonpath
           # jsonpath also hard-codes -Werror (same GCC 15 story as ucode)
           sed -i -e 's/-Werror=[a-z=-]*//g' -e 's/-Werror//g' /tmp/jsonpath/CMakeLists.txt
