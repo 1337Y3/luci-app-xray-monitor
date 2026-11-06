@@ -1364,12 +1364,12 @@ EOF
 	# UI_VERSION and `xray-sub latest-version` on apk-based releases
 	out=$(rpccall status)
 	ok_eq "rpcd(app_version, opkg-owned): straight from opkg status" \
-		"9.9.9-1" "$(printf '%s' "$out" | jget '@.app_version')"
+		"9.9.9-1" "$(jget "$out" '@.app_version')"
 	touch "$STUB_APK_OWNS"
 	out=$(rpccall status)
 	rm -f "$STUB_APK_OWNS"
 	ok_eq "rpcd(app_version, apk-owned): -rN normalized to ipk spelling" \
-		"1.23-2" "$(printf '%s' "$out" | jget '@.app_version')"
+		"1.23-2" "$(jget "$out" '@.app_version')"
 
 	# --- hash path handling: symlinked config, and no config at all
 	rm -f "$CFG" "$CFG".bak.* "$CFG.new"
