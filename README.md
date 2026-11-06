@@ -65,7 +65,8 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 - A **Reset counters** button (zeroes xray's cumulative totals via the Stats API)
 - A **Validate config** button (runs `xray -test` and shows the result)
 - A **Check for updates** button (compares the installed version to the feed and
-  can download + install the latest `.ipk` in place)
+  can download + install the latest package in place — `.ipk` via opkg or
+  `.apk` via apk, whichever the router uses)
 - An **Enable Stats API** banner/button if the API isn't detected
 - Traffic refreshes every 5 s; connectivity every 30 s while Auto-refresh ping is on
 - An **E2E column** (end-to-end check): pulls a real body through every exit —
@@ -138,9 +139,10 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
   and header capture apply on the proxied path, and the status row shows which
   transport actually moved bytes (`direct` / `via <tag>` / `direct, retried
   via <tag>`). Self-update downloads have their own switch
-  (`fetch_via_update`; `opkg install` itself always stays local). A
-  configured proxy path that cannot be established is an **honest failure** —
-  never a silent direct fallback that would leak the fetch to a blocking ISP.
+  (`fetch_via_update`; the `opkg install` / `apk add` itself always stays
+  local). A configured proxy path that cannot be established is an
+  **honest failure** — never a silent direct fallback that would leak the
+  fetch to a blocking ISP.
 
 **Routing**
 - Manage the tproxy **dokodemo-door inbounds**: add, rename, set the tproxy
@@ -244,24 +246,34 @@ the panel delivered, before diffing and staging:
 wget -qO- https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs/install.sh | sh
 ```
 
-This downloads the latest `.ipk` and installs it directly (`opkg install <file>`),
-which works with the default `option check_signature` **on** — no feed signing,
-no security changes. Re-run the same line any time to **upgrade**. It pulls from
-the **GitHub Release** (`releases/latest/download/luci-app-xray-monitor.ipk` — a
-single stable URL, robust on flaky links) and falls back to the raw feed.
+The installer detects the package manager and downloads the matching artifact:
+the **`.ipk`** on opkg-based releases (OpenWrt ≤ 24.10, `opkg install <file>` —
+works with the default `option check_signature` **on**, no feed signing, no
+security changes) or the **`.apk`** on apk-based releases (25.06+, `apk add
+--allow-untrusted <file>`). Re-run the same line any time to **upgrade**. It
+pulls from the **GitHub Release** (`releases/latest/download/…` — a single
+stable URL per artifact, robust on flaky links) and falls back to the raw feed.
+The in-app **Check for updates** button (and the hourly cron path) pick the
+right artifact the same way.
 
 Dependencies (`luci-base, xray-core, curl, ucode-mod-fs, ucode-mod-uci`) come from
-your normal OpenWrt feeds, so run `opkg update` once first if any are missing
-(`ucode` does the JSON work — no `jq` needed).
+your normal OpenWrt feeds, so run `opkg update` (or `apk update`) once first if
+any are missing (`ucode` does the JSON work — no `jq` needed).
 
 Fully manual fallback (e.g. if `raw.githubusercontent` is blocked but releases
 aren't): download once and install the file —
 ```sh
+# opkg (OpenWrt <= 24.10)
 wget -O /tmp/x.ipk https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.ipk
 opkg install /tmp/x.ipk
+# apk (OpenWrt 25.06+)
+wget -O /tmp/x.apk https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.apk
+apk add --allow-untrusted /tmp/x.apk
 ```
 
-## Native opkg feed (optional, advanced)
+## Native feeds (optional, advanced)
+
+### opkg (OpenWrt ≤ 24.10)
 
 You can add the repo as an opkg feed for native `opkg upgrade`, **but** OpenWrt's
 default `option check_signature` refuses unsigned feeds — `opkg install` from the
@@ -275,15 +287,55 @@ echo 'src/gz xraymon https://1337y3.github.io/luci-app-xray-monitor' >> /etc/opk
 opkg update && opkg install luci-app-xray-monitor
 ```
 
+### apk (OpenWrt 25.06+) — read this first
+
+Two apk behaviors make a native feed much less useful than the opkg one:
+
+1. **apk only reads an unsigned index under `--allow-untrusted`.** Without
+   the flag, `apk update` exits 0 but silently skips the repo (at best an
+   `UNTRUSTED signature` warning), and a plain `apk add
+   luci-app-xray-monitor` answers *no such package*. An `add` running with
+   the flag re-reads the index itself, so a plain earlier `apk update` does
+   no harm — but flagging both is the least surprising form.
+2. **`apk upgrade` never updates a file-installed package.** Installing via
+   `apk add <file>` (what the installer and self-update do) pins the package
+   in `/etc/apk/world` by checksum (`luci-app-xray-monitor><Q1…>`), so a newer
+   version in the feed is visible in `apk list --upgradable` but `apk upgrade`
+   skips it. Self-update/installer runs rewrite the pin to the new checksum —
+   that's the supported update path on apk.
+
+So on apk-based releases, **update via the one-line installer or the in-app
+Check-for-updates button** (both verified to rewrite the pin). The feed index
+`docs/packages.adb` still exists — with `--allow-untrusted` it works for
+name-based fresh installs and dependency resolution:
+
+```sh
+echo 'https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs/packages.adb' \
+  >> /etc/apk/repositories.d/customfeeds.list
+apk update --allow-untrusted && apk add --allow-untrusted luci-app-xray-monitor
+```
+
+(Repository lines are used verbatim by apk, and the `.adb` suffix is what makes
+it read the v3 index — the URL must be the FULL path to `packages.adb`, not
+just the directory. Making the feed signed — key in CI, public key shipped in
+`/etc/apk/keys` — would remove caveat 1 but not 2; possible future work.)
+
 Most people should just use the one-line installer above instead.
 
 ### Maintaining the feed (all local — no SDK, no router)
-1. Bump `VER` in `build-ipk.sh`.
-2. `rm -f docs/*.ipk && sh build-ipk.sh docs` — builds straight into the feed.
-   `build-ipk.sh` forces uid/gid 0 in the archive (GNU tar / bsdtar / BusyBox),
-   so the package installs as root regardless of build host.
-3. `sh make-feed.sh` — regenerates `docs/Packages[.gz]`.
-4. `git commit` + `git push`. Routers pick it up on `opkg update && opkg upgrade`.
+1. Bump `VER` in `build-common.sh`.
+2. `rm -f docs/*.ipk docs/*.apk docs/packages.adb && sh build-ipk.sh docs &&
+   sh build-apk.sh docs` — builds straight into the feed. Both builders force
+   uid/gid 0 (tar flags / fakeroot around `apk mkpkg`), so the package installs
+   as root regardless of build host. `build-apk.sh` needs apk-tools ≥ 3.0 with
+   the `mkpkg` applet (not the router's minimal apk — build apk-tools on the
+   host, or let CI do it).
+3. `sh make-feed.sh` — regenerates `docs/Packages[.gz]` (opkg),
+   `docs/packages.adb` (apk) and the stable-named `.apk` + `.sha256` sidecar
+   for the self-update feed fallback.
+4. `git commit` + `git push`. opkg routers pick it up on
+   `opkg update && opkg upgrade`; apk routers update through the one-line
+   installer or in-app self-update (see the apk feed caveats above).
 
 Then open LuCI → **Services → Xray Monitor** (hard-refresh the browser if the
 menu doesn't appear immediately). After an upgrade every tab also compares its

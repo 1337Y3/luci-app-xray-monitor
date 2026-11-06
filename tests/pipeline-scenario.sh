@@ -95,6 +95,7 @@ sed \
 	-e "s|/usr/share/xray-monitor/xray-sub|$SB/sub|g" \
 	-e "s|xray-monitor./xray-sub|sub|g" \
 	-e "s|/tmp/luci-app-xray-monitor\.ipk|$SB/tmp/luci-app-xray-monitor.ipk|g" \
+	-e "s|/tmp/luci-app-xray-monitor\.apk|$SB/tmp/luci-app-xray-monitor.apk|g" \
 	-e 's|^post_restart_hooks() {$|post_restart_hooks() { echo hook >> "${STUB_HOOK_LOG:-/dev/null}";|' \
 	"$SHARESRC/xray-sub" > "$SB/sub"
 for pat in "SHARE=$SB" "STATE=$SB" "XRAY=$SB" "LOCK=$SB" "TLOCK=$SB" "TSTATE_DIR=$SB" \
@@ -343,6 +344,7 @@ cat > "$SB/bin/curl" <<'EOF'
 # distinguishable), then answers from per-URL canned files so a whole
 # self-update can run against it:
 #   *.sha256  -> $STUB_CURL_SHA256     *.ipk -> $STUB_CURL_IPK
+#   *.apk     -> $STUB_CURL_APK
 #   *Packages -> $STUB_CURL_PACKAGES   else  -> $STUB_CURL_BODY (fetch body)
 # $STUB_CURL_HDR is copied into the -D header-dump file, keeping the
 # subscription-userinfo capture in play on the proxy path too. Flags:
@@ -399,6 +401,7 @@ done
 case "$url" in
 	*.sha256)  body="${STUB_CURL_SHA256:-}" ;;
 	*.ipk)     body="${STUB_CURL_IPK:-}" ;;
+	*.apk)     body="${STUB_CURL_APK:-}" ;;
 	*Packages) body="${STUB_CURL_PACKAGES:-}" ;;
 	*)         body="${STUB_CURL_BODY:-}" ;;
 esac
@@ -421,11 +424,37 @@ EOF
 
 cat > "$SB/bin/opkg" <<'EOF'
 #!/bin/sh
-# opkg stub: even if a future case reaches self-update, nothing gets installed.
-# Calls also mark the tmpxray log so the F18 cases can assert ordering (the
-# proxied self-update must stop the instance BEFORE handing the file to opkg).
+# opkg stub: `status <pkg>` serves a control-style stanza (the rpcd's
+# pkg_version reads the Version line); everything else only logs, so even if
+# a future case reaches self-update, nothing gets installed. Calls also mark
+# the tmpxray log so the F18 cases can assert ordering (the proxied
+# self-update must stop the instance BEFORE handing the file to opkg).
+if [ "$1" = status ]; then
+	printf 'Package: %s\nStatus: install ok installed\nVersion: %s\nArchitecture: all\n' \
+		"$2" "${STUB_OPKG_VERSION:-9.9.9-1}"
+	exit 0
+fi
 echo "opkg $*" >> "${STUB_OPKG_LOG:-/dev/null}"
 echo "opkg-mark" >> "${STUB_TMPXRAY_LOG:-/dev/null}"
+exit 0
+EOF
+cat > "$SB/bin/apk" <<'EOF'
+#!/bin/sh
+# apk stub: `info -e <pkg>` answers from $STUB_APK_OWNS so a case can flip the
+# manager detection (whoever owns the installed package wins - the apk path
+# must be taken even with the opkg stub present); `list --installed <pkg>`
+# serves the version line the rpcd's pkg_version parses. Everything else
+# logs like the opkg stub, so the ordering assertions are shared.
+if [ "$1 $2" = "info -e" ]; then
+	[ -f "${STUB_APK_OWNS:-/nonexistent}" ] && exit 0
+	exit 1
+fi
+if [ "$1 $2" = "list --installed" ]; then
+	printf '%s-%s noarch {%s} () [installed]\n' "$3" "${STUB_APK_VERSION:-1.23-r2}" "$3"
+	exit 0
+fi
+echo "apk $*" >> "${STUB_APK_LOG:-/dev/null}"
+echo "apk-mark" >> "${STUB_TMPXRAY_LOG:-/dev/null}"
 exit 0
 EOF
 cat > "$SB/bin/netstat" <<'EOF'
@@ -451,7 +480,7 @@ echo "$*" >> "${STUB_INITD_LOG:-/dev/null}"
 exit 0
 EOF
 cp "$SB/etc/init.d/xray" "$SB/etc/init.d/cron"
-chmod 0755 "$SB/bin/xray" "$SB/bin/pgrep" "$SB/bin/uci" "$SB/bin/opkg" \
+chmod 0755 "$SB/bin/xray" "$SB/bin/pgrep" "$SB/bin/uci" "$SB/bin/opkg" "$SB/bin/apk" \
 	"$SB/bin/netstat" "$SB/bin/ubus" "$SB/bin/curl" \
 	"$SB/etc/init.d/xray" "$SB/etc/init.d/cron" "$SB/sub"
 touch "$SB/lock/xray-monitor"
@@ -462,6 +491,7 @@ export STUB_HOOK_LOG="$SB/log/hooks.log"
 export STUB_INITD_LOG="$SB/log/initd.log"
 export STUB_PGREP_DOWN="$SB/flags/xray-down"
 export STUB_OPKG_LOG="$SB/log/opkg.log"
+export STUB_APK_LOG="$SB/log/apk.log"
 export STUB_API_OB="$SB/api/ob.tags"
 export STUB_API_DOWN="$SB/flags/api-down"
 export STUB_API_FAIL="$SB/flags/api-fail"
@@ -484,10 +514,12 @@ export STUB_UBUS_OUT="$SB/work/ubus-outbounds.json"
 export STUB_CURL_BODY="$FIX/sub1.json"
 export STUB_CURL_HDR="$SB/work/curl-hdrs.txt"
 export STUB_CURL_IPK="$SB/work/fake-update.ipk"
+export STUB_CURL_APK="$SB/work/fake-update.apk"
 export STUB_CURL_SHA256="$SB/work/fake-update.sha256"
 export STUB_CURL_PACKAGES="$SB/work/fake-Packages"
 export STUB_TMPXRAY_LOG="$SB/log/tmpxray.log"
 export STUB_TMPXRAY_FAIL="$SB/flags/tmpxray-fail"
+export STUB_APK_OWNS="$SB/flags/apk-owns"
 export STUB_CURL_FAIL_ALL="$SB/flags/curl-fail-all"
 export STUB_CURL_DIRECT_DOWN="$SB/flags/curl-direct-down"
 mkdir -p "$SB/api"
@@ -500,10 +532,12 @@ printf '%s\n' "xray-monitor.sub=xray-monitor" "xray-monitor.sub.backup_keep='3'"
 # survive the proxy path - store_usage parses it from the -D dump file)
 printf 'HTTP/1.1 200 OK\r\nsubscription-userinfo: upload=0; download=1234; total=5678; expire=0\r\n' > "$STUB_CURL_HDR"
 # a self-update payload the stub curl can serve: a real gzip tar (tar -tzf must
-# accept it) plus its correct .sha256 sidecar
+# accept it) plus its correct .sha256 sidecar, and an ADB-magic blob for the
+# apk path (pkg_ok only checks the 3-byte "ADB" container magic)
 mkdir -p "$SB/work/fake-pkg"
 echo "scenario fake package payload" > "$SB/work/fake-pkg/data.txt"
 tar -czf "$STUB_CURL_IPK" -C "$SB/work/fake-pkg" . 2>/dev/null
+printf 'ADBd-scenario-fake-apk-container' > "$STUB_CURL_APK"
 sha=$(sha256sum "$STUB_CURL_IPK" 2>/dev/null | awk '{ print $1 }')
 printf '%s  luci-app-xray-monitor.ipk\n' "$sha" > "$STUB_CURL_SHA256"
 printf 'Package: luci-app-xray-monitor\nVersion: 9.9.9-1\nFilename: luci-app-xray-monitor.ipk\nSHA256sum: %s\n' "$sha" > "$STUB_CURL_PACKAGES"
@@ -1324,6 +1358,19 @@ EOF
 	out=$(rpccall config_save "$SB/work/cs-emptyhash.json")
 	ok_eq "rpcd config_save(empty hash): ok (what the UI sends when it has none)" "true" "$(jget "$out" '@.ok')"
 
+	# --- status -> app_version reads the version from whoever owns the
+	# package (pkgmgr.sh): opkg spelling straight from `opkg status`, apk
+	# spelling normalized -rN -> -N so it compares equal with the baked
+	# UI_VERSION and `xray-sub latest-version` on apk-based releases
+	out=$(rpccall status)
+	ok_eq "rpcd(app_version, opkg-owned): straight from opkg status" \
+		"9.9.9-1" "$(jget "$out" '@.app_version')"
+	touch "$STUB_APK_OWNS"
+	out=$(rpccall status)
+	rm -f "$STUB_APK_OWNS"
+	ok_eq "rpcd(app_version, apk-owned): -rN normalized to ipk spelling" \
+		"1.23-2" "$(jget "$out" '@.app_version')"
+
 	# --- hash path handling: symlinked config, and no config at all
 	rm -f "$CFG" "$CFG".bak.* "$CFG.new"
 	cp "$FIX/config.json" "$SB/etc/xray/config.real.json"
@@ -1347,7 +1394,7 @@ via_reset() {  # <fetch_via> [fetch_via_exit] — uci, flags, logs, fetch state
 	rm -f "$STUB_TMPXRAY_FAIL" "$STUB_CURL_FAIL_ALL" "$STUB_CURL_DIRECT_DOWN"
 	rm -f "$SB/tmp/xray-monitor/e2e.json" "$SB/state/fetch_path" "$SB/state/update_path"
 	rm -f "$SB/state/usage-proxy.json" "$SB/state/title-proxy.txt" "$SB/state/tagmap-proxy.json"
-	rm -f "$SB/tmp/luci-app-xray-monitor.ipk"
+	rm -f "$SB/tmp/luci-app-xray-monitor.ipk" "$SB/tmp/luci-app-xray-monitor.apk"
 	# restore the correct checksum sidecar (the mismatch case overwrites it)
 	printf '%s  luci-app-xray-monitor.ipk\n' \
 		"$(sha256sum "$STUB_CURL_IPK" 2>/dev/null | awk '{ print $1 }')" > "$STUB_CURL_SHA256"
@@ -1507,6 +1554,26 @@ ok_eq "upd(auto retry): rc" 0 "$rc"
 ok_eq "upd(auto retry): direct attempts first, then proxied" "2 2" "$(grep -c 'socks=0' "$STUB_CURL_LOG") $(grep -c 'socks=1' "$STUB_CURL_LOG")"
 ok_eq "upd(auto retry): update_path token" "direct, retried via proxy-de" "$(cat "$SB/state/update_path" 2>/dev/null)"
 is "upd(auto retry): proxy instance stopped after the downloads" "$(grep -q '^stop$' "$STUB_TMPXRAY_LOG" && echo 1 || echo 0)"
+
+# 11) self-update when apk owns the package: .apk artifact + sidecar,
+#     `apk add --allow-untrusted`, opkg never touched - the detection asks
+#     whoever owns the installed package first, so apk wins even with an
+#     opkg binary present on the box
+via_reset direct
+# via_reset restores the ipk sidecar; this case downloads the .apk blob
+printf '%s  luci-app-xray-monitor.apk\n' \
+	"$(sha256sum "$STUB_CURL_APK" 2>/dev/null | awk '{ print $1 }')" > "$STUB_CURL_SHA256"
+touch "$STUB_APK_OWNS"
+o0=$(lines "$STUB_OPKG_LOG"); a0=$(lines "$STUB_APK_LOG")
+out=$(runsub self-update 2>/dev/null); rc=$?
+rm -f "$STUB_APK_OWNS"
+ok_eq "upd(apk): stdout" "updated" "$out"
+ok_eq "upd(apk): rc" 0 "$rc"
+ok_eq "upd(apk): apk ran once" "$((a0 + 1))" "$(lines "$STUB_APK_LOG")"
+is "upd(apk): apk add of the verified file, untrusted ok" "$(grep -q -- "add --allow-untrusted" "$STUB_APK_LOG" && echo 1 || echo 0)"
+ok_eq "upd(apk): opkg never called" "$o0" "$(lines "$STUB_OPKG_LOG")"
+ok_eq "upd(apk): .apk and .sha256 fetched directly" 2 "$(grep -c 'socks=0' "$STUB_CURL_LOG")"
+is "upd(apk): downloaded file cleaned up" "$([ ! -e "$SB/tmp/luci-app-xray-monitor.apk" ] && echo 1 || echo 0)"
 
 # restore the default uci answers so any later section sees the base state,
 # and drop the tmpxray-boundary override flag again

@@ -18,7 +18,7 @@ var callUpdApply  = rpc.declare({ object: 'xray-monitor', method: 'update_apply'
 var callE2eStatus = rpc.declare({ object: 'xray-monitor', method: 'e2e_status' });
 var callE2eStart  = rpc.declare({ object: 'xray-monitor', method: 'e2e_start' });
 
-/* Baked by build-ipk.sh; compared with status.app_version in load(). LuCI
+/* Baked by build-common.sh; compared with status.app_version in load(). LuCI
  * serves modules without a cache buster, so after an upgrade the browser
  * may still run the previous JS - the banner asks for a hard reload. */
 var UI_VERSION = '__XRAY_MONITOR_VER__';

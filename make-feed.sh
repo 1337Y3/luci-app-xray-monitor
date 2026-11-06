@@ -1,8 +1,12 @@
 #!/bin/sh
-# Generate an opkg feed index (Packages + Packages.gz) from the .ipk files in docs/.
-# Build first with:  sh build-ipk.sh docs   (forces root ownership on any host).
-# Run on macOS/Linux/CI; this only reads the .ipk files.
-#   sh make-feed.sh
+# Generate package feed indexes from the built packages in docs/.
+#   sh build-ipk.sh docs   &&   sh build-apk.sh docs   first.
+# - opkg (OpenWrt <= 24.10):  docs/Packages + docs/Packages.gz from the .ipk
+# - apk  (OpenWrt 25.06+):    docs/packages.adb via `apk mkndx` from the .apk,
+#   plus a stable-named copy + .sha256 sidecar for `xray-sub self-update`'s
+#   feed fallback (the .adb index is not parseable in POSIX sh).
+# Run on macOS/Linux/CI; apk output needs apk-tools >= 3.0 with mkndx (not
+# the router's minimal apk).
 set -e
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -30,4 +34,20 @@ done
 
 gzip -c "$PKGS" > "$PKGS.gz"
 echo "Wrote $PKGS and $PKGS.gz"
+
+# ---- apk feed ----
+stable="$FEED/luci-app-xray-monitor.apk"
+if ls "$FEED"/luci-app-xray-monitor-*.apk >/dev/null 2>&1; then
+	command -v apk >/dev/null 2>&1 || { echo "ERROR: .apk present but no apk-tools (mkndx) to index them"; exit 1; }
+	set -- mkndx --allow-untrusted --output "$FEED/packages.adb"
+	for apkf in "$FEED"/luci-app-xray-monitor-*.apk; do
+		set -- "$@" "$apkf"
+	done
+	apk "$@"
+	# stable name + sidecar consumed by the apk path of `xray-sub self-update`
+	newest=$(ls -t "$FEED"/luci-app-xray-monitor-*.apk | head -n1)
+	cp "$newest" "$stable"
+	sha256 "$stable" > "$stable.sha256"
+	echo "Wrote $FEED/packages.adb (+ stable-named apk + sha256 sidecar)"
+fi
 ls -l "$FEED"

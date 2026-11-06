@@ -10,7 +10,7 @@
  * Depends only on luci.js built-ins: the baseclass module and the
  * globals E() and _(). */
 
-/* Baked by build-ipk.sh at package time (the literal placeholder survives in
+/* Baked by build-common.sh at package time (the literal placeholder survives in
  * git and in tests). Every view carries the same constant and compares it
  * with status.app_version: LuCI 23.05 serves modules without a cache buster,
  * so after an upgrade the browser may keep running the previous JS until a

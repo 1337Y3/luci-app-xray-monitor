@@ -16,6 +16,7 @@ STATE=/etc/xray-monitor
 XRAY=/usr/bin/xray
 FEED="https://raw.githubusercontent.com/1337Y3/luci-app-xray-monitor/main/docs"
 REL="https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.ipk"
+REL_APK="https://github.com/1337Y3/luci-app-xray-monitor/releases/latest/download/luci-app-xray-monitor.apk"
 PKG=luci-app-xray-monitor
 
 config_file() {
@@ -124,6 +125,11 @@ case "$e2e_url_bytes" in https://*|http://*) ;; *) e2e_url_bytes="https://speed.
 e2e_bytes=$(uci -q get xray-monitor.sub.e2e_bytes)
 case "$e2e_bytes" in ''|*[!0-9]*) e2e_bytes=1048576 ;; esac
 [ "$e2e_bytes" -ge 1024 ] && [ "$e2e_bytes" -le 104857600 ] || e2e_bytes=1048576
+
+# --- package manager (shared with the rpcd backend) ---------------------------
+# pkg_manager() lives in its own tiny file: the rpcd sources it too - on
+# every ubus call - so forking this whole script for the pick is off limits.
+. "$SHARE/pkgmgr.sh"
 
 # --- fetch / self-update through xray (F18) ----------------------------------
 # Routers whose own internet path to the panel or GitHub is blocked, but whose
@@ -1476,18 +1482,41 @@ case "$1" in
 		;;
 
 	self-update)
-		tmp="/tmp/luci-app-xray-monitor.ipk"
-		# Only the DOWNLOADS go via xray when fetch_via_update says so; opkg
-		# install stays local and the SHA256 gate below is untouched. The
-		# downloads run through via_curl, so with a tmpxray port up they use
-		# the same exit, with identical flags otherwise.
+		# The package manager (pkg_manager, shared with the rpcd backend)
+		# picks the release artifact extension: .ipk for opkg, .apk for apk.
+		upd_ext=$(pkg_manager) || { echo "no package manager (opkg/apk) found"; exit 1; }
+		if [ "$upd_ext" = apk ]; then
+			tmp="/tmp/luci-app-xray-monitor.apk"
+			upd_rel=$REL_APK
+		else
+			tmp="/tmp/luci-app-xray-monitor.ipk"
+			upd_rel=$REL
+		fi
+		pkg_ok() {  # cheap container sanity of the download (the SHA256 gate below is the real check)
+			if [ "$upd_ext" = apk ]; then
+				# apk v3 packages are an ADB container, not tar
+				[ "$(head -c3 "$tmp" 2>/dev/null)" = "ADB" ]
+			else
+				tar -tzf "$tmp" >/dev/null 2>&1
+			fi
+		}
+		# Only the DOWNLOADS go via xray when fetch_via_update says so; the
+		# package-manager install stays local and the SHA256 gate below is
+		# untouched. The downloads run through via_curl, so with a tmpxray
+		# port up they use the same exit, with identical flags otherwise.
 		update_downloads() {  # -> $upd_src = release|feed; rc 1, $upd_err = reason
 			upd_src=""; upd_err=""
 			# 1) preferred: stable GitHub Release asset (single redirect, robust)
-			if via_curl -fsSL --max-time 60 -o "$tmp" "$REL" 2>/dev/null && tar -tzf "$tmp" >/dev/null 2>&1; then
+			if via_curl -fsSL --max-time 60 -o "$tmp" "$upd_rel" 2>/dev/null && pkg_ok; then
 				upd_src=release; return 0
 			fi
-			# 2) fallback: the opkg feed
+			# 2) fallback: the feed (opkg: filename from the Packages index;
+			#    apk: stable-named copy + its .sha256 sidecar, see make-feed.sh)
+			if [ "$upd_ext" = apk ]; then
+				via_curl -s --max-time 60 -o "$tmp" "$FEED/luci-app-xray-monitor.apk" || { upd_err="cannot reach Releases or feed"; return 1; }
+				pkg_ok || { upd_err="downloaded file is not a valid package (feed may be updating)"; return 1; }
+				upd_src=feed; return 0
+			fi
 			ipk=$(via_curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
 			[ -n "$ipk" ] || { upd_err="cannot reach Releases or feed"; return 1; }
 			via_curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { upd_err="download failed"; return 1; }
@@ -1522,15 +1551,21 @@ case "$1" in
 		fi
 		printf '%s\n' "$upd_path" > "$STATE/update_path"
 		# Integrity gate: verify the download against a published checksum
-		# before handing it to opkg. Preferred: the .sha256 sidecar next to
-		# the Release asset; else the SHA256sum of the matching Version
-		# stanza in the feed index. Neither available, or mismatch => refuse.
-		# (Checksum fetches ride the same transport the .ipk came over.)
+		# before handing it to the package manager. Preferred: the .sha256
+		# sidecar next to the Release asset; else the feed (apk: the stable
+		# copy's sidecar; opkg: the SHA256sum of the matching Version stanza
+		# in the Packages index). Neither available, or mismatch => refuse.
+		# (Checksum fetches ride the same transport the package came over.)
 		exp=""
 		if [ "$upd_src" = release ]; then
-			exp=$(via_curl -fsSL --max-time 20 "$REL.sha256" 2>/dev/null | awk 'NR==1 { print $1 }')
+			exp=$(via_curl -fsSL --max-time 20 "$upd_rel.sha256" 2>/dev/null | awk 'NR==1 { print $1 }')
 		fi
-		if [ -z "$exp" ]; then
+		# apk: release sidecar unreachable -> the feed sidecar, whatever the
+		# download source (mirrors the ipk path's release->feed resilience)
+		if [ -z "$exp" ] && [ "$upd_ext" = apk ]; then
+			exp=$(via_curl -s --max-time 20 "$FEED/luci-app-xray-monitor.apk.sha256" 2>/dev/null | awk 'NR==1 { print $1 }')
+		fi
+		if [ -z "$exp" ] && [ "$upd_ext" = ipk ]; then
 			ver=$(tar -xzOf "$tmp" ./control.tar.gz 2>/dev/null | tar -xzO ./control 2>/dev/null | sed -n 's/^Version: //p' | head -n1)
 			[ -n "$ver" ] || { rm -f "$tmp"; echo "cannot read package version - refusing to install"; exit 1; }
 			exp=$(via_curl -s --max-time 20 "$FEED/Packages" 2>/dev/null | awk -v want="$ver" '
@@ -1541,13 +1576,17 @@ case "$1" in
 		[ -n "$exp" ] || { rm -f "$tmp"; echo "no published SHA256 for this package version - refusing to install"; exit 1; }
 		got=$(sha256sum "$tmp" 2>/dev/null | awk '{ print $1 }')
 		[ "$got" = "$exp" ] || { rm -f "$tmp"; echo "SHA256 mismatch (expected $exp, got $got) - refusing to install"; exit 1; }
-		# downloads done: drop the proxy instance BEFORE opkg - installing the
-		# package restarts rpcd and replaces this very script, so only the TTL
+		# downloads done: drop the proxy instance BEFORE installing - the
+		# install restarts rpcd and replaces this very script, so only the TTL
 		# watchdog would be left to reap the instance
 		via_stop
-		opkg install --force-reinstall "$tmp"; rc=$?
+		if [ "$upd_ext" = apk ]; then
+			apk add --allow-untrusted "$tmp"; rc=$?
+		else
+			opkg install --force-reinstall "$tmp"; rc=$?
+		fi
 		rm -f "$tmp"
-		[ "$rc" -eq 0 ] && echo "updated" || { echo "opkg install failed"; exit 1; }
+		[ "$rc" -eq 0 ] && echo "updated" || { echo "package install failed"; exit 1; }
 		;;
 
 	enable-api)

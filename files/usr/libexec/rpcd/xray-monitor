@@ -5,6 +5,7 @@
 
 XRAY="/usr/bin/xray"
 API_SERVER="127.0.0.1:10085"
+PKG="luci-app-xray-monitor"
 
 # Resolve the active xray config file (for endpoint discovery)
 config_file() {
@@ -79,6 +80,24 @@ get_api_services() {  # -> api_services, api_missing
 	done
 }
 
+# Installed package version in ipk spelling ("1.23-1"), regardless of the
+# package manager (pkg_manager, sourced above: whoever owns the installed
+# package wins). apk versions carry the release as "-rN" (apk rejects bare
+# "-N"), normalized back so app_version, the baked UI_VERSION and
+# `xray-sub latest-version` all compare equal.
+pkg_version() {
+	case "$(pkg_manager)" in
+		apk)
+			apk list --installed "$PKG" 2>/dev/null \
+				| sed -n "s/^${PKG}-\([^ ]*\) .*/\1/p" | head -n1 \
+				| sed 's/-r\([0-9][0-9]*\)$/-\1/'
+			;;
+		opkg)
+			opkg status "$PKG" 2>/dev/null | sed -n 's/^Version: //p' | head -n1
+			;;
+	esac
+}
+
 get_status() {
 	local pid hz starttime sysuptime up=0 running=0 version
 	pid=$(pgrep -f "$XRAY run" | head -n1)
@@ -100,7 +119,7 @@ get_status() {
 	json_add_int pid "${pid:-0}"
 	json_add_int uptime "$up"
 	json_add_string version "${version:-unknown}"
-	json_add_string app_version "$(opkg status luci-app-xray-monitor 2>/dev/null | sed -n 's/^Version: //p' | head -n1)"
+	json_add_string app_version "$(pkg_version)"
 	json_add_boolean confdir_dup "$(confdir_dup "$pid" && echo 1 || echo 0)"
 	json_add_array "api_services"
 	for x in $api_services; do json_add_string "" "$x"; done
@@ -337,6 +356,12 @@ do_reset() {
 }
 
 SHARE=/usr/share/xray-monitor
+# pkg_manager(): the apk/opkg pick, shared with xray-sub. Sourced fresh on
+# every ubus call (the 5 s status polls included), so the file stays tiny
+# and no xray-sub fork happens just to learn the manager. Sourced here (not
+# at the top) because it rides on $SHARE; pkg_version() above only CALLS
+# pkg_manager at request time, well after this line has run.
+. "$SHARE/pkgmgr.sh"
 SUB=$SHARE/xray-sub
 
 # --- Balancers: live state + sticky overrides (F15) ---------------------------
@@ -709,7 +734,7 @@ case "$1" in
 				json_dump
 			;;
 			update_check)
-				installed=$(opkg status luci-app-xray-monitor 2>/dev/null | sed -n 's/^Version: //p' | head -n1)
+				installed=$(pkg_version)
 				latest=$("$SUB" latest-version 2>/dev/null)
 				json_init
 				json_add_string installed "${installed:-unknown}"
