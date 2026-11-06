@@ -119,7 +119,11 @@ jobs:
           # jsonpath also hard-codes -Werror (same GCC 15 story as ucode)
           sed -i -e 's/-Werror=[a-z=-]*//g' -e 's/-Werror//g' /tmp/jsonpath/CMakeLists.txt
           (cd /tmp/jsonpath && cmake -DCMAKE_BUILD_TYPE=Release . && make -j"$(nproc)")
-          sudo install -m 0755 /tmp/jsonpath/jsonfilter /usr/bin/jsonfilter
+          # upstream builds the binary as `jsonpath`; OpenWrt's package
+          # Makefile is what renames it to jsonfilter on the router
+          JP_BIN=/tmp/jsonpath/jsonfilter
+          [ -f "$JP_BIN" ] || JP_BIN=/tmp/jsonpath/jsonpath
+          sudo install -m 0755 "$JP_BIN" /usr/bin/jsonfilter
           echo '{"a":["b","c"]}' | jsonfilter -e '@.a[0]'
 
       - name: Golden tests (parse/apply/diff/routing/balancers)
