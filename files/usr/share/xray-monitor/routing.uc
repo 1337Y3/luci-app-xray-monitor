@@ -1,10 +1,13 @@
 #!/usr/bin/ucode
 // Read/write the tproxy inbounds and their inbound->exit routing rules.
 //   routing.uc get <config.json>
-//   routing.uc set <config.json> <desired.json> [out-path]
+//   routing.uc set <config.json> <desired.json> [out-path] [prefix ...]
 // desired.json = [ { "tag":..., "port":..., "exit":... }, ... ]
+// Prefixes (the subscriptions') keep the outbounds section's // group comments
+// intact on write - see render.uc.
 'use strict';
-import { readfile, writefile } from 'fs';
+import { readfile } from 'fs';
+import { split_outbounds, emit } from 'render';
 
 let action = ARGV[0];
 let cfg = json(readfile(ARGV[1]));
@@ -47,6 +50,8 @@ if (action == 'get') {
 else if (action == 'set') {
 	let desired = json(readfile(ARGV[2]));
 	let out_path = ARGV[3];
+	let prefixes = [];
+	for (let i = 4; i < length(ARGV); i++) push(prefixes, ARGV[i]);
 	let bs = balancer_set();
 
 	function mk_inbound(tag, port) {
@@ -88,7 +93,7 @@ else if (action == 'set') {
 	if (!cfg.routing) cfg.routing = {};
 	cfg.routing.rules = kept;
 
-	let s = sprintf('%.2J', cfg);
-	if (out_path) { writefile(out_path, s); printf('OK\n'); }
-	else printf('%s\n', s);
+	// plain %.2J would drop the outbounds' // group comments - re-render them
+	let so = split_outbounds(cfg, prefixes);
+	emit(cfg, so.groups, so.locals, out_path);
 }

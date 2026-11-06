@@ -1,0 +1,4 @@
+[
+{ "balancer": "fast", "outbound": "proxy-ch" },
+{ "balancer": "ghost", "outbound": "proxy-fi" }
+]

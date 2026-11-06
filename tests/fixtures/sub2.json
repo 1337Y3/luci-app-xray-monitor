@@ -1,0 +1,4 @@
+[
+  {"remarks":"DE - Frankfurt","outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"work-de-ffm.example.org","port":443,"users":[{"id":"f66fa661-d424-4583-b36e-524ab1f0afa4","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"work-de.example.org","fingerprint":"chrome","publicKey":"pbVjhWqqvXcvKZW2jH3mBa9BHuK5iOLXeiCBBB9XKA0","shortId":"ee01","spiderX":"/"}}}]},
+  {"remarks":"DE - Berlin","outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"work-de-ber.example.org","port":8443,"users":[{"id":"077f0772-d424-4583-b36e-524ab1f0afa4","encryption":"none"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"work-de.example.org"}}}]}
+]

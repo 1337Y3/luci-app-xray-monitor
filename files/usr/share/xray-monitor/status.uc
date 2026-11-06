@@ -34,12 +34,25 @@ uci.foreach('xray-monitor', 'subscription', function(s) {
 
 let cfg = load(cfg_path, {});
 let diff = load(diff_path, { added: [], removed: [], changed: [], total: 0 });
+// How the LAST apply hit the running xray (written by xray-sub's do_apply):
+// {"mode":"live"|"restart","reason":"",...,"fallback":0|1,"removed":N,"added":N,"ts":N}
+let last_apply = state_dir ? load(state_dir + '/last-apply.json', null) : null;
+// Which transport the last fetch / self-update actually used (F18): the exact
+// tokens xray-sub writes are "direct", "via <tag>" and "direct, retried via
+// <tag>"; an empty file / missing file = no fetch moved any bytes yet.
+function readtok(p) { let s = p ? readfile(p) : null; return s ? trim(s) : ''; }
+let fetch_path = state_dir ? readtok(state_dir + '/fetch_path') : '';
+let update_path = state_dir ? readtok(state_dir + '/update_path') : '';
 let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
 let servers = [], obs = cfg.outbounds ?? [];
 for (let i = 0; i < length(obs); i++) {
 	let o = obs[i];
 	if (!(o.protocol in proxy_protos)) continue;
-	let s = o.settings ?? {}, v = (s.vnext && s.vnext[0]) ? s.vnext[0] : {};
+	// vless/vmess keep the endpoint in settings.vnext[0]; trojan/shadowsocks
+	// (and anything else without vnext) in settings.servers[0].
+	let s = o.settings ?? {};
+	let v = (s.vnext && s.vnext[0]) ? s.vnext[0] :
+	        (s.servers && s.servers[0]) ? s.servers[0] : {};
 	let ss = o.streamSettings ?? {}, rs = ss.realitySettings ?? {}, xs = ss.xhttpSettings ?? {};
 	push(servers, { tag: o.tag, address: v.address, port: v.port, network: ss.network, mode: xs.mode, sni: rs.serverName });
 }
@@ -49,10 +62,14 @@ printf('%J\n', {
 	cron: (g('cron') == '0') ? false : true,
 	cron_schedule: g('cron_schedule') ?? '0 * * * *',
 	auto_apply: (g('auto_apply') == '1') ? true : false,
+	hot_swap: (g('hot_swap') == '0') ? false : true,
 	user_agent: g('user_agent') ?? '',
 	last_fetch: int(lf) ?? 0,
 	status: (st && length(st)) ? st : 'never',
+	fetch_path: fetch_path,
+	update_path: update_path,
 	pending: (pending == '1') ? true : false,
 	diff: diff,
+	last_apply: last_apply,
 	servers: servers
 });

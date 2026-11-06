@@ -1,0 +1,1 @@
+{"ts":1700000000,"results":{"proxy-x":{"status":"ok","ttfb_ms":300,"bytes":1000,"speed_bps":100,"ts":1700000000},"proxy-a":{"status":"ok","ttfb_ms":100,"bytes":500000,"speed_bps":500000,"ts":1700000001},"proxy-b":{"status":"ok","ttfb_ms":100,"bytes":500000,"speed_bps":500000,"ts":1700000002}}}

@@ -4,6 +4,13 @@
 #         | sub-add <prefix> <url> | sub-del <id> | sub-edit <id> <prefix> <url> <enabled>
 #         | routing-get | routing-set <f> | balancers-get | balancers-set <f>
 #         | config-save <f> | enable-api
+#         | overrides-list | overrides-apply   (sticky balancer pins, live bo)
+#         | tmpxray start <tag>... | tmpxray stop   (short-lived per-exit test xray)
+#         | e2e [tag...]   (end-to-end exit check: pull a body through each exit)
+#         | backups-list | backups-get <name> | backups-delete <name>
+#         | backups-pin <name> <0|1> | backups-restore <name>
+# `apply` reconciles subscription-outbound-only changes live via `xray api
+# rmo`/`ado` (no restart) when hot_swap is on - see the F14 block below.
 SHARE=/usr/share/xray-monitor
 STATE=/etc/xray-monitor
 XRAY=/usr/bin/xray
@@ -19,15 +26,157 @@ config_file() {
 CFG=$(config_file)
 mkdir -p "$STATE"
 
+# Mutating commands (fetch/apply/sub-*/set-cfg/routing-set/balancers-set/
+# config-save/enable-api/cron-sync/backups-delete/backups-pin/backups-restore/
+# overrides-apply) serialize on this lock so concurrent cron fetches and UI/RPC
+# clicks can't
+# interleave uci commits, staging and config
+# renames. Read-only commands skip it. The lock is a kernel flock held on fd 3
+# of this process (busybox `flock -n 3`): the kernel drops it when the holder
+# dies - even by SIGKILL/OOM, which cannot run the EXIT trap - so there is no
+# stale-orphan recovery left to get wrong (the old lock(1) + $LOCK_OWNER
+# scheme could hand the lock to two waiters at once when a killed holder was
+# recovered by two concurrent runs). The EXIT trap releases it on every path.
+LOCK=/var/lock/xray-monitor
+held=0
+# tmpxray start/stop serialize on their own mini-lock on fd 4 (contract B2):
+# a tmpxray session outlives the command, so holding the config LOCK for the
+# process lifetime would block fetch/apply - and taking the config LOCK at all
+# would make e2e runs (F13/F18) contend with config writes for no benefit.
+# Only the short start/stop critical sections take the mini-lock.
+TLOCK=/var/lock/xray-monitor-tmpxray
+TSTATE_DIR=/tmp/xray-monitor
+TSTATE=$TSTATE_DIR/tmpxray.json
+theld=0
+STAGE_DIR=""
+# via_* state for proxied fetches / self-updates (F18, see the block below):
+# via_stop is best-effort, bounded (tmpxray_kill waits <= ~4 s) and must never
+# change this script's exit status. NOT run for an instance started by the
+# `tmpxray` command itself - that one is meant to outlive the command.
+VIA_TAG=""; VIA_PORT=""; via_started=0; via_dead=0; via_err=""
+cleanup() {
+	via_stop
+	[ -n "$STAGE_DIR" ] && rm -rf "$STAGE_DIR"
+	if [ "$held" = 1 ]; then
+		flock -u 3 2>/dev/null
+		exec 3>&-
+	fi
+	if [ "$theld" = 1 ]; then
+		flock -u 4 2>/dev/null
+		exec 4>&-
+	fi
+	return 0
+}
+trap cleanup EXIT
+# cleanup runs on normal exits only; route the termination signals through
+# exit(1) so a signalled run still releases the lock and removes $STAGE_DIR.
+trap 'exit 1' INT TERM HUP
+
+# Take the mutation lock: a bounded poll of the non-blocking flock try
+# (~55 x 1 s). Every process must open its OWN descriptor of the lock file
+# (`exec 3>>`): an inherited descriptor is one shared open file description,
+# and a lock on it would not exclude the parent that passed it down.
+# CRITICAL: the lock lives on that descriptor, so a child spawned while it is
+# held and meant to outlive this script MUST close fd 3 (redirect `3>&-`),
+# or it holds the lock hostage for its whole lifetime. fd 4 (mini-lock) has
+# the same rule. The only such children are the tmpxray instance and its
+# watchdog - they close both descriptors; everything else we spawn is waited
+# for, and the xray daemon itself is procd's child, never ours.
+# XRAYMON_NOWAIT=1 (exported by the rpcd backend): a UI click must not sit
+# out the wait inside the rpcd call - the HTTP session can time out while the
+# operation would still run afterwards. One try only; the cron path keeps the
+# bounded wait.
+take_lock() {
+	local tries=0
+	# without flock(1) the poll below would spin its whole budget on a "not
+	# found" and fail every writer after ~55 s - fail at once with a reason
+	# instead (busybox on OpenWrt ships flock)
+	command -v flock >/dev/null 2>&1 || { echo "flock(1) not available - cannot serialize writes" >&2; return 1; }
+	exec 3>>"$LOCK" || return 1
+	while ! flock -n 3; do
+		[ "$XRAYMON_NOWAIT" = 1 ] && return 1
+		tries=$((tries + 1))
+		[ "$tries" -ge 55 ] && return 1
+		sleep 1
+	done
+	held=1
+	return 0
+}
+
 ua_default=$(uci -q get xray-monitor.sub.user_agent); [ -n "$ua_default" ] || ua_default="v2rayNG/1.8.0"
 cron=$(uci -q get xray-monitor.sub.cron); [ -n "$cron" ] || cron=1
 cron_schedule=$(uci -q get xray-monitor.sub.cron_schedule); [ -n "$cron_schedule" ] || cron_schedule="0 * * * *"
 auto_apply=$(uci -q get xray-monitor.sub.auto_apply); [ -n "$auto_apply" ] || auto_apply=0
 
-fetch_url() {  # <url> <user-agent> [header-dump-file]
-	local hdr="${3:-/dev/null}"
-	if command -v curl >/dev/null 2>&1; then curl -s -D "$hdr" -A "$2" --max-time 25 "$1"
-	else uclient-fetch -q -O - -U "$2" -T 25 "$1"; fi
+# --- e2e exit check options (contract B5 / F13) ------------------------------
+# e2e_cron/e2e_schedule drive the crontab line (do_cron_sync); the check is OFF
+# by default - it moves real traffic through every exit. URL defaults: a tiny
+# always-fast 204 endpoint for TTFB and a size-parameterized body URL (%d is
+# replaced with e2e_bytes, which makes the expected size exact; a fixed-size
+# custom URL without %d is instead judged by "transfer finished"). A malformed
+# value falls back to its default, so a stray UCI edit can never wedge cron.
+e2e_cron=$(uci -q get xray-monitor.sub.e2e_cron); [ -n "$e2e_cron" ] || e2e_cron=0
+e2e_schedule=$(uci -q get xray-monitor.sub.e2e_schedule); [ -n "$e2e_schedule" ] || e2e_schedule="30 4 * * *"
+e2e_url_204=$(uci -q get xray-monitor.sub.e2e_url_204)
+case "$e2e_url_204" in https://*|http://*) ;; *) e2e_url_204="https://cp.cloudflare.com/generate_204" ;; esac
+e2e_url_bytes=$(uci -q get xray-monitor.sub.e2e_url_bytes)
+case "$e2e_url_bytes" in https://*|http://*) ;; *) e2e_url_bytes="https://speed.cloudflare.com/__down?bytes=%d" ;; esac
+e2e_bytes=$(uci -q get xray-monitor.sub.e2e_bytes)
+case "$e2e_bytes" in ''|*[!0-9]*) e2e_bytes=1048576 ;; esac
+[ "$e2e_bytes" -ge 1024 ] && [ "$e2e_bytes" -le 104857600 ] || e2e_bytes=1048576
+
+# --- fetch / self-update through xray (F18) ----------------------------------
+# Routers whose own internet path to the panel or GitHub is blocked, but whose
+# xray exits can reach it. UCI (xray-monitor.sub):
+#   fetch_via         direct (default) | proxy | auto    subscription fetches
+#   fetch_via_update  0/direct (default) | proxy | auto  self-update downloads
+#   fetch_via_exit    an outbound tag, or auto (default) which exit to use
+# "via xray" = one tmpxray socks inbound (contract B2) for the ONE chosen exit,
+# then curl --socks5-hostname 127.0.0.1:<port> with the SAME user agent (incl.
+# the per-subscription override), the SAME --max-time bound and the SAME
+# response-header capture as the direct path. The instance is stopped on
+# success, on failure and from the EXIT trap (cleanup -> via_stop); the TTL
+# watchdog stays as the last-resort backstop. A configured proxy path that
+# cannot be established is an HONEST failure - never a silent direct fallback
+# (that would leak the fetch to an ISP that blocks it).
+via_norm() {  # <raw uci value> -> canonical direct|proxy|auto
+	case "$1" in
+		proxy) echo proxy ;;
+		auto)  echo auto ;;
+		*)     echo direct ;;   # "", "0", "direct" and typos = today's behavior
+	esac
+}
+fetch_via=$(via_norm "$(uci -q get xray-monitor.sub.fetch_via)")
+fetch_via_update=$(via_norm "$(uci -q get xray-monitor.sub.fetch_via_update)")
+fetch_via_exit=$(uci -q get xray-monitor.sub.fetch_via_exit); [ -n "$fetch_via_exit" ] || fetch_via_exit=auto
+
+fetch_url() {  # <url> <user-agent> [header-dump-file] [socks-port]
+	local hdr="${3:-/dev/null}" port="${4:-}"
+	if command -v curl >/dev/null 2>&1; then
+		if [ -n "$port" ]; then
+			# proxied fetch: only the transport changes. socks5-HOSTNAME so the
+			# panel's name is resolved at the exit, not by the blocked router.
+			curl -s -D "$hdr" -A "$2" --max-time 25 --socks5-hostname "127.0.0.1:$port" "$1"
+		else
+			curl -s -D "$hdr" -A "$2" --max-time 25 "$1"
+		fi
+	else
+		# uclient-fetch cannot speak socks5: a proxied fetch without curl is an
+		# honest failure, not a downgrade to a direct connection
+		[ -z "$port" ] || return 1
+		uclient-fetch -q -O - -U "$2" -T 25 "$1"
+	fi
+}
+
+# curl with the proxy appended when a via port is up (self-update downloads).
+# Every flag stays exactly as the direct path passes it; only the transport
+# changes, so timeouts and error handling are unchanged.
+via_curl() {  # <curl args...>
+	if [ -n "$VIA_PORT" ]; then
+		curl "$@" --socks5-hostname "127.0.0.1:$VIA_PORT"
+	else
+		curl "$@"
+	fi
 }
 
 # Parse the standard `subscription-userinfo` response header into usage state:
@@ -53,19 +202,50 @@ store_usage() {  # <key> <header-file>   key = subscription prefix (stable in bo
 }
 
 sub_ids() { uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=subscription$/\1/p'; }
+# Prefixes of ALL configured subscriptions, enabled or disabled. Everything
+# tagged <prefix> or <prefix>-* in config.json is "managed": fetch/apply may
+# replace or prune it. Proxy outbounds the user added by hand must therefore
+# never use one of these prefixes - they are preserved in the local block.
+sub_prefixes() {
+	local id p
+	for id in $(sub_ids); do
+		p=$(uci -q get "xray-monitor.$id.prefix")
+		printf '%s ' "${p:-proxy}"
+	done
+}
 valid_prefix() { echo "$1" | grep -qE '^[A-Za-z0-9_-]+$'; }
-prefix_in_use() {  # <prefix> <exclude-id>
-	local id; for id in $(sub_ids); do
+# A new prefix must not OVERLAP an existing one: "proxy" vs "proxy-work" (either
+# direction, or equality) makes the managed-tag rule "<prefix> or <prefix>-*"
+# ambiguous - ownership would depend on argument order and staged groups could
+# carry the same outbound tag twice, which xray -test rejects. Prints the
+# conflicting existing prefix and returns 0 when <new> overlaps, 1 otherwise.
+prefix_conflict() {  # <new-prefix> <exclude-id>
+	local id e
+	for id in $(sub_ids); do
 		[ "$id" = "$2" ] && continue
-		[ "$(uci -q get "xray-monitor.$id.prefix")" = "$1" ] && return 0
-	done; return 1
+		e=$(uci -q get "xray-monitor.$id.prefix"); [ -n "$e" ] || e=proxy
+		if [ "$1" = "$e" ]; then printf '%s\n' "$e"; return 0; fi
+		case "$1" in "$e"-*) printf '%s\n' "$e"; return 0 ;; esac   # new nests under existing
+		case "$e" in "$1"-*) printf '%s\n' "$e"; return 0 ;; esac   # existing nests under new
+	done
+	return 1
 }
 
-# Keep the newest $1 (default 3) "$CFG.bak.*" backups, delete the rest.
-# Only ever runs after a config change verified working (xray -test + restart).
+# Keep the newest N "$CFG.bak.*" backups, delete the rest. N comes from UCI
+# xray-monitor.sub.backup_keep (default 5, 0 = keep everything); an explicit
+# argument overrides (tests). Pinned backups (see backups-pin) neither count
+# towards N nor are ever deleted. Only ever runs after a config change
+# verified working (xray -test + restart).
 prune_backups() {
-	local keep="${1:-3}" f n=0
+	local keep="${1:-$(uci -q get xray-monitor.sub.backup_keep)}"
+	case "$keep" in ''|*[!0-9]*) keep=5 ;; esac
+	[ "$keep" -gt 0 ] || return 0
+	local f n=0
 	for f in $(ls -t "$CFG".bak.* 2>/dev/null); do
+		case "$(basename "$f")" in *.pinned.*) continue ;; esac
+		# Only pipeline-shaped backups are managed here; a stray user-made
+		# config.json.bak.* neither counts towards the budget nor is deleted.
+		backup_meta "${f##*/}" >/dev/null || continue
 		n=$((n + 1))
 		[ "$n" -le "$keep" ] && continue
 		[ "$f" = "$CFG" ] && continue   # never the live config
@@ -73,13 +253,220 @@ prune_backups() {
 	done
 }
 
+# --- config.json backups -----------------------------------------------------
+# Backups are created by the write pipeline as "$CFG.bak.<kind>.<ts>" with kind
+# empty (auto), "manual" or "preapi". Pinning renames a backup to
+# "$CFG.bak.pinned.<kind>.<ts>" - the only difference is the name; prune_backups
+# leaves anything matching "*.pinned.*" alone. Clients (rpcd, UI) only ever see
+# and send the basename: it is checked against a strict charset AND against
+# this real directory listing, and the path is always rebuilt from $CFG's own
+# directory - a client-provided path is never used to touch the filesystem.
+
+backup_names() {  # basenames of all backups, newest first
+	local b
+	for b in $(ls -t "$(dirname "$CFG")/$(basename "$CFG").bak."* 2>/dev/null); do
+		echo "${b##*/}"
+	done
+}
+
+# Parse a backup basename into "<kind> <ts> <pinned>"; rc 1 = not a backup of
+# ours (wrong prefix or no trailing timestamp - such files are ignored by the
+# backup commands and never listed or restorable).
+backup_meta() {  # <basename>
+	local pfx="$(basename "$CFG").bak." rest="$1" kind pinned=0
+	case "$rest" in "$pfx"*) rest="${rest#"$pfx"}" ;; *) return 1 ;; esac
+	case "$rest" in pinned.*) pinned=1; rest="${rest#pinned.}" ;; esac
+	case "$rest" in manual.*) kind=manual; rest="${rest#manual.}" ;;
+		preapi.*) kind=preapi; rest="${rest#preapi.}" ;;
+		*)       kind=auto ;;
+	esac
+	case "$rest" in
+		20[0-9][0-9][01][0-9][0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9]) ;;
+		*) return 1 ;;
+	esac
+	echo "$kind $rest $pinned"
+}
+
+# Resolve a client-supplied basename to an existing backup file (prints the
+# path). Rejects anything that is not a plain basename, not in backup_names(),
+# or not pipeline-shaped (backup_meta) - the membership check is what actually
+# authorizes the access, so get/delete/pin/restore see exactly the set that
+# backups-list shows.
+backup_path() {  # <basename>
+	local name="$1" b
+	case "$name" in
+		''|*[!A-Za-z0-9._-]*) return 1 ;;   # strict charset; no /, no NUL-ish tricks
+	esac
+	for b in $(backup_names); do
+		if [ "$b" = "$name" ]; then
+			backup_meta "$name" >/dev/null || return 1
+			echo "$(dirname "$CFG")/$name"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Dot-paths INSIDE an outbound whose change must not read as a diff, e.g. the
+# panel-randomized spiderX. Defaults to streamSettings.realitySettings.spiderX;
+# setting the list (uci add_list xray-monitor.sub.diff_ignore='<a.b.c>')
+# replaces the default. Apply always writes the staged outbounds in full.
+diff_ignore() {
+	local list
+	list=$(uci -q get xray-monitor.sub.diff_ignore)
+	if [ -n "$list" ]; then echo "$list"; else echo "streamSettings.realitySettings.spiderX"; fi
+}
+# The same list as diff.uc/hotswap.uc ARGUMENTS: each path as `ignore=<path>`
+# (NOT after a `--` separator - the 23.05 ucode drops a literal `--` from a
+# script's ARGV, which would feed every path into the prefixes; prefixes
+# cannot contain `=`, so the spelling is unambiguous - see diff.uc's header).
+diff_ignore_args() {
+	local p
+	for p in $(diff_ignore); do printf 'ignore=%s ' "$p"; done
+}
+
 # Stats API reachability probe (rc 0 = answering on 127.0.0.1:10085).
 APISRV="127.0.0.1:10085"
 api_up() { "$XRAY" api statsquery --server="$APISRV" >/dev/null 2>&1; }
 
+# --- hot-swap apply (F14) ---------------------------------------------------
+# When the ONLY change of an apply is the membership/bodies of the managed
+# subscription outbounds, reconcile the RUNNING xray with `xray api rmo`/`ado`
+# instead of restarting it. The full reasoning (from the xray-core sources) is
+# in hotswap.uc's header; the load-bearing facts for this shell code:
+#   - a changed body is remove+add of the same tag (no alter operation exists),
+#     and adds must FOLLOW the removals ("existing tag found" otherwise);
+#   - adds must run in the plan's order: the candidate's first outbound re-
+#     claims the default handler when the old default was removed;
+#   - `lso` lists the running outbound tags (order random - compare as sets);
+#     removing an unknown tag is a no-op success, adding a known tag fails;
+#   - balancers/observatories follow outbound add/remove live (new members
+#     carry traffic after at most one observatory probe round).
+# Everything runs inside the mutation lock the apply command already holds;
+# every xray-api child here is waited for, so none outlives fd 3.
+# On ANY step failing, fall back to the documented recipe: restore the
+# pre-change snapshot ($COMMIT_BAK) when it exists + full restart +
+# verify_or_rollback - the restart+verify ALWAYS run, even when the snapshot
+# itself is missing (see the fallback block in do_apply).
+# hot_swap (UCI xray-monitor.sub.hot_swap, default 1) turns the whole thing
+# off - then every apply restarts, exactly as before F14.
+hot_swap=$(uci -q get xray-monitor.sub.hot_swap); [ -n "$hot_swap" ] || hot_swap=1
+
+# The RUNNING outbound tag list as raw JSON (empty output + rc != 0 = the
+# HandlerService is not answering: API disabled, xray down, or too old).
+lso_out() { "$XRAY" api lso --server="$APISRV" 2>/dev/null; }
+
+# The outbound tags of a config file, one per line, config order.
+config_tags() { jsonfilter -i "$1" -e '@.outbounds[*].tag' 2>/dev/null | sed '/^$/d'; }
+
+# Set-compare of two tag lists (files, one tag per line): rc 0 = same set.
+tags_same_set() {  # <a> <b>
+	[ "$(sort -u < "$1")" = "$(sort -u < "$2")" ]
+}
+
+# How the last apply was applied - status.uc hands it to the subscription tab:
+#   mode: "live" (xray api rmo/ado, no restart) | "restart" (classic pipeline)
+#   reason: "" | why a restart was chosen instead of the live path
+#           ("changes-beyond-outbounds", "tag-charset", "default-outbound",
+#            "api-unavailable", "running-state-mismatch", "plan-unavailable"),
+#            or "hot-swap-failed" together with fallback=1 when a live
+#            attempt had to roll back
+write_last_apply() {  # <mode> <reason> <fallback 0|1> <removed> <added>
+	printf '{"mode":"%s","reason":"%s","fallback":%s,"removed":%s,"added":%s,"ts":%s}\n' \
+		"$1" "$2" "$3" "${4:-0}" "${5:-0}" "$(date +%s)" > "$STATE/last-apply.json"
+}
+
+# Reconcile the running xray with the freshly installed candidate (commit_config
+# no-restart already put it at $CFG). rc 0 = live applied and verified;
+# rc 1 = failed at some step, the caller runs the documented fallback.
+hotswap_apply() {  # <plan-json> <candidate>
+	local plan="$1" cand="$2"
+	local rmo_tags add_tags t first=1 lsout
+
+	rmo_tags=$(printf '%s' "$plan" | jsonfilter -e '@.remove[*]' 2>/dev/null | sed '/^$/d')
+	add_tags=$(printf '%s' "$plan" | jsonfilter -e '@.add[*]' 2>/dev/null | sed '/^$/d')
+
+	# Removals first, tags via a JSON file: `rmo` treats an argument that
+	# happens to name a readable file as a config, so a tag must never travel
+	# as a bare argument. Strict tag charset - the JSON is built by hand here.
+	if [ -n "$rmo_tags" ]; then
+		printf '{"outbounds":[' > "$STAGE_DIR/rmo.json"
+		for t in $rmo_tags; do
+			case "$t" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+			[ "$first" = 1 ] || printf ',' >> "$STAGE_DIR/rmo.json"
+			first=0
+			printf '{"tag":"%s"}' "$t" >> "$STAGE_DIR/rmo.json"
+		done
+		printf ']}' >> "$STAGE_DIR/rmo.json"
+		# rmo prints a line per tag; only its rc matters here. -t 10: the
+		# default 3 s deadline spans dialing AND the whole batch (one context
+		# per invocation) - too tight for a large batch on slow hardware, and
+		# a timeout there would push every apply into the fallback.
+		"$XRAY" api rmo -t 10 --server="$APISRV" "$STAGE_DIR/rmo.json" >/dev/null 2>&1 || return 1
+	fi
+
+	# Adds in the plan's (candidate) order, bodies lifted verbatim from the
+	# candidate - the same JSON `xray -test` already validated, so the client
+	# side of ado cannot choke on an unknown field.
+	if [ -n "$add_tags" ]; then
+		"$SHARE/hotswap.uc" adds "$cand" $add_tags > "$STAGE_DIR/ado.json" 2>/dev/null || return 1
+		"$XRAY" api ado -t 10 --server="$APISRV" "$STAGE_DIR/ado.json" >/dev/null 2>&1 || return 1
+	fi
+
+	# Verify the RUNNING set now equals the candidate's (lso order is random,
+	# so compare as sets). This also proves xray is alive and answering gRPC.
+	lsout=$(lso_out) || return 1
+	printf '%s' "$lsout" | jsonfilter -e '@.outbounds[*].tag' 2>/dev/null | sed '/^$/d' | sort -u > "$STAGE_DIR/ran.tags"
+	config_tags "$cand" | sort -u > "$STAGE_DIR/want.tags"
+	tags_same_set "$STAGE_DIR/ran.tags" "$STAGE_DIR/want.tags" || return 1
+	return 0
+}
+
+# Candidate configs for `xray -test` are staged as $d/config.json inside their
+# own mktemp(1) directory, never next to $CFG: when xray runs with `-confdir D`
+# it loads every D/*.json, so a leftover `config.json.new.json` there would be
+# double-loaded. The extension-less copy keeps the final rename atomic on the
+# same filesystem while staying invisible to -confdir. Removed by the EXIT trap.
+#   stage_init      -> $STAGE_DIR created, candidate = $STAGE_DIR/config.json
+#   test_config     -> xray -test on a candidate (no writes anywhere)
+#   install_config  -> cp -> <target>.new -> mv onto the target (atomic)
+#   test_and_install <candidate> -> test_config || return; install_config
+#   commit_config <kind> <need_api> <candidate> [no-restart] -> test_config,
+#     snapshot, install_config, restart, verify_or_rollback, post_restart_hooks,
+#     prune_backups - the single entry point every writer funnels through
+# Writers run test_config BEFORE making the backup: a backup is only worth
+# keeping if a verified candidate actually follows it, and prune_backups keeps
+# only the newest backup_keep (UCI xray-monitor.sub.backup_keep, default 5) -
+# a series of failed attempts must not evict the meaningful ones.
+stage_init() {
+	STAGE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/xraymon.XXXXXX") || exit 1
+}
+
+test_config() {  # <candidate config.json> — validate only; no config writes
+	"$XRAY" -test -format json -config "$1" >/dev/null 2>&1
+}
+
+install_config() {  # <validated candidate> — atomically replace the live config
+	# $CFG may be a symlink (config-save used to write through it with `cat >`);
+	# cp+mv on $CFG itself would replace the LINK with a regular file. Resolve
+	# the target so the symlink survives and the rename stays atomic on it.
+	local target="$CFG" tmp
+	[ -L "$target" ] && target=$(readlink -f "$target")
+	tmp="$target.new"
+	cp "$1" "$tmp" && mv "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+}
+
+test_and_install() {  # <candidate config.json> — test, then install
+	test_config "$1" || return 1
+	install_config "$1"
+}
+
 # After a config change + restart, confirm xray came back healthy; if not,
 # restore the pre-change backup and restart. $1 = backup file to restore,
 # $2 = 1 to also require the stats API to answer (else only require xray up).
+# The restore goes through install_config (never `cp onto $CFG`): $CFG may be
+# a symlink, and a plain copy would replace the LINK with a regular file - the
+# same reason the write path resolves the target first.
 verify_or_rollback() {
 	local bak="$1" need_api="$2" i
 	for i in 1 2 3 4 5; do
@@ -88,16 +475,802 @@ verify_or_rollback() {
 		fi
 		sleep 1
 	done
-	[ -f "$bak" ] && cp -a "$bak" "$CFG"
-	/etc/init.d/xray restart >/dev/null 2>&1
+	[ -f "$bak" ] && install_config "$bak"
+	# Close the mutation-lock fds for the child: anything the init script
+	# forks must not inherit fd 3/4 - a leaked flock would outlive this
+	# xray-sub run and block the next writer. Same at every init.d call.
+	/etc/init.d/xray restart >/dev/null 2>&1 3>&- 4>&-
 	return 1
 }
+
+# --- sticky balancer overrides (F15) -----------------------------------------
+# A sticky override pins one balancer to one outbound: applied LIVE through the
+# RoutingService (`xray api bo`) and persisted as a UCI `balancer_override`
+# section (options: balancer, outbound) so it survives restarts. The override
+# table lives in the RUNNING xray's memory only - it is not part of
+# config.json, so every restart (ours or an external one) drops it and UCI is
+# the only durable copy. The Balancers tab drives this through the rpcd
+# methods balancer_override_set / _del / _apply; post_restart_hooks re-applies
+# the persisted set after every config-writing restart.
+
+# Persisted overrides as JSON, one object per line inside an array. Only
+# sections carrying a valid-charset balancer+outbound pair are emitted: a
+# hand-edited UCI value must never break the JSON document this feeds.
+overrides_list() {
+	local id first=1 b o
+	printf '[\n'
+	for id in $(uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=balancer_override$/\1/p'); do
+		b=$(uci -q get "xray-monitor.$id.balancer"); o=$(uci -q get "xray-monitor.$id.outbound")
+		echo "$b" | grep -qE '^[A-Za-z0-9_.-]+$' || continue
+		echo "$o" | grep -qE '^[A-Za-z0-9_.-]+$' || continue
+		[ "$first" = 1 ] || printf ',\n'
+		first=0
+		printf '{"balancer":"%s","outbound":"%s"}' "$b" "$o"
+	done
+	printf '\n]\n'
+}
+
+# Re-apply every persisted override to the RUNNING xray via bo. Sections whose
+# balancer no longer exists in the config are skipped (bo rejects unknown
+# balancer tags; a stale section must not read as a failure on every restart).
+# Sets OV_APPLIED / OV_SKIPPED / OV_FAILED; returns 0 = everything applicable
+# applied (or nothing to do), 1 = some bo call failed, 2 = cannot start.
+# Called by post_restart_hooks (in-process, under the caller's lock; output
+# must go to stderr only - stdout belongs to the writer's message) and by the
+# overrides-apply command.
+OV_APPLIED=0
+OV_SKIPPED=0
+OV_FAILED=""
+overrides_apply() {
+	local tmp appl bal out total nfail
+	OV_APPLIED=0; OV_SKIPPED=0; OV_FAILED=""
+	command -v ucode >/dev/null 2>&1 || return 2
+	[ -f "$CFG" ] || return 2
+	tmp=$(mktemp "${TMPDIR:-/tmp}/xraymon.ovr.XXXXXX") || return 2
+	overrides_list > "$tmp"
+	total=$(grep -c '"balancer":' "$tmp" 2>/dev/null); total=${total:-0}
+	# stale-section filter (pure logic, golden-tested in balance.uc)
+	appl=$("$SHARE/balance-cli.uc" applicable "$CFG" "$tmp" 2>/dev/null)
+	rm -f "$tmp"
+	if [ -n "$appl" ]; then
+		# each bo is bounded by xray's own -t: a down API fails after ~2 s
+		# instead of hanging. Values come back from ucode with a validated
+		# charset, so word-splitting the two columns is safe.
+		while read -r bal out; do
+			[ -n "$bal" ] || continue
+			if "$XRAY" api bo --server="$APISRV" -t 2 -b "$bal" "$out" >/dev/null 2>&1; then
+				OV_APPLIED=$((OV_APPLIED + 1))
+			else
+				OV_FAILED="$OV_FAILED $bal"
+			fi
+		done <<EOF
+$appl
+EOF
+	fi
+	nfail=$(printf '%s' "$OV_FAILED" | wc -w | tr -d ' ')
+	OV_SKIPPED=$((total - OV_APPLIED - nfail))
+	[ -z "$OV_FAILED" ] || return 1
+	return 0
+}
+
+# Extension point: invoked under the write lock after every successful
+# restart+verify, before prune_backups - $CFG already holds the new config and
+# xray is confirmed healthy. Its return value is ignored (the change is already
+# live), hooks report their own failures - and must stay silent on stdout: the
+# writer's message ("ok", "saved and restarted xray", ...) is what the rpcd
+# layer relays. F15: a restart always drops xray's in-memory override table,
+# so the persisted sticky overrides are re-applied here (bo).
+post_restart_hooks() {
+	local hookrc
+	hookrc=0; overrides_apply || hookrc=$?
+	case "$hookrc" in
+		0) [ "$OV_APPLIED" -gt 0 ] && echo "xray-monitor: re-applied $OV_APPLIED balancer override(s) after restart" >&2 ;;
+		2) echo "xray-monitor: could not re-apply balancer overrides (ucode not installed)" >&2 ;;
+		*) echo "xray-monitor: balancer override re-apply failed:$OV_FAILED" >&2 ;;
+	esac
+	return 0
+}
+
+# --- Config write pipeline ----------------------------------------------
+# One place for everything that happens AFTER a writer has produced its
+# candidate config (formerly five copies of the same sequence in do_apply /
+# routing-set / balancers-set / config-save / enable-api): `xray -test` the
+# candidate, snapshot the live config, atomically replace it (install_config,
+# symlink-aware), restart xray, verify it came back (rolling back to the
+# snapshot otherwise), then the extension point and backup pruning. Writers
+# keep their transform (.uc call) and their user-facing messages / exit codes
+# - commit_config itself prints nothing and returns:
+#   0  installed (and healthy, unless no-restart)
+#   1  `xray -test` rejected the candidate - nothing written, no snapshot
+#   2  installed but unhealthy - snapshot restored, xray restarted again
+#   3  install_config failed - $CFG untouched, snapshot kept
+# The candidate is always validated BEFORE the snapshot is taken, so a
+# rejected candidate leaves no backup behind (see the note above prune_backups).
+# The status of prune_backups / post_restart_hooks never leaks into the return
+# value: rc 0 means the new config is installed and healthy, nothing else.
+# Usage: commit_config <kind> <need_api> <candidate> [no-restart]
+#   kind      backup tag: "" = automatic timestamp-only name, else a word
+#             ("manual", "preapi", ...) -> $CFG.bak[.<kind>].<YYYYmmdd-HHMMSS>
+#   need_api  1 = the health check must also require the stats API (the
+#             caller's api_before), 0 = xray running is enough
+#   candidate the finished candidate - $STAGE_DIR/config.json, or the
+#             uploaded file as-is for config-save
+#   no-restart (4th arg) skips restart/verify/hooks/prune: validate, snapshot
+#             and replace only. Hot-swap (F14) reconciles the running xray
+#             with `xray api` afterwards and, if that fails, falls back to a
+#             full restart + verify against the snapshot in $COMMIT_BAK.
+# $COMMIT_BAK holds the snapshot path on return ("" when none was taken).
+# Callers hold the write lock.
+COMMIT_BAK=""
+commit_config() {  # <kind> <need_api> <candidate> [no-restart]
+	local kind="$1" need_api="$2" cand="$3" mode="${4:-}" ts
+	COMMIT_BAK=""
+	test_config "$cand" || return 1
+	ts=$(date +%Y%m%d-%H%M%S)
+	if [ -n "$kind" ]; then COMMIT_BAK="$CFG.bak.$kind.$ts"; else COMMIT_BAK="$CFG.bak.$ts"; fi
+	# -L: $CFG may be a symlink (see install_config). cp -a would copy the LINK,
+	# so the "backup" would alias the live file and already hold the NEW config
+	# after install_config - rollback and backups-restore would then restore
+	# nothing. The snapshot must be a regular file with the OLD content; -p
+	# keeps the live config's mode like the -a this replaces.
+	cp -pL "$CFG" "$COMMIT_BAK"
+	install_config "$cand" || return 3
+	if [ "$mode" = "no-restart" ]; then return 0; fi
+	/etc/init.d/xray restart >/dev/null 2>&1 3>&- 4>&-
+	verify_or_rollback "$COMMIT_BAK" "$need_api" || return 2
+	post_restart_hooks
+	prune_backups
+	return 0   # prune/hook status must not leak: the change is installed+healthy
+}
+
+# `apply` as a function: the command runs it under the lock, and fetch's
+# auto-apply calls it in-process - re-running `"$0" apply` would deadlock on
+# the very lock fetch already holds. Non-zero return (and state files) on any
+# failure; rc propagates to the caller.
+# With hot_swap (UCI xray-monitor.sub.hot_swap, default 1) a change that is
+# confined to the managed subscription outbounds is applied LIVE via
+# `xray api rmo`/`ado` (commit_config no-restart + reconcile + verify); every
+# other change - and any failing live step - takes the classic restart
+# pipeline, falling back to restore+restart+verify when a live attempt already
+# replaced the config. See the hot-swap block above and hotswap.uc.
+do_apply() {
+	[ -s "$STATE/staged.json" ] || { echo "nothing staged"; return 1; }
+	api_before=0; api_up && api_before=1
+	stage_init
+	apply_err=$("$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$STAGE_DIR/config.json" $(sub_prefixes) 2>&1 >/dev/null)
+	if [ -n "$apply_err" ]; then
+		echo "merge-failed" > "$STATE/status"
+		echo "staged merge failed - not applied: $apply_err"; return 1
+	fi
+	cand="$STAGE_DIR/config.json"
+
+	# --- decide live vs restart (the plan is computed against the OLD $CFG,
+	# before commit_config replaces it) -----------------------------------
+	live=0; hs_reason=""
+	if [ "$hot_swap" = 1 ]; then
+		hs_plan=$("$SHARE/hotswap.uc" plan "$CFG" "$cand" $(sub_prefixes) $(diff_ignore_args) 2>/dev/null)
+		case $(printf '%s' "$hs_plan" | jsonfilter -e '@.hot_swap' 2>/dev/null) in
+			true)
+				# Membership-only change. Two runtime guards before touching
+				# anything: the handler API must answer, and the RUNNING
+				# outbound set must still equal the installed config (a
+				# hand-played `xray api` or an un-restarted manual edit would
+				# otherwise desync remove/add).
+				lsout=$(lso_out) || lsout=""
+				if [ -z "$lsout" ]; then
+					hs_reason="api-unavailable"
+				else
+					printf '%s' "$lsout" | jsonfilter -e '@.outbounds[*].tag' 2>/dev/null | sed '/^$/d' | sort -u > "$STAGE_DIR/ran0.tags"
+					config_tags "$CFG" | sort -u > "$STAGE_DIR/cfg0.tags"
+					if tags_same_set "$STAGE_DIR/ran0.tags" "$STAGE_DIR/cfg0.tags"; then
+						live=1
+					else
+						hs_reason="running-state-mismatch"
+					fi
+				fi
+				;;
+			false) hs_reason=$(printf '%s' "$hs_plan" | jsonfilter -e '@.restart_required' 2>/dev/null) ;;
+			*)     hs_reason="plan-unavailable" ;;
+		esac
+	fi
+
+	if [ "$live" = 1 ]; then
+		# install without restart, then make the running xray match
+		rc=0; commit_config "" "$api_before" "$cand" no-restart || rc=$?
+		case "$rc" in
+			0) ;;
+			1) echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1 ;;
+			*) echo "install-failed" > "$STATE/status"; echo "failed to install new config"; return 1 ;;
+		esac
+		if hotswap_apply "$hs_plan" "$cand"; then
+			nrem=$(printf '%s' "$hs_plan" | jsonfilter -e '@.remove[*]' 2>/dev/null | sed '/^$/d' | grep -c .)
+			nadd=$(printf '%s' "$hs_plan" | jsonfilter -e '@.add[*]' 2>/dev/null | sed '/^$/d' | grep -c .)
+			echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"
+			write_last_apply live "" 0 "${nrem:-0}" "${nadd:-0}"
+			prune_backups
+			echo "ok (applied live)"
+			return 0
+		fi
+		# live reconciliation failed at some step: the candidate is already
+		# installed but the running xray may be mid-mutation - the documented
+		# fallback restores the snapshot and takes the full restart path.
+		# The restart + verify run UNCONDITIONALLY: if the snapshot itself is
+		# unusable (its cp failed, e.g. disk full -> $COMMIT_BAK missing),
+		# skipping them would end the apply with $CFG holding the candidate,
+		# the running xray mid-mutated and NO restart. verify_or_rollback
+		# tolerates a missing backup: with none to restore it only demands
+		# that xray comes back up - on the validated candidate - which still
+		# reconciles the running state with the installed config.
+		[ -n "$COMMIT_BAK" ] && [ -f "$COMMIT_BAK" ] && install_config "$COMMIT_BAK"
+		/etc/init.d/xray restart >/dev/null 2>&1 3>&- 4>&-
+		verify_or_rollback "$COMMIT_BAK" "$api_before" || true
+		echo "rolled-back" > "$STATE/status"
+		write_last_apply restart "hot-swap-failed" 1 0 0
+		echo "hot-swap failed - rolled back to the previous config and restarted xray"
+		return 1
+	fi
+
+	rc=0; commit_config "" "$api_before" "$cand" || rc=$?
+	case "$rc" in
+		0) echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"
+		   write_last_apply restart "$hs_reason" 0 0 0
+		   echo ok ;;
+		2) echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; return 1 ;;
+		3) echo "install-failed" > "$STATE/status"; echo "failed to install new config"; return 1 ;;
+		*) echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; return 1 ;;
+	esac
+}
+
+# cron-sync likewise: set-cfg calls it in-process instead of `"$0" cron-sync`.
+# Manages both crontab lines: the subscription fetch (sub.cron/cron_schedule)
+# and the e2e exit check (sub.e2e_cron/e2e_schedule, default off - it moves
+# real traffic through every exit, so it wants its own, calmer schedule).
+do_cron_sync() {
+	CRON=/etc/crontabs/root
+	mkdir -p /etc/crontabs; touch "$CRON"
+	sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
+	sed -i '/xray-monitor\/xray-sub e2e/d' "$CRON" 2>/dev/null
+	[ "$cron" != "0" ] && echo "$cron_schedule /usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1" >> "$CRON"
+	[ "$e2e_cron" = "1" ] && echo "$e2e_schedule /usr/share/xray-monitor/xray-sub e2e >/dev/null 2>&1" >> "$CRON"
+	/etc/init.d/cron enable 2>/dev/null 3>&- 4>&-; /etc/init.d/cron restart 2>/dev/null 3>&- 4>&-
+	echo ok
+}
+
+# --- tmpxray: a short-lived per-exit test instance (contract B2) -----------
+# A second, throwaway xray built from the live config: one socks inbound on
+# 127.0.0.1 per requested exit tag, routing pinned to that exact outbound, log
+# none, no api/stats. Its lifetime is bounded by XRAYMON_TMPXRAY_TTL seconds
+# (default 120) through a detached watchdog, so a forgotten instance can never
+# linger. State (pid/ports/dir) lives in $TSTATE for F13/F18; start/stop take
+# the mini-lock only for their short critical section.
+# `start` REPLACES any live instance (one tmpxray at a time by design): the old
+# process is stopped and its files removed before the new one is spawned.
+
+tmpxray_take_lock() {
+	local tries=0
+	# same flock-on-a-descriptor model as take_lock, on fd 4: released by
+	# cleanup() and by process death, no orphaned holder to recover
+	command -v flock >/dev/null 2>&1 || return 1
+	exec 4>>"$TLOCK" || return 1
+	while ! flock -n 4; do
+		tries=$((tries + 1))
+		[ "$tries" -ge 10 ] && return 1
+		sleep 1
+	done
+	return 0
+}
+
+# One candidate loopback port per requested outbound, random in [11000,61000),
+# skipping ports that already listen and each other. Best effort only - the
+# actual bind is the final judge (xray exits on a taken port, readiness fails,
+# start errors out; just retry).
+tmpxray_pick_ports() {  # <count> -> one port per line
+	local want="$1" busy p got=0 tries=0 chosen=""
+	busy=$(netstat -tln 2>/dev/null | awk '$1 ~ /^tcp/ { n = split($4, a, ":"); print a[n] }' | sort -u | tr '\n' ' ')
+	while [ "$got" -lt "$want" ] && [ "$tries" -lt 40 ]; do
+		tries=$((tries + 1))
+		# srand() alone re-seeds by time only, so retries within the same second
+		# would repeat one candidate list - mix the try counter in.
+		for p in $(awk -v n=$((want - got + 2)) -v s=$(( $(date +%s) + tries )) 'BEGIN { srand(s); for (i = 0; i < n; i++) printf "%d ", 11000 + int(rand() * 50000) }'); do
+			case " $busy $chosen " in *" $p "*) continue ;; esac
+			chosen="$chosen $p"; got=$((got + 1))
+			[ "$got" -lt "$want" ] || break
+		done
+	done
+	[ "$got" -eq "$want" ] || return 1
+	echo "$chosen" | tr ' ' '\n' | sed '/^$/d'
+}
+
+# Wait until every port listens on 127.0.0.1 (max ~6 s) while xray stays alive.
+# rc 0 = all listening, 1 = timeout, 2 = process died (bind error etc).
+tmpxray_wait_ports() {  # <pid> <port> ...
+	local pid="$1"; shift
+	local i p ok
+	for i in 1 2 3 4 5 6; do
+		kill -0 "$pid" 2>/dev/null || return 2
+		ok=1
+		for p in "$@"; do
+			netstat -tln 2>/dev/null | grep -q "127.0.0.1:$p " || ok=0
+		done
+		[ "$ok" = 1 ] && return 0
+		sleep 1
+	done
+	return 1
+}
+
+# Is <pid> still one of OUR tmpxray processes for <dir>? /proc/<pid>/cmdline
+# names the temp config (`-config <dir>/config.json`) in the instance's and the
+# watchdog's argv; busybox grep cannot search past the NUL separators, so the
+# NULs are folded to spaces first (busybox tr does translate \0). A pid whose
+# cmdline no longer carries the dir has exited and been reused - signalling a
+# bare pid number could kill an innocent process. rc 1 = leave it alone.
+tmpxray_pid_ours() {  # <pid> <dir>
+	[ -n "$1" ] && [ -n "$2" ] || return 1
+	tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "$2"
+}
+
+# Stop the recorded instance and remove its files. Caller holds TLOCK.
+# The watchdog and the xray process both carry the temp dir in their cmdline,
+# so pgrep -f on the dir finds the watchdog even when the pid in $TSTATE is
+# stale (e.g. state file survived a reboot of the box but pids did not).
+# Every kill is guarded by tmpxray_pid_ours: a stale $TSTATE after a pid reuse
+# must never turn "stop" into killing somebody else's process.
+tmpxray_kill() {
+	local pid tdir tpat wp i rc=1
+	[ -s "$TSTATE" ] || { echo "not running"; return 0; }
+	pid=$(jsonfilter -i "$TSTATE" -e '@.pid' 2>/dev/null)
+	tdir=$(jsonfilter -i "$TSTATE" -e '@.dir' 2>/dev/null)
+	if [ -n "$pid" ] && tmpxray_pid_ours "$pid" "$tdir"; then
+		kill "$pid" 2>/dev/null
+	fi
+	if [ -n "$tdir" ]; then
+		tpat=$(printf '%s' "$tdir" | sed 's/\./\\./g')
+		for wp in $(pgrep -f "$tpat" 2>/dev/null); do
+			[ "$wp" = "$pid" ] && continue
+			kill "$wp" 2>/dev/null
+		done
+	fi
+	for i in 1 2 3; do
+		kill -0 "$pid" 2>/dev/null || { rc=0; break; }
+		sleep 1
+	done
+	if [ "$rc" != 0 ]; then
+		tmpxray_pid_ours "$pid" "$tdir" && kill -9 "$pid" 2>/dev/null
+		[ -n "$tdir" ] && for wp in $(pgrep -f "$tpat" 2>/dev/null); do kill -9 "$wp" 2>/dev/null; done
+	fi
+	case "$tdir" in /tmp/*) rm -rf "$tdir" ;; esac
+	rm -f "$TSTATE"
+	echo "stopped"
+	return 0
+}
+
+do_tmpxray_start() {  # <tag> ...
+	local tags="$*" ttl n=0 t i p pid tdir pports uargs pjson first=1 msg
+	[ -n "$tags" ] || { echo "no tags given"; return 1; }
+	for t in $tags; do
+		case "$t" in *[!A-Za-z0-9._-]*) echo "invalid tag: $t"; return 1 ;; esac
+		n=$((n + 1))
+	done
+	ttl=${XRAYMON_TMPXRAY_TTL:-120}
+	case "$ttl" in ''|*[!0-9]*|0) echo "invalid XRAYMON_TMPXRAY_TTL"; return 1 ;; esac
+	command -v ucode >/dev/null 2>&1 || { echo "ucode not installed"; return 1; }
+	[ -f "$CFG" ] || { echo "xray config not found at $CFG"; return 1; }
+	tmpxray_take_lock || { echo "another tmpxray operation is running"; return 1; }
+	theld=1
+
+	tmpxray_kill >/dev/null   # replace semantics: one instance at a time
+
+	tdir=$(mktemp -d "${TMPDIR:-/tmp}/tmpxray.XXXXXX") || { echo "mktemp failed"; return 1; }
+	pports=$(tmpxray_pick_ports "$n") || { rm -rf "$tdir"; echo "no free ports"; return 1; }
+	set -- $pports
+	for t in $tags; do
+		p=$1; shift
+		uargs="$uargs $t $p"
+		[ "$first" = 1 ] || pjson="$pjson,"
+		first=0
+		pjson="$pjson\"$t\":$p"
+	done
+
+	msg=$("$SHARE/tmpxray.uc" "$CFG" "$tdir/config.json" $uargs 2>&1)
+	if [ -n "$msg" ]; then
+		rm -rf "$tdir"; echo "tmpxray config build failed: $msg"; return 1
+	fi
+	if ! "$XRAY" -test -format json -config "$tdir/config.json" >"$tdir/test.log" 2>&1; then
+		msg=$(tr -s '\r\n\t ' ' ' < "$tdir/test.log")
+		rm -rf "$tdir"; echo "xray -test failed on tmpxray config: $msg"; return 1
+	fi
+
+	# Not setsid: $! must be the xray pid itself, and a plain background child
+	# survives this script's exit. If the parent shell is ever killed by group
+	# signal the TTL watchdog still reaps the instance. `3>&- 4>&-`: the lock
+	# lives on those descriptors, and this xray (and anything it spawns)
+	# outlives the command - keeping them would hold the config lock and the
+	# mini-lock open for the whole TTL.
+	"$XRAY" run -config "$tdir/config.json" >/dev/null 2>&1 3>&- 4>&- &
+	pid=$!
+	if ! tmpxray_wait_ports "$pid" $pports; then
+		tmpxray_pid_ours "$pid" "$tdir" && { kill "$pid" 2>/dev/null; sleep 1; kill -9 "$pid" 2>/dev/null; }
+		rm -rf "$tdir"; rm -f "$TSTATE"
+		echo "tmpxray did not come up (port bind failed or timed out)"
+		return 1
+	fi
+
+	mkdir -p "$TSTATE_DIR"
+	printf '{"pid":%s,"ports":{%s},"dir":"%s","ttl":%s,"ts":%s}\n' \
+		"$pid" "$pjson" "$tdir" "$ttl" "$(date +%s)" > "$TSTATE.new"
+	mv "$TSTATE.new" "$TSTATE"
+
+	# TTL watchdog, detached so it survives this command and its caller. It only
+	# removes $TSTATE while that file still records OUR pid, so it can never
+	# clean up a replacement instance started later, and it only signals the
+	# recorded pid while that pid's cmdline still names our temp dir - a pid
+	# that exited early and got reused now belongs to someone else (see
+	# tmpxray_pid_ours). setsid is used when present (23.05 busybox builds ship
+	# without it); the HUP-ignoring trap covers the plain-background fallback
+	# on those boxes. `3>&- 4>&-` for the same reason as on the xray spawn
+	# above: the watchdog outlives the command and must not keep the locks.
+	watchdog='trap "" HUP; sleep "$2"; if tr "\0" " " < "/proc/$1/cmdline" 2>/dev/null | grep -q "$3"; then kill "$1" 2>/dev/null; sleep 5; tr "\0" " " < "/proc/$1/cmdline" 2>/dev/null | grep -q "$3" && kill -9 "$1" 2>/dev/null; fi; rm -rf "$3"; [ "$(jsonfilter -i "$4" -e "@.pid" 2>/dev/null)" = "$1" ] && rm -f "$4"'
+	detach=""
+	command -v setsid >/dev/null 2>&1 && detach="setsid"
+	$detach sh -c "$watchdog" tmpxray "$pid" "$ttl" "$tdir" "$TSTATE" >/dev/null 2>&1 3>&- 4>&- &
+
+	printf '{"pid":%s,"ports":{%s}}\n' "$pid" "$pjson"
+}
+
+do_tmpxray_stop() {
+	tmpxray_take_lock || { echo "another tmpxray operation is running"; return 1; }
+	theld=1
+	tmpxray_kill
+	return 0
+}
+
+# --- e2e: does traffic actually FLOW through each exit? (F13, B3) ------------
+# The TCP probe reaches an exit's endpoint while TSPU-style DPI freezes the
+# stream after the first ~16-20 KB: "reachable" but useless. This check pulls
+# real bodies through every exit and watches whether they complete:
+#   1. ONE tmpxray instance (contract B2) carries all checked exits - a socks
+#      inbound per tag on 127.0.0.1. Its TTL is sized for the whole run; the
+#      TTL watchdog remains the backstop if this script is killed.
+#   2. Per exit, with at most 3 curls in flight overall (batch pool - no
+#      unbounded xargs -P tricks on busybox ash) and the SAME user agent as
+#      the subscription fetch:
+#        - a 204 URL -> TTFB (curl %{time_starttransfer})
+#        - a body URL -> %{size_download} / %{speed_download}; a freeze shows
+#          up as bytes arriving then curl timing out short of the expected size
+#   3. Verdicts (e2e.uc) land in $TSTATE_DIR/e2e.json incrementally - skipped
+#      exits first, then one merge per finished batch - so a polling UI sees
+#      progress. $TSTATE_DIR/e2e.run holds the runner's pid while it is live.
+# The command never takes the config LOCK: it only reads the live config (via
+# tmpxray.uc, at start) and writes its own state under /tmp.
+E2E_JSON="$TSTATE_DIR/e2e.json"
+E2E_RUN="$TSTATE_DIR/e2e.run"
+E2E_WFMT='%{http_code}|%{time_starttransfer}|%{time_total}|%{size_download}|%{speed_download}'
+E2E_WORK=""
+E2E_RUNTS=0
+e2e_tx=0   # 1 once this run started a tmpxray instance (e2e_fini must stop it)
+
+# Tags the user turned off from active probing - the same list the rpcd probe
+# honors. Matched with surrounding spaces so substrings don't hit. An exit in
+# this list is NEVER dialled by e2e either: it gets a "skipped" verdict and no
+# port on the tmpxray instance at all.
+e2e_disabled_list() {
+	printf ' %s ' "$(uci -q get xray-monitor.sub.probe_disabled 2>/dev/null)"
+}
+
+e2e_num() {  # numeric-or-0 (curl counters are strings; junk maps to 0)
+	case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac
+}
+
+# Body URL with the size substituted; whether the expected byte count is exact
+# (%d placeholder -> yes, fixed-size custom URL -> no) drives the verdict's
+# "completed" test.
+e2e_body_url() {
+	case "$e2e_url_bytes" in
+		*%d*) echo "$e2e_url_bytes" | sed "s/%d/$(e2e_num "$e2e_bytes")/g" ;;
+		*)    echo "$e2e_url_bytes" ;;
+	esac
+}
+e2e_body_expected() {
+	case "$e2e_url_bytes" in *%d*) e2e_num "$e2e_bytes" ;; *) echo 0 ;; esac
+}
+
+# Body fetch budget: 45 s per started MiB, clamped to [45, 300] - a usable exit
+# moves 1 MiB in a few seconds, while a DPI trickle needs minutes and is
+# exactly what the timeout must cut off.
+e2e_body_maxtime() {
+	local t=$(( 45 * e2e_bytes / 1048576 ))
+	[ "$t" -lt 45 ] && t=45
+	[ "$t" -gt 300 ] && t=300
+	echo "$t"
+}
+
+# Merge one finished record into e2e.json (atomic: .new + mv).
+e2e_merge() {  # <tag> <record-json>
+	"$SHARE/e2e.uc" merge "$E2E_JSON" "$E2E_RUNTS" "$1" "$2" > "$E2E_JSON.new" 2>/dev/null \
+		&& mv "$E2E_JSON.new" "$E2E_JSON"
+}
+
+# One exit, as a background child of the batch pool: 204 fetch (TTFB) then the
+# body fetch through this exit's socks port, each bounded by --max-time so a
+# frozen stream cannot hang the run. Runs in a subshell: results go through
+# e2e.uc verdict into $E2E_WORK/<tag>.json, which the parent merges in order.
+e2e_check_one() {  # <tag> <port> <body-url> <expected> <body-maxtime>
+	trap - EXIT INT TERM HUP   # a pool child must not run the runner's EXIT trap
+	local tag="$1" port="$2" url_b="$3" expected="$4" bmax="$5"
+	local out rc f1 f2 f4 f5 r204 rbody rec
+	out=$(curl -sL -o /dev/null --max-time 10 --socks5-hostname "127.0.0.1:$port" \
+		-A "$ua_default" -w "$E2E_WFMT" "$e2e_url_204" 2>/dev/null); rc=$?
+	f1=$(printf '%s' "$out" | cut -d'|' -f1)
+	f2=$(printf '%s' "$out" | cut -d'|' -f2)
+	r204=$(printf '{"rc":%s,"http":%s,"ttfb_ms":%s}' \
+		"$(e2e_num "$rc")" "$(e2e_num "$f1")" \
+		"$(awk -v s="$(printf '%s' "$f2" | tr -d ' ')" 'BEGIN { printf "%d", (s + 0) * 1000 + 0.5 }')")
+	out=$(curl -sL -o /dev/null --max-time "$bmax" --socks5-hostname "127.0.0.1:$port" \
+		-A "$ua_default" -w "$E2E_WFMT" "$url_b" 2>/dev/null); rc=$?
+	f1=$(printf '%s' "$out" | cut -d'|' -f1)
+	f4=$(printf '%s' "$out" | cut -d'|' -f4)
+	f5=$(printf '%s' "$out" | cut -d'|' -f5)
+	rbody=$(printf '{"rc":%s,"http":%s,"bytes":%s,"expected":%s,"speed_bps":%s}' \
+		"$(e2e_num "$rc")" "$(e2e_num "$f1")" "$(e2e_num "$f4")" "$(e2e_num "$expected")" \
+		"$(awk -v s="$(printf '%s' "$f5" | tr -d ' ')" 'BEGIN { printf "%d", (s + 0) + 0.5 }')")
+	rec=$("$SHARE/e2e.uc" verdict "$r204" "$rbody" 2>/dev/null) \
+		|| rec='{"status":"fail","ttfb_ms":0,"bytes":0,"speed_bps":0}'
+	printf '%s\n' "$rec" > "$E2E_WORK/$tag.json"
+}
+
+# EXIT trap for the e2e command only (it replaces cleanup): stop the tmpxray
+# instance we started on EVERY path - success, failure, signal - then drop the
+# run marker and scratch dir, then the usual cleanup (locks/staging).
+e2e_fini() {
+	local rc=$?
+	[ "$e2e_tx" = 1 ] && { e2e_tx=0; do_tmpxray_stop >/dev/null 2>&1; }
+	rm -f "$E2E_RUN"
+	[ -n "$E2E_WORK" ] && rm -rf "$E2E_WORK"
+	E2E_WORK=""
+	cleanup
+	return 0
+}
+
+# The e2e command's body. Owns no config LOCK (read-only on $CFG). Explicit
+# tags narrow the check to those exits; without arguments every probeable exit
+# of the live config is checked.
+do_e2e() {  # [tag ...]
+	local tags_all tags_chk tag dlist known runts msg ports_json port
+	local nchk bttl burl bexp bmax batch i mtxrc wpids wp
+	if [ $# -gt 0 ]; then
+		for tag in "$@"; do
+			case "$tag" in *[!A-Za-z0-9._-]*) echo "invalid tag: $tag"; return 1 ;; esac
+		done
+		known=$("$SHARE/e2e.uc" tags "$CFG" 2>/dev/null)
+		for tag in "$@"; do
+			printf '%s\n' "$known" | grep -qx "$tag" || { echo "no such exit: $tag"; return 1; }
+		done
+		tags_all="$*"
+	else
+		tags_all=$("$SHARE/e2e.uc" tags "$CFG" 2>/dev/null)
+	fi
+	[ -n "$tags_all" ] || { echo "no exits to check"; return 0; }
+	[ -s "$CFG" ] || { echo "xray config not found at $CFG"; return 1; }
+
+	# probe_disabled exits are never dialled: they get a skipped verdict right
+	# away (visible to a polling UI before any connection is attempted)
+	dlist=$(e2e_disabled_list)
+	tags_chk=""
+	for tag in $tags_all; do
+		case "$dlist" in *" $tag "*) ;; *) tags_chk="$tags_chk $tag" ;; esac
+	done
+	tags_chk=${tags_chk# }
+
+	E2E_RUNTS=$(date +%s)
+	mkdir -p "$TSTATE_DIR"
+	printf '%s\n' "$$" > "$E2E_RUN"
+	E2E_WORK=$(mktemp -d "${TMPDIR:-/tmp}/e2e.XXXXXX") || { echo "mktemp failed"; return 1; }
+	printf '{"ts":%s,"results":{}}\n' "$E2E_RUNTS" > "$E2E_JSON.new" && mv "$E2E_JSON.new" "$E2E_JSON"
+	for tag in $tags_all; do
+		case "$dlist" in *" $tag "*)
+			e2e_merge "$tag" '{"status":"skipped","ttfb_ms":0,"bytes":0,"speed_bps":0}'
+			;; esac
+	done
+
+	if [ -z "$tags_chk" ]; then
+		echo "e2e: nothing to check (every exit is probe-disabled)"
+		"$SHARE/e2e.uc" summary "$E2E_JSON" 2>/dev/null
+		return 0
+	fi
+
+	# ONE tmpxray instance for all checked exits. The TTL covers the worst-case
+	# run length (ceil(n/3) batches x per-exit curl budget + slack) so the
+	# watchdog cannot kill it mid-run - and still reaps it if we crash.
+	set -- $tags_chk
+	nchk=$#
+	bmax=$(e2e_body_maxtime)
+	bttl=$(( (nchk + 2) / 3 * (10 + bmax) + 75 ))
+	[ "$bttl" -lt 120 ] && bttl=120
+	[ "$bttl" -gt 1800 ] && bttl=1800
+	XRAYMON_TMPXRAY_TTL=$bttl
+	export XRAYMON_TMPXRAY_TTL
+	msg=$(do_tmpxray_start $tags_chk)
+	mtxrc=$?
+	unset XRAYMON_TMPXRAY_TTL
+	if [ "$mtxrc" -ne 0 ]; then
+		echo "$msg" >&2
+		for tag in $tags_chk; do
+			e2e_merge "$tag" '{"status":"fail","ttfb_ms":0,"bytes":0,"speed_bps":0}'
+		done
+		return 1
+	fi
+	e2e_tx=1
+	# do_tmpxray_start leaves the mini-lock fd open (it cannot know the caller
+	# is about to run for minutes); release it so other tmpxray users are not
+	# blocked for the whole check. The instance itself closed fd 3/4 at spawn.
+	flock -u 4 2>/dev/null
+	exec 4>&-
+	theld=0
+
+	# tag -> port map from the start reply {"pid":N,"ports":{"<tag>":port}}
+	ports_json=${msg#*'"ports":{'}
+	ports_json=${ports_json%\}}
+	ports_json=${ports_json%\}}
+
+	# batch pool: 3 exits at a time, 2 sequential curls each -> at most 3
+	# concurrent curls. Children write per-exit records; the parent merges them
+	# into e2e.json in order after each batch (no concurrent file rewrites).
+	burl=$(e2e_body_url)
+	bexp=$(e2e_body_expected)
+	set -- $tags_chk
+	while [ $# -gt 0 ]; do
+		batch=""
+		i=0
+		while [ $# -gt 0 ] && [ "$i" -lt 3 ]; do
+			batch="$batch $1"
+			shift
+			i=$((i + 1))
+		done
+		wpids=""
+		for tag in $batch; do
+			port=$(printf '%s\n' "$ports_json" | tr ',' '\n' \
+				| sed -n "s/^[[:space:]]*\"$(printf '%s' "$tag" | sed 's/\./\\./g')\":[[:space:]]*//p" \
+				| tr -d '[:space:]')
+			port=$(e2e_num "$port")
+			if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+				e2e_check_one "$tag" "$port" "$burl" "$bexp" "$bmax" &
+				wpids="$wpids $!"
+			else
+				printf '%s\n' '{"status":"fail","ttfb_ms":0,"bytes":0,"speed_bps":0}' > "$E2E_WORK/$tag.json"
+			fi
+		done
+		# wait for THIS batch's pool children only: the tmpxray instance and its
+		# TTL watchdog are our children too, and a bare `wait` would sit out the
+		# whole TTL
+		for wp in $wpids; do wait "$wp"; done
+		for tag in $batch; do
+			if [ -s "$E2E_WORK/$tag.json" ]; then
+				e2e_merge "$tag" "$(cat "$E2E_WORK/$tag.json")"
+			else
+				e2e_merge "$tag" '{"status":"fail","ttfb_ms":0,"bytes":0,"speed_bps":0}'
+			fi
+		done
+	done
+
+	# stop the instance now (not only via the EXIT trap): polite to the box and
+	# frees the ports immediately; e2e_tx=0 keeps e2e_fini from double-stopping
+	do_tmpxray_stop >/dev/null 2>&1
+	e2e_tx=0
+
+	"$SHARE/e2e.uc" summary "$E2E_JSON" 2>/dev/null
+	echo "e2e: results in $E2E_JSON"
+	return 0
+}
+
+# --- via-xray plumbing (F18) -------------------------------------------------
+# Which exit a proxied fetch / self-update uses. SELECTION ORDER, in full:
+# 1. fetch_via_exit is a concrete outbound tag -> that tag, nothing else is
+#    consulted (a tag no longer in the config fails tmpxray start honestly).
+# 2. fetch_via_exit=auto, step 1: the freshest e2e results F13 writes to
+#    $E2E_JSON (contract B3). pickexit.uc accepts it only when its top-level
+#    ts is within E2E_MAX_AGE seconds of now (a file from the future by > 300 s
+#    is clock skew and also rejected), and picks the exit with status "ok" and
+#    the highest speed_bps; ties keep document order.
+# 3. fetch_via_exit=auto, step 2 (e2e absent / stale / nothing ok): the rpcd
+#    outbounds surface - `ubus call xray-monitor outbounds` probes every
+#    endpoint (bare TCP, ~3 s, honors probe_disabled) and answers them in
+#    CONFIG order; the FIRST outbound with up=1 wins (up=0 down, -1 no probe
+#    tool and -2 probe-disabled never match).
+# 4. neither source names an exit -> rc 1: a fetch/update configured to go via
+#    xray then fails with today's honest failure statuses. In proxy mode there
+#    is NEVER a silent direct retry - the whole point is that direct is blocked
+#    or must not be used.
+E2E_MAX_AGE=3600
+E2E_JSON="$TSTATE_DIR/e2e.json"
+
+via_pick_exit() {  # prints the chosen tag; rc 1 = nothing selectable
+	local tag out i
+	if [ "$fetch_via_exit" != auto ]; then
+		echo "$fetch_via_exit"; return 0
+	fi
+	tag=$("$SHARE/pickexit.uc" "$E2E_JSON" "$(date +%s)" "$E2E_MAX_AGE" 2>/dev/null)
+	[ -n "$tag" ] && { echo "$tag"; return 0; }
+	out=$(ubus call xray-monitor outbounds 2>/dev/null) || return 1
+	i=0
+	while :; do
+		tag=$(printf '%s' "$out" | jsonfilter -e "@.outbounds[$i].tag" 2>/dev/null)
+		[ -n "$tag" ] || return 1
+		if [ "$(printf '%s' "$out" | jsonfilter -e "@.outbounds[$i].up" 2>/dev/null)" = 1 ]; then
+			echo "$tag"; return 0
+		fi
+		i=$((i + 1))
+	done
+}
+
+# Start the ONE-exit tmpxray used for proxied transfers. The mini-lock (fd 4)
+# is released again as soon as the instance is up: a fetch can keep the socks
+# port open for minutes and must not block unrelated tmpxray use (F13 e2e) for
+# that long. The instance itself is a replace-style B2 session, so a concurrent
+# e2e tmpxray is stopped by our start (one tmpxray at a time, by design).
+via_start() {  # <tag> -> sets VIA_TAG/VIA_PORT; via_err carries the reason
+	local out tag_re
+	VIA_TAG=""; VIA_PORT=""
+	out=$(do_tmpxray_start "$1" 2>&1) || { via_err="$out"; return 1; }
+	if [ "$theld" = 1 ]; then
+		flock -u 4 2>/dev/null
+		exec 4>&- 2>/dev/null
+		theld=0
+	fi
+	# do_tmpxray_start prints exactly {"pid":N,"ports":{"<tag>":port}} - read
+	# the port without depending on jsonfilter key syntax for dashed tags
+	# (escape the dot, the one regex metachar a tag may contain)
+	tag_re=$(printf '%s' "$1" | sed 's/\./\\./g')
+	VIA_PORT=$(printf '%s' "$out" | sed -n "s/.*\"$tag_re\":\([0-9][0-9]*\).*/\1/p")
+	case "$VIA_PORT" in
+		''|*[!0-9]*)
+			via_err="tmpxray started but reported no port for $1"
+			do_tmpxray_stop >/dev/null 2>&1
+			return 1 ;;
+	esac
+	VIA_TAG="$1"; via_started=1
+	return 0
+}
+
+via_stop() {
+	[ "$via_started" = 1 ] || return 0
+	via_started=0; VIA_PORT=""
+	do_tmpxray_stop >/dev/null 2>&1
+	return 0
+}
+
+# Lazy start (the exit is picked and the instance started only when a transfer
+# actually needs the proxy, so an all-direct `auto` run never touches tmpxray).
+# After a hard failure the run remembers (via_dead) and stops retrying.
+via_ensure() {
+	[ -n "$VIA_PORT" ] && return 0
+	[ "$via_dead" = 1 ] && return 1
+	local tag
+	tag=$(via_pick_exit) || { via_dead=1; via_err="no exit selectable for the proxy path (no fresh e2e.json and no outbound probing up)"; return 1; }
+	via_start "$tag" || { via_dead=1; return 1; }
+	return 0
+}
+
+case "$1" in
+	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync|backups-delete|backups-pin|backups-restore|overrides-apply)
+		take_lock || {
+			if [ "$XRAYMON_NOWAIT" = 1 ]; then
+				echo "another xray-monitor operation is running, try again in a moment"
+			else
+				echo "another xray-monitor operation is running"
+			fi
+			exit 1
+		}
+		;;
+esac
 
 case "$1" in
 	fetch)
 		tmpd=$(mktemp -d); staged="$tmpd/staged.json"
 		printf '{"groups":[' > "$staged"
-		first=1; nsub=0; nok=0
+		first=1; nsub=0; nok=0; failed=""
+		# which transport actually moved bytes this run (status surface):
+		#   direct | via <tag> | direct, retried via <tag>
+		moved_direct=0; moved_via=0; via_noted=0
 		for id in $(sub_ids); do
 			[ "$(uci -q get "xray-monitor.$id.enabled")" = "0" ] && continue
 			url=$(uci -q get "xray-monitor.$id.url"); [ -n "$url" ] || continue
@@ -105,7 +1278,28 @@ case "$1" in
 			ua=$(uci -q get "xray-monitor.$id.user_agent"); [ -n "$ua" ] || ua="$ua_default"
 			nsub=$((nsub + 1))
 			raw="$tmpd/$id.raw"; obs="$tmpd/$id.obs"; hdrf="$tmpd/$id.hdr"
-			if fetch_url "$url" "$ua" "$hdrf" > "$raw" 2>/dev/null && [ -s "$raw" ]; then
+			got=""
+			# direct attempt unless fetch_via=proxy (there direct is known-broken
+			# or must not be tried at all)
+			if [ "$fetch_via" != proxy ]; then
+				if fetch_url "$url" "$ua" "$hdrf" > "$raw" 2>/dev/null && [ -s "$raw" ]; then
+					got=direct
+				fi
+			fi
+			# proxy mode: the only transport. auto mode: retry a transport-level
+			# failure (curl error or empty body) through xray, same UA/timeouts.
+			if [ -z "$got" ] && [ "$fetch_via" != direct ]; then
+				if via_ensure; then
+					if fetch_url "$url" "$ua" "$hdrf" "$VIA_PORT" > "$raw" 2>/dev/null && [ -s "$raw" ]; then
+						got=via
+					fi
+				elif [ "$via_noted" = 0 ]; then
+					via_noted=1
+					echo "proxy path unavailable: $via_err" >&2
+				fi
+			fi
+			if [ -n "$got" ]; then
+				[ "$got" = direct ] && moved_direct=1 || moved_via=1
 				store_usage "$prefix" "$hdrf"
 				if "$SHARE/parse.uc" "$raw" "$STATE/tagmap-$prefix.json" "$STATE/overrides.json" "$prefix" > "$obs" 2>/dev/null && [ -s "$obs" ]; then
 					[ "$first" = 1 ] || printf ',' >> "$staged"
@@ -113,7 +1307,43 @@ case "$1" in
 					cat "$obs" >> "$staged"
 					printf '}' >> "$staged"
 					first=0; nok=$((nok + 1))
+				else
+					failed="$failed $prefix"
 				fi
+			else
+				failed="$failed $prefix"
+			fi
+		done
+		# the proxy instance is no longer needed: stop it now (the EXIT trap and
+		# the TTL watchdog are only backstops) - auto-apply below may restart
+		# xray, and usage/diff state is already written
+		via_stop
+		if [ "$nsub" -gt 0 ]; then
+			# machine-greppable path token (UI reads it via status):
+			#   direct | via <tag> | direct, retried via <tag> (auto mode)
+			# "" when nothing was fetched at all (e.g. proxy mode could not
+			# establish the instance) - the status file carries that failure.
+			tok=""
+			if [ "$moved_via" = 1 ]; then
+				if [ "$fetch_via" = auto ]; then tok="direct, retried via $VIA_TAG"
+				else tok="via $VIA_TAG"; fi
+			elif [ "$moved_direct" = 1 ]; then
+				tok="direct"
+			fi
+			printf '%s\n' "$tok" > "$STATE/fetch_path"
+		fi
+		# A subscription that could not be refetched keeps its currently installed
+		# exits: snapshot them from the live config as extra staged groups. Disabled
+		# subscriptions are deliberately absent here - those DO get pruned on apply.
+		nsnap=0
+		for pfx in $failed; do
+			nsnap=$((nsnap + 1)); snap="$tmpd/snap.$nsnap"
+			if "$SHARE/snapshot.uc" "$CFG" "$pfx" $(sub_prefixes) > "$snap" 2>/dev/null && [ -s "$snap" ]; then
+				[ "$first" = 1 ] || printf ',' >> "$staged"
+				printf '{"label":"%s","outbounds":' "$pfx" >> "$staged"
+				cat "$snap" >> "$staged"
+				printf '}' >> "$staged"
+				first=0
 			fi
 		done
 		printf ']}' >> "$staged"
@@ -121,7 +1351,7 @@ case "$1" in
 			echo "no-subs" > "$STATE/status"
 		elif [ "$nok" -gt 0 ]; then
 			mv "$staged" "$STATE/staged.json"
-			"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" > "$STATE/diff.json" 2>/dev/null
+			"$SHARE/diff.uc" "$STATE/staged.json" "$CFG" $(sub_prefixes) $(diff_ignore_args) > "$STATE/diff.json" 2>/dev/null
 			cnt=$(jsonfilter -i "$STATE/diff.json" -e '@.total' 2>/dev/null)
 			[ "${cnt:-0}" -gt 0 ] && echo 1 > "$STATE/pending" || echo 0 > "$STATE/pending"
 			[ "$nok" -eq "$nsub" ] && echo "ok" > "$STATE/status" || echo "partial" > "$STATE/status"
@@ -130,26 +1360,24 @@ case "$1" in
 		fi
 		date +%s > "$STATE/last_fetch"
 		rm -rf "$tmpd"
-		if [ "$auto_apply" = "1" ] && [ "$(cat "$STATE/pending" 2>/dev/null)" = "1" ]; then "$0" apply >/dev/null 2>&1; fi
-		case "$(cat "$STATE/status" 2>/dev/null)" in ok|partial) exit 0 ;; *) exit 1 ;; esac
+		case "$(cat "$STATE/status" 2>/dev/null)" in ok|partial) frc=0 ;; *) frc=1 ;; esac
+		# auto-apply runs in-process (fetch already holds the lock). A failed
+		# apply must NOT read as a failed fetch: the fresh exits ARE staged
+		# (pending stays 1, the UI offers Apply again) - only swapping the
+		# config failed. Mark that explicitly instead of letting apply's
+		# test-failed/rolled-back stand in for the fetch's own state.
+		if [ "$auto_apply" = "1" ] && [ "$(cat "$STATE/pending" 2>/dev/null)" = "1" ]; then
+			apply_msg=$(do_apply 2>&1) || {
+				frc=1
+				echo "fetched-apply-failed" > "$STATE/status"
+				[ -n "$apply_msg" ] && echo "$apply_msg" >&2
+			}
+		fi
+		exit "$frc"
 		;;
 
 	apply)
-		[ -s "$STATE/staged.json" ] || { echo "nothing staged"; exit 1; }
-		api_before=0; api_up && api_before=1
-		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if "$SHARE/apply.uc" "$CFG" "$STATE/staged.json" "$CFG.new" >/dev/null 2>&1 \
-			&& "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
-			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" "$api_before"; then
-				prune_backups
-				echo 0 > "$STATE/pending"; echo "applied" > "$STATE/status"; echo ok
-			else
-				echo "rolled-back" > "$STATE/status"; echo "applied but xray/api failed health check - rolled back"; exit 1
-			fi
-		else
-			rm -f "$CFG.new"; echo "test-failed" > "$STATE/status"; echo "config test failed - not applied"; exit 1
-		fi
+		do_apply
 		;;
 
 	status)
@@ -160,7 +1388,7 @@ case "$1" in
 	sub-add)
 		valid_prefix "$2" || { echo "invalid prefix"; exit 1; }
 		case "$3" in http://*|https://*) ;; *) echo "invalid url"; exit 1 ;; esac
-		prefix_in_use "$2" "" && { echo "prefix already used"; exit 1; }
+		conf=$(prefix_conflict "$2" "") && { echo "prefix overlaps with prefix '$conf'"; exit 1; }
 		sec=$(uci add xray-monitor subscription 2>/dev/null)
 		uci set "xray-monitor.$sec.prefix"="$2"
 		uci set "xray-monitor.$sec.url"="$3"
@@ -179,7 +1407,7 @@ case "$1" in
 		uci -q get "xray-monitor.$2" >/dev/null 2>&1 || { echo "no such subscription"; exit 1; }
 		if [ -n "$3" ]; then
 			valid_prefix "$3" || { echo "invalid prefix"; exit 1; }
-			prefix_in_use "$3" "$2" && { echo "prefix already used"; exit 1; }
+			conf=$(prefix_conflict "$3" "$2") && { echo "prefix overlaps with prefix '$conf'"; exit 1; }
 			uci set "xray-monitor.$2.prefix"="$3"
 		fi
 		if [ -n "$4" ]; then
@@ -190,7 +1418,7 @@ case "$1" in
 		echo ok
 		;;
 
-	set-cfg)  # <cron> <cron_schedule> <auto_apply> <user_agent>  (empty = keep)
+	set-cfg)  # <cron> <cron_schedule> <auto_apply> <user_agent> <hot_swap>  (empty = keep)
 		uci set xray-monitor.sub=xray-monitor 2>/dev/null
 		[ -n "$2" ] && uci set xray-monitor.sub.cron="$2"
 		if [ -n "$3" ]; then
@@ -199,18 +1427,16 @@ case "$1" in
 		fi
 		[ -n "$4" ] && uci set xray-monitor.sub.auto_apply="$4"
 		[ -n "$5" ] && uci set xray-monitor.sub.user_agent="$5"
+		if [ -n "$6" ]; then
+			case "$6" in 0|1) uci set xray-monitor.sub.hot_swap="$6" ;; *) echo "hot_swap must be 0 or 1"; exit 1 ;; esac
+		fi
 		uci commit xray-monitor
-		"$0" cron-sync >/dev/null 2>&1
+		do_cron_sync >/dev/null 2>&1
 		echo ok
 		;;
 
 	cron-sync)
-		CRON=/etc/crontabs/root
-		mkdir -p /etc/crontabs; touch "$CRON"
-		sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
-		[ "$cron" != "0" ] && echo "$cron_schedule /usr/share/xray-monitor/xray-sub fetch >/dev/null 2>&1" >> "$CRON"
-		/etc/init.d/cron enable 2>/dev/null; /etc/init.d/cron restart 2>/dev/null
-		echo ok
+		do_cron_sync
 		;;
 
 	routing-get)   "$SHARE/routing.uc" get "$CFG" ;;
@@ -220,31 +1446,29 @@ case "$1" in
 		[ -s "$2" ] || { echo "no input"; exit 1; }
 		case "$1" in routing-set) uc="$SHARE/routing.uc" ;; *) uc="$SHARE/balancers.uc" ;; esac
 		api_before=0; api_up && api_before=1
-		bak="$CFG.bak.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-		if "$uc" set "$CFG" "$2" "$CFG.new" >/dev/null 2>&1 && "$XRAY" -test -format json -config "$CFG.new" >/dev/null 2>&1; then
-			mv "$CFG.new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" "$api_before"; then prune_backups; echo ok
-			else echo "xray/api failed health check - rolled back"; exit 1; fi
+		stage_init
+		if "$uc" set "$CFG" "$2" "$STAGE_DIR/config.json" $(sub_prefixes) >/dev/null 2>&1; then
+			rc=0; commit_config "" "$api_before" "$STAGE_DIR/config.json" || rc=$?
+			case "$rc" in
+				0) echo ok ;;
+				2) echo "xray/api failed health check - rolled back"; exit 1 ;;
+				3) echo "failed to install new config"; exit 1 ;;
+				*) echo "config test failed - not applied"; exit 1 ;;
+			esac
 		else
-			rm -f "$CFG.new"; echo "config test failed - not applied"; exit 1
+			echo "config test failed - not applied"; exit 1
 		fi
 		;;
 
 	config-save)
 		[ -s "$2" ] || { echo "empty config"; exit 1; }
-		if "$XRAY" -test -format json -config "$2" >/dev/null 2>&1; then
-			api_before=0; api_up && api_before=1
-			bak="$CFG.bak.manual.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-			cat "$2" > "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" 0; then
-				prune_backups
-				echo "saved and restarted xray"
-			else
-				echo "saved but xray failed to start - rolled back"; exit 1
-			fi
-		else
-			echo "xray -test failed; not saved"; exit 1
-		fi
+		rc=0; commit_config manual 0 "$2" || rc=$?
+		case "$rc" in
+			0) echo "saved and restarted xray" ;;
+			2) echo "saved but xray failed to start - rolled back"; exit 1 ;;
+			3) echo "failed to install new config"; exit 1 ;;
+			*) echo "xray -test failed; not saved"; exit 1 ;;
+		esac
 		;;
 
 	latest-version)
@@ -253,14 +1477,74 @@ case "$1" in
 
 	self-update)
 		tmp="/tmp/luci-app-xray-monitor.ipk"
-		# 1) preferred: stable GitHub Release asset (single redirect, robust)
-		if ! { curl -fsSL --max-time 60 -o "$tmp" "$REL" 2>/dev/null && tar -tzf "$tmp" >/dev/null 2>&1; }; then
+		# Only the DOWNLOADS go via xray when fetch_via_update says so; opkg
+		# install stays local and the SHA256 gate below is untouched. The
+		# downloads run through via_curl, so with a tmpxray port up they use
+		# the same exit, with identical flags otherwise.
+		update_downloads() {  # -> $upd_src = release|feed; rc 1, $upd_err = reason
+			upd_src=""; upd_err=""
+			# 1) preferred: stable GitHub Release asset (single redirect, robust)
+			if via_curl -fsSL --max-time 60 -o "$tmp" "$REL" 2>/dev/null && tar -tzf "$tmp" >/dev/null 2>&1; then
+				upd_src=release; return 0
+			fi
 			# 2) fallback: the opkg feed
-			ipk=$(curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
-			[ -n "$ipk" ] || { rm -f "$tmp"; echo "cannot reach Releases or feed"; exit 1; }
-			curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { rm -f "$tmp"; echo "download failed"; exit 1; }
-			tar -tzf "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "downloaded file is not a valid package (feed may be updating)"; exit 1; }
+			ipk=$(via_curl -s --max-time 15 "$FEED/Packages" 2>/dev/null | sed -n 's/^Filename: //p' | tail -n1)
+			[ -n "$ipk" ] || { upd_err="cannot reach Releases or feed"; return 1; }
+			via_curl -s --max-time 60 -o "$tmp" "$FEED/$ipk" || { upd_err="download failed"; return 1; }
+			tar -tzf "$tmp" >/dev/null 2>&1 || { upd_err="downloaded file is not a valid package (feed may be updating)"; return 1; }
+			upd_src=feed; return 0
+		}
+		upd_via_fail=""
+		upd_path="direct"
+		upd_ok=0
+		# direct attempt first unless the update path is pinned to proxy
+		if [ "$fetch_via_update" != proxy ]; then
+			update_downloads && upd_ok=1
 		fi
+		# proxy mode: the only transport. auto: retry a failed direct download.
+		if [ "$upd_ok" != 1 ] && [ "$fetch_via_update" != direct ]; then
+			if via_ensure; then
+				if update_downloads; then
+					upd_ok=1
+					upd_path="via $VIA_TAG"
+					[ "$fetch_via_update" = auto ] && upd_path="direct, retried via $VIA_TAG"
+				fi
+			else
+				upd_via_fail="proxy path unavailable: $via_err"
+			fi
+		fi
+		if [ "$upd_ok" != 1 ]; then
+			rm -f "$tmp"
+			if   [ -n "$upd_via_fail" ]; then echo "$upd_via_fail"
+			elif [ -n "$upd_err" ];      then echo "$upd_err"
+			else                              echo "download failed"; fi
+			exit 1
+		fi
+		printf '%s\n' "$upd_path" > "$STATE/update_path"
+		# Integrity gate: verify the download against a published checksum
+		# before handing it to opkg. Preferred: the .sha256 sidecar next to
+		# the Release asset; else the SHA256sum of the matching Version
+		# stanza in the feed index. Neither available, or mismatch => refuse.
+		# (Checksum fetches ride the same transport the .ipk came over.)
+		exp=""
+		if [ "$upd_src" = release ]; then
+			exp=$(via_curl -fsSL --max-time 20 "$REL.sha256" 2>/dev/null | awk 'NR==1 { print $1 }')
+		fi
+		if [ -z "$exp" ]; then
+			ver=$(tar -xzOf "$tmp" ./control.tar.gz 2>/dev/null | tar -xzO ./control 2>/dev/null | sed -n 's/^Version: //p' | head -n1)
+			[ -n "$ver" ] || { rm -f "$tmp"; echo "cannot read package version - refusing to install"; exit 1; }
+			exp=$(via_curl -s --max-time 20 "$FEED/Packages" 2>/dev/null | awk -v want="$ver" '
+				/^Package: /    { ok = ($2 == PKG) }
+				/^Version: /    { ok = ok && ($2 == want) }
+				/^SHA256sum: /  { if (ok) { print $2; exit } }' PKG="$PKG")
+		fi
+		[ -n "$exp" ] || { rm -f "$tmp"; echo "no published SHA256 for this package version - refusing to install"; exit 1; }
+		got=$(sha256sum "$tmp" 2>/dev/null | awk '{ print $1 }')
+		[ "$got" = "$exp" ] || { rm -f "$tmp"; echo "SHA256 mismatch (expected $exp, got $got) - refusing to install"; exit 1; }
+		# downloads done: drop the proxy instance BEFORE opkg - installing the
+		# package restarts rpcd and replaces this very script, so only the TTL
+		# watchdog would be left to reap the instance
+		via_stop
 		opkg install --force-reinstall "$tmp"; rc=$?
 		rm -f "$tmp"
 		[ "$rc" -eq 0 ] && echo "updated" || { echo "opkg install failed"; exit 1; }
@@ -270,27 +1554,142 @@ case "$1" in
 		command -v ucode >/dev/null 2>&1 || { echo "ucode not installed"; exit 1; }
 		ucode -e 'import { readfile } from "fs";' >/dev/null 2>&1 || { echo "ucode-mod-fs not installed"; exit 1; }
 		[ -f "$CFG" ] || { echo "xray config not found at $CFG"; exit 1; }
-		new="$CFG.apinew.$$"
-		res=$("$SHARE/enable-api.uc" "$CFG" "$new" 10085 2>&1)
+		stage_init
+		res=$("$SHARE/enable-api.uc" "$CFG" "$STAGE_DIR/config.json" 10085 $(sub_prefixes) 2>&1)
 		case "$res" in
-			unchanged) rm -f "$new"; echo "already enabled ($CFG)"; exit 0 ;;
+			unchanged) echo "already enabled ($CFG)"; exit 0 ;;
 			changed)   ;;
-			*)         rm -f "$new"; echo "merge failed: $res"; exit 1 ;;
+			*)         echo "merge failed: $res"; exit 1 ;;
 		esac
-		if "$XRAY" -test -format json -config "$new" >/dev/null 2>&1; then
-			bak="$CFG.bak.preapi.$(date +%Y%m%d-%H%M%S)"; cp -a "$CFG" "$bak"
-			mv "$new" "$CFG"; /etc/init.d/xray restart >/dev/null 2>&1
-			if verify_or_rollback "$bak" 1; then
-				prune_backups
-				echo "enabled and restarted xray ($CFG)"
-			else
-				rm -f "$new" 2>/dev/null; echo "enabled but stats API did not come up - rolled back"; exit 1
+		rc=0; commit_config preapi 1 "$STAGE_DIR/config.json" || rc=$?
+		case "$rc" in
+			0) echo "enabled and restarted xray ($CFG)" ;;
+			2) echo "enabled but stats API did not come up - rolled back"; exit 1 ;;
+			3) echo "failed to install new config"; exit 1 ;;
+			*) echo "xray -test failed on merged config; not applied"; exit 1 ;;
+		esac
+		;;
+
+	# Sticky balancer overrides (F15). Read-only listing for the rpcd
+	# balancers_live snapshot; the apply re-pins everything persisted to the
+	# running xray (used by the tab's "re-apply" button after an EXTERNAL
+	# restart - the post_restart_hooks path already covers our own restarts).
+	# overrides-apply takes the mutation lock: a config write restarting xray
+	# underneath a bo would just race the restart.
+	overrides-list)
+		overrides_list
+		;;
+	overrides-apply)
+		rc=0; overrides_apply || rc=$?
+		case "$rc" in
+			0) skip=""; [ "$OV_SKIPPED" -gt 0 ] && skip=", skipped $OV_SKIPPED (balancer not in config)"
+				echo "ok - applied $OV_APPLIED override(s)$skip" ;;
+			2) echo "ucode not installed"; exit 1 ;;
+			*) echo "applied $OV_APPLIED, failed:$OV_FAILED"; exit 1 ;;
+		esac
+		;;
+
+	tmpxray)
+		case "$2" in
+			start) shift 2; do_tmpxray_start "$@" ;;
+			stop)  do_tmpxray_stop ;;
+			*)     echo "usage: xray-sub tmpxray start <tag>... | tmpxray stop"; exit 1 ;;
+		esac
+		;;
+
+	# End-to-end exit check (F13): runs synchronously (cron form). Tens of
+	# seconds for a handful of exits - the rpcd e2e_start method detaches it
+	# for the UI. Its own EXIT trap (e2e_fini) guarantees the tmpxray instance
+	# is stopped on every path; the run marker $E2E_RUN makes double starts
+	# fail fast.
+	e2e)
+		command -v ucode >/dev/null 2>&1 || { echo "ucode not installed"; exit 1; }
+		command -v curl >/dev/null 2>&1 || { echo "curl not installed"; exit 1; }
+		if [ -s "$E2E_RUN" ]; then
+			pid=$(cat "$E2E_RUN" 2>/dev/null)
+			if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+				&& tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "xray-sub.* e2e"; then
+				echo "an e2e check is already running (pid $pid)"
+				exit 1
 			fi
-		else
-			rm -f "$new"; echo "xray -test failed on merged config; not applied"; exit 1
+			rm -f "$E2E_RUN"
 		fi
+		shift
+		trap e2e_fini EXIT
+		trap 'exit 1' INT TERM HUP
+		do_e2e "$@"
+		exit $?
+		;;
+
+	backups-list)
+		first=1
+		printf '{"backups":['
+		for b in $(backup_names); do
+			meta=$(backup_meta "$b") || continue
+			set -- $meta; kind=$1; ts=$2; pinned=$3
+			size=$(wc -c < "$(dirname "$CFG")/$b" 2>/dev/null | tr -d ' ')
+			# The file can vanish between backup_names' ls and the wc (a
+			# concurrent prune from cron or another pin's mv). Skip it rather
+			# than emit an empty "size":, which would break the whole reply.
+			case "$size" in ''|*[!0-9]*) continue ;; esac
+			[ "$first" = 1 ] || printf ','
+			first=0
+			printf '{"name":"%s","kind":"%s","ts":"%s","size":%s,"pinned":%s}' \
+				"$b" "$kind" "$ts" "$size" "$pinned"
+		done
+		printf ']}\n'
+		;;
+
+	backups-get)
+		p=$(backup_path "$2") || { echo "no such backup"; exit 1; }
+		cat "$p"
+		;;
+
+	backups-delete)
+		p=$(backup_path "$2") || { echo "no such backup"; exit 1; }
+		rm -f "$p" && echo ok || { echo "delete failed"; exit 1; }
+		;;
+
+	backups-pin)  # <name> <0|1>: pin = rename into the pinned.* form (and back)
+		name="$2"; pin="$3"
+		p=$(backup_path "$name") || { echo "no such backup"; exit 1; }
+		case "$pin" in 0|1) ;; *) echo "pin must be 0 or 1"; exit 1 ;; esac
+		meta=$(backup_meta "$name") || { echo "not a recognized backup"; exit 1; }
+		kind=$(echo "$meta" | cut -d' ' -f1)
+		ts=$(echo "$meta"   | cut -d' ' -f2)
+		new="$(basename "$CFG").bak."
+		[ "$pin" = 1 ] && new="${new}pinned."
+		[ "$kind" != auto ] && new="${new}${kind}."
+		new="${new}${ts}"
+		[ "$new" = "$name" ] && { echo "$name"; exit 0; }   # already pinned/unpinned
+		target="$(dirname "$CFG")/$new"
+		[ -e "$target" ] && { echo "target name already exists"; exit 1; }
+		# Say why on failure - the rpcd layer would otherwise show the user
+		# an empty "Pin failed:" with no reason.
+		if mv "$p" "$target"; then echo "$new"; else echo "pin rename failed"; exit 1; fi
+		;;
+
+	# Restore = a config write like any other: the backup content goes through
+	# the standard commit_config pipeline (validate-first, manual-kind backup
+	# of the live config, atomic install, restart, verify+rollback, hooks,
+	# prune). Refuses rather than rolls back on a bad backup (the
+	# content came from disk, not the user's editor, so a test failure means
+	# the backup itself is broken).
+	backups-restore)
+		p=$(backup_path "$2") || { echo "no such backup"; exit 1; }
+		[ -s "$p" ] || { echo "backup is empty"; exit 1; }
+		stage_init
+		cp "$p" "$STAGE_DIR/config.json"
+		api_before=0; api_up && api_before=1
+		rc=0; commit_config manual "$api_before" "$STAGE_DIR/config.json" || rc=$?
+		case "$rc" in
+			0) echo "restored and restarted xray" ;;
+			1) echo "xray -test failed on backup content - not restored"; exit 1 ;;
+			2) echo "restored but xray/api failed health check - rolled back"; exit 1 ;;
+			*) echo "failed to install backup content"; exit 1 ;;
+		esac
 		;;
 
 	*)
-		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api"; exit 1 ;;
+		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api|overrides-list|overrides-apply|tmpxray start <tag>...|tmpxray stop|e2e [tag...]|backups-list|backups-get <name>|backups-delete <name>|backups-pin <name> <0|1>|backups-restore <name>"; exit 1 ;;
 esac

@@ -1,0 +1,1 @@
+{ "api": true, "balancers": [ { "tag": "any-balancer", "strategy": "random", "members": [ "proxy-fi", "proxy-ch" ], "live": true, "pick": "proxy-fi", "targets": [ "proxy-fi" ], "overrideLive": "proxy-fi", "overrideUci": "proxy-ch", "state": "drift" } ], "stale": [ { "balancer": "ghost", "outbound": "proxy-fi" } ], "ts": 1700000000 }

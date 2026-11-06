@@ -14,6 +14,20 @@ config_file() {
 	echo "/etc/xray/config.json"
 }
 
+# Change token of the config file's bytes, for optimistic locking in the raw
+# editor (F17): config_get returns it as "hash", config_save compares the
+# client's "expected_hash" against a fresh one and refuses on a mismatch, so
+# two editors cannot silently clobber each other. Deliberately md5, not sha256:
+# it is not a security digest, it only has to say "the file changed", and md5sum
+# is the cheaper applet every BusyBox build carries. Follows a symlinked config
+# (hashes the target, the same bytes `cat` shows); unreadable file -> "".
+config_hash() {  # <file> -> hex digest, empty when the file is absent/unreadable
+	local h
+	[ -f "$1" ] || { echo ""; return; }
+	h=$(md5sum "$1" 2>/dev/null | awk '{ print $1 }')
+	case "$h" in *[!0-9a-f]*|'') echo "" ;; *) echo "$h" ;; esac
+}
+
 # Detect the config double-load footgun: xray launched with -confdir D *and*
 # -config F where F lives inside D, so D/*.json loads F a second time. Harmless
 # until it isn't (inbounds, incl. the api on 10085, can fail to bind).
@@ -43,6 +57,28 @@ EOF
 	return 1
 }
 
+# Which API services the CONFIG declares, so the UI can tell "not enabled"
+# from "enabled but down" without poking the API. Keep the required list in
+# sync with enable-api.uc. Sets api_services (config order, deduped) and
+# api_missing (required services absent from the config).
+API_SERVICES="StatsService HandlerService RoutingService"
+get_api_services() {  # -> api_services, api_missing
+	local cfg s x
+	api_services=""; api_missing=""
+	cfg=$(config_file)
+	[ -s "$cfg" ] || { api_missing="$API_SERVICES"; return; }
+	s=$(jsonfilter -i "$cfg" -e '@.api.services[*]' 2>/dev/null)
+	for x in $s; do
+		case " $api_services " in *" $x "*) ;; *) api_services="$api_services $x" ;; esac
+	done
+	# compare against the deduped, space-separated api_services, not $s:
+	# jsonfilter prints one service per line, so a " $s " pattern match would
+	# never see the space after a name and every service would read "missing"
+	for x in $API_SERVICES; do
+		case " $api_services " in *" $x "*) ;; *) api_missing="$api_missing $x" ;; esac
+	done
+}
+
 get_status() {
 	local pid hz starttime sysuptime up=0 running=0 version
 	pid=$(pgrep -f "$XRAY run" | head -n1)
@@ -58,6 +94,7 @@ get_status() {
 			[ "$up" -lt 0 ] && up=0
 		fi
 	fi
+	get_api_services
 	json_init
 	json_add_boolean running "$running"
 	json_add_int pid "${pid:-0}"
@@ -65,6 +102,12 @@ get_status() {
 	json_add_string version "${version:-unknown}"
 	json_add_string app_version "$(opkg status luci-app-xray-monitor 2>/dev/null | sed -n 's/^Version: //p' | head -n1)"
 	json_add_boolean confdir_dup "$(confdir_dup "$pid" && echo 1 || echo 0)"
+	json_add_array "api_services"
+	for x in $api_services; do json_add_string "" "$x"; done
+	json_close_array
+	json_add_array "api_missing"
+	for x in $api_missing; do json_add_string "" "$x"; done
+	json_close_array
 	json_dump
 }
 
@@ -78,28 +121,92 @@ get_stats() {
 }
 
 # TCP-reachability probe -> echoes "<up> <ms>"  (up: 1 reachable, 0 down, -1 no tool)
+# Backends, most precise first, detected once per call:
+#   ucode-mod-socket  bare TCP connect (no payload, no handshake) + ms latency
+#   curl ftp://       connect, then wait for a server greeting that never comes
+#                     - not a single byte is sent to the endpoint. Up is judged
+#                     by time_connect > 0 (the later timeout rc is expected);
+#                     bounded by --max-time. (telnet:// is not compiled into
+#                     OpenWrt's curl.)
+#   ncat -z           port check, no latency value
+# ucode-mod-socket is optional and only exists in the feeds from 24.10 on, so
+# 23.05 boxes transparently use the curl path. BusyBox nc has no -w and can
+# hang in connect() for minutes, so it is deliberately not used.
+have_socket=0
+if command -v ucode >/dev/null 2>&1; then
+	ucode -e 'import { create } from "socket";' >/dev/null 2>&1 && have_socket=1
+fi
+have_curl=0; command -v curl >/dev/null 2>&1 && have_curl=1
+have_ncat=0; command -v ncat >/dev/null 2>&1 && have_ncat=1
+
 probe() {
-	local a="$1" p="$2" t
-	if command -v curl >/dev/null 2>&1; then
-		t=$(curl -sk -o /dev/null --connect-timeout 3 --max-time 4 -w '%{time_connect}' "https://$a:$p" 2>/dev/null)
-		case "$t" in
-			""|0|0.0|0.000|0.000000) echo "0 0" ;;
-			*) echo "1 $(awk "BEGIN{printf \"%d\", $t*1000}")" ;;
-		esac
-	elif command -v ncat >/dev/null 2>&1; then
-		if ncat -z -w 3 "$a" "$p" >/dev/null 2>&1; then echo "1 0"; else echo "0 0"; fi
-	else
-		echo "-1 0"
+	local a="$1" p="$2" out url t rc
+	if [ "$have_socket" = 1 ]; then
+		# probe.uc aborts with empty output on refused/unreachable => down
+		out=$("$SHARE/probe.uc" "$a" "$p" 2>/dev/null)
+		[ -n "$out" ] && echo "$out" || echo "0 0"
+		return
 	fi
+	if [ "$have_curl" = 1 ]; then
+		case "$a" in *:*) url="ftp://[$a]:$p" ;; *) url="ftp://$a:$p" ;; esac
+		t=$(curl -s -o /dev/null </dev/null --connect-timeout 3 --max-time 3 \
+			-w '%{time_connect}' "$url" 2>/dev/null); rc=$?
+		if [ "$rc" -eq 1 ]; then
+			have_curl=0   # protocol unsupported by this curl build - skip it
+		else
+			t=$(awk "BEGIN{printf \"%.0f %d\", (${t:-0})*1000, (${t:-0} > 0) ? 1 : 0}")
+			[ "${t#* }" = 1 ] && echo "1 ${t% *}" || echo "0 0"
+			return
+		fi
+	fi
+	if [ "$have_ncat" = 1 ]; then
+		ncat -z -w 3 "$a" "$p" >/dev/null 2>&1 && echo "1 0" || echo "0 0"
+		return
+	fi
+	echo "-1 0"
+}
+
+# Print an IPv6 address the way /proc/net/nf_conntrack spells dst=: eight
+# groups of 4 zero-padded hex digits, no "::" compression, e.g.
+# 2a01:4f8::1 -> 2a01:04f8:0000:0000:0000:0000:0000:0001. grep needs that
+# exact form - the compressed spelling never matches a conntrack line.
+expand6() {  # <ipv6>
+	local a="$1" pre post g n=0 preout="" postout=""
+	case "$a" in
+		*.*)  echo "$a"; return ;;   # IPv4-mapped/junk - leave as-is
+		*::*) pre="${a%%::*}"; post="${a##*::}" ;;
+		*)    pre="$a"; post="" ;;
+	esac
+	local IFS=:
+	for g in $pre; do
+		case "$g" in *[!0-9a-fA-F]*|'') echo "$a"; return ;; esac
+		preout="$preout$(printf '%04x:' $(( 0x$g )))"; n=$((n + 1))
+	done
+	for g in $post; do
+		case "$g" in *[!0-9a-fA-F]*|'') echo "$a"; return ;; esac
+		postout="$postout$(printf '%04x:' $(( 0x$g )))"; n=$((n + 1))
+	done
+	[ "$n" -gt 8 ] && { echo "$a"; return; }   # not 8-expandable - keep as-is
+	while [ "$n" -lt 8 ]; do postout="0000:$postout"; n=$((n + 1)); done
+	local out="${preout}${postout}"
+	echo "${out%:}"
 }
 
 # Is there a live (ESTABLISHED) connection to addr:port right now?
-# Resolves hostnames to IPs (subscription servers use hostnames).
+# Resolves hostnames to IPs (subscription servers use hostnames), preferring
+# A over AAAA; IPv6 literals and AAAA results are normalized via expand6().
 is_active() {
 	local addr="$1" port="$2" ips ip
 	case "$addr" in
-		*[!0-9.]*) ips=$(resolveip -4 -t 2 "$addr" 2>/dev/null) ;;  # contains non-IPv4 chars => hostname
-		*)         ips="$addr" ;;
+		*:*)        ips=$(expand6 "$addr") ;;                 # IPv6 literal
+		*[!0-9.]*)                                              # hostname
+			ips=$(resolveip -4 -t 2 "$addr" 2>/dev/null)
+			if [ -z "$ips" ]; then
+				ips=$(resolveip -6 -t 2 "$addr" 2>/dev/null \
+					| while IFS= read -r ip; do expand6 "$ip"; done)
+			fi
+			;;
+		*)          ips="$addr" ;;
 	esac
 	[ -n "$ips" ] || ips="$addr"
 	for ip in $ips; do
@@ -121,7 +228,7 @@ get_outbounds() {
 	cfg=$(config_file)
 	dlist=$(probe_disabled_list)
 	n=$(jsonfilter -i "$cfg" -e '@.outbounds[*].tag' 2>/dev/null | wc -l)
-	tmp=$(mktemp -d)
+	tmp=$(mktemp -d) || { json_init; json_add_array "outbounds"; json_close_array; json_dump; return; }
 	i=0
 	while [ "$i" -lt "$n" ]; do
 		tag=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].tag" 2>/dev/null)
@@ -229,14 +336,186 @@ do_reset() {
 	json_dump
 }
 
-SUB=/usr/share/xray-monitor/xray-sub
+SHARE=/usr/share/xray-monitor
+SUB=$SHARE/xray-sub
 
-run_ok() {  # run a command, emit {"ok":bool}
-	"$@" >/dev/null 2>&1
-	local rc=$?
+# --- Balancers: live state + sticky overrides (F15) ---------------------------
+# `xray api bi/bo` talk to the RoutingService on the api inbound (loopback
+# only; enable-api.uc ships it). Every call carries xray's own -t flag, so a
+# down API fails after ~2 s instead of hanging the ubus call. bi is read-only;
+# bo mutates the RUNNING instance only - config.json is never touched here,
+# overrides persist in UCI (xray-sub overrides-*) and survive restarts via
+# post_restart_hooks.
+
+# Live snapshot for the Balancers tab: one `bi` call per configured balancer
+# (in parallel, so wall time stays one call even for several balancers) plus
+# the persisted overrides, merged by balance-cli.uc into the shape the UI
+# renders (pick / running pin / saved pin / divergence per balancer).
+get_balancers_live() {
+	local cfg tmp t ts out
+	cfg=$(config_file)
+	if ! command -v ucode >/dev/null 2>&1 || [ ! -s "$cfg" ]; then
+		printf '{"api":false,"balancers":[],"stale":[],"ts":0}'
+		return
+	fi
+	tmp=$(mktemp -d) || { printf '{"api":false,"balancers":[],"stale":[],"ts":0}'; return; }
+	for t in $(jsonfilter -i "$cfg" -e '@.routing.balancers[*].tag' 2>/dev/null); do
+		# the tag becomes a filename below: strict charset, never "." / ".."
+		case "$t" in ''|.|..|*[!A-Za-z0-9._-]*) continue ;; esac
+		(
+			out=$("$XRAY" api bi --server="$API_SERVER" -t 2 -json "$t" 2>/dev/null)
+			if [ $? -eq 0 ] && [ -n "$out" ]; then printf '%s' "$out" > "$tmp/$t.bi"
+			else printf '{"error":true}' > "$tmp/$t.bi"; fi
+		) &
+	done
+	wait
+	"$SUB" overrides-list > "$tmp/overrides.json" 2>/dev/null || printf '[]' > "$tmp/overrides.json"
+	ts=$(date +%s)
+	"$SHARE/balance-cli.uc" live "$cfg" "$tmp" "$tmp/overrides.json" "$ts" \
+		|| printf '{"api":false,"balancers":[],"stale":[],"ts":%s}' "$ts"
+	rm -rf "$tmp"
+}
+
+# Upsert the UCI side of an override: exactly one balancer_override section per
+# balancer (set the outbound on the existing one, drop accidental duplicates,
+# else add a section).
+override_upsert_uci() {  # <balancer> <outbound>
+	local id keep="" b
+	for id in $(uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=balancer_override$/\1/p'); do
+		b=$(uci -q get "xray-monitor.$id.balancer")
+		[ "$b" = "$1" ] || continue
+		if [ -z "$keep" ]; then
+			uci set "xray-monitor.$id.outbound"="$2"; keep="$id"
+		else
+			uci -q delete "xray-monitor.$id"
+		fi
+	done
+	if [ -z "$keep" ]; then
+		keep=$(uci add xray-monitor balancer_override)
+		uci set "xray-monitor.$keep.balancer"="$1"
+		uci set "xray-monitor.$keep.outbound"="$2"
+	fi
+}
+
+# Pin one balancer to one outbound: validate (charset AND membership in the
+# current config - bo would accept a nonexistent tag and the balancer would
+# route into the void), apply LIVE via bo, then persist. bo first: a failure
+# (api down, balancer just vanished) must not leave a UCI section the running
+# xray does not honor.
+do_override_set() {
+	local input bal ob v ok msg rc
+	input=$(cat)
+	bal=$(echo "$input" | jsonfilter -e '@.balancer' 2>/dev/null)
+	ob=$(echo "$input"  | jsonfilter -e '@.outbound' 2>/dev/null)
+	if [ -z "$bal" ] || [ -z "$ob" ]; then
+		json_init; json_add_boolean ok 0; json_add_string msg "missing balancer or outbound"; json_dump; return
+	fi
+	v=$("$SHARE/balance-cli.uc" validate "$(config_file)" "$bal" "$ob" 2>/dev/null)
+	ok=$(printf '%s' "$v" | jsonfilter -e '@.ok' 2>/dev/null)
+	if [ "$ok" != 1 ]; then
+		msg=$(printf '%s' "$v" | jsonfilter -e '@.msg' 2>/dev/null)
+		[ -n "$msg" ] || msg="invalid override"
+		json_init; json_add_boolean ok 0; json_add_string msg "$msg"; json_dump; return
+	fi
+	msg=$("$XRAY" api bo --server="$API_SERVER" -t 2 -b "$bal" "$ob" 2>&1); rc=$?
+	if [ "$rc" -ne 0 ]; then
+		json_init; json_add_boolean ok 0
+		json_add_string msg "xray rejected the override: $(printf '%s' "$msg" | tr -s '\r\n\t ' ' ')"
+		json_dump; return
+	fi
+	override_upsert_uci "$bal" "$ob"
+	uci commit xray-monitor
+	json_init; json_add_boolean ok 1; json_add_string msg "pinned $bal to $ob"; json_dump
+}
+
+# Remove a balancer's sticky override: clear the LIVE pin first - even when no
+# UCI section exists (it may have been set from the CLI). A bo failure is
+# tolerated when the balancer is gone from the config: that is exactly the
+# stale-section case, where dropping the section is the whole point.
+do_override_del() {
+	local input bal id b
+	input=$(cat)
+	bal=$(echo "$input" | jsonfilter -e '@.balancer' 2>/dev/null)
+	case "$bal" in
+		''|*[!A-Za-z0-9._-]*)
+			json_init; json_add_boolean ok 0; json_add_string msg "missing or invalid balancer"; json_dump
+			return ;;
+	esac
+	"$XRAY" api bo --server="$API_SERVER" -t 2 -b "$bal" -r >/dev/null 2>&1
+	for id in $(uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=balancer_override$/\1/p'); do
+		b=$(uci -q get "xray-monitor.$id.balancer")
+		if [ "$b" = "$bal" ]; then uci -q delete "xray-monitor.$id"; fi
+	done
+	uci commit xray-monitor
+	json_init; json_add_boolean ok 1; json_add_string msg "override removed from $bal"; json_dump
+}
+
+# --- e2e exit check (F13, contract B3) ---------------------------------------
+# e2e.json / e2e.run live next to the tmpxray state in /tmp (xray-sub owns the
+# files; this backend only reads them and kicks the detached run). The run
+# marker is a pid file whose process must still look like `xray-sub e2e` - a
+# reused pid must not read as "running" (same cmdline guard idea as
+# tmpxray_pid_ours in xray-sub).
+E2E_STATE=/tmp/xray-monitor
+e2e_pid_ours() {  # <pid>
+	tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "xray-sub.* e2e"
+}
+e2e_running() {
+	local pid
+	[ -s "$E2E_STATE/e2e.run" ] || return 1
+	pid=$(cat "$E2E_STATE/e2e.run" 2>/dev/null)
+	case "$pid" in ''|*[!0-9]*) rm -f "$E2E_STATE/e2e.run"; return 1 ;; esac
+	if e2e_pid_ours "$pid" && kill -0 "$pid" 2>/dev/null; then return 0; fi
+	rm -f "$E2E_STATE/e2e.run"
+	return 1
+}
+
+# Every xray-sub call from here serves a UI click: fail fast on a busy lock
+# instead of waiting out xray-sub's ~55 s poll inside the rpcd call (the HTTP
+# session may drop while the operation would still run afterwards). The cron
+# path invokes xray-sub without this variable and keeps the bounded wait.
+export XRAYMON_NOWAIT=1
+
+sub_msg() {  # <args...> — run xray-sub, emit {"ok":bool,"msg":string}
+	local msg rc
+	msg=$("$SUB" "$@" 2>&1); rc=$?
 	json_init
 	json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+	json_add_string msg "$msg"
 	json_dump
+}
+
+# --- config.json backups (xray-sub backups-*) --------------------------------
+# The client sends only a backup basename. It must be a plain basename, be
+# present in the real listing of $CFG.bak.* files, and be pipeline-shaped;
+# the path is always rebuilt from the config file's own directory, so no
+# client path ever reaches the filesystem. Mirrors backup_path() in xray-sub
+# (defense in depth), including the shape check - config_diff never reaches
+# xray-sub, so this is the only gate for it.
+backup_check() {  # <basename> -> prints path, rc 1 = rejected
+	local cfg d b pfx rest
+	case "$1" in
+		''|*[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	cfg=$(config_file)
+	d=$(dirname "$cfg")
+	for b in $(ls -t "$d/$(basename "$cfg").bak."* 2>/dev/null); do
+		if [ "${b##*/}" = "$1" ]; then
+			# same shape rules as backup_meta() in xray-sub:
+			# [pinned.][manual.|preapi.]<timestamp>
+			pfx="$(basename "$cfg").bak."
+			rest="$1"
+			case "$rest" in "$pfx"*) rest="${rest#"$pfx"}" ;; *) return 1 ;; esac
+			case "$rest" in pinned.*) rest="${rest#pinned.}" ;; esac
+			case "$rest" in manual.*|preapi.*) rest="${rest#*.}" ;; esac
+			case "$rest" in
+				20[0-9][0-9][01][0-9][0-3][0-9]-[0-2][0-9][0-5][0-9][0-5][0-9]) ;;
+				*) return 1 ;;
+			esac
+			echo "$d/$1"; return 0
+		fi
+	done
+	return 1
 }
 
 # Validate the live xray config with `xray -test` (read-only)
@@ -267,6 +546,7 @@ case "$1" in
 		json_add_object "sub_setcfg"
 			json_add_string "cron" ""; json_add_string "cron_schedule" ""
 			json_add_string "auto_apply" ""; json_add_string "user_agent" ""
+			json_add_string "hot_swap" ""
 		json_close_object
 		json_add_object "sub_add"; json_add_string "prefix" ""; json_add_string "url" ""; json_close_object
 		json_add_object "sub_del"; json_add_string "id" ""; json_close_object
@@ -278,13 +558,28 @@ case "$1" in
 		json_add_object "routing_set"; json_add_array "inbounds"; json_close_array; json_close_object
 		json_add_object "balancers_get"; json_close_object
 		json_add_object "balancers_set"; json_add_array "balancers"; json_close_array; json_close_object
+		json_add_object "balancers_live"; json_close_object
+		json_add_object "balancer_override_set"
+			json_add_string "balancer" ""; json_add_string "outbound" ""
+		json_close_object
+		json_add_object "balancer_override_del"; json_add_string "balancer" ""; json_close_object
+		json_add_object "balancer_override_apply"; json_close_object
 		json_add_object "enable_api"; json_close_object
 		json_add_object "validate"; json_close_object
 		json_add_object "config_get"; json_close_object
 		json_add_object "config_test"; json_add_string "config" ""; json_close_object
-		json_add_object "config_save"; json_add_string "config" ""; json_close_object
+		json_add_object "config_save"; json_add_string "config" ""; json_add_string "expected_hash" ""; json_close_object
+		json_add_object "config_diff_text"; json_add_string "config" ""; json_close_object
 		json_add_object "update_check"; json_close_object
 		json_add_object "update_apply"; json_close_object
+		json_add_object "backups_list"; json_close_object
+		json_add_object "backups_get"; json_add_string "name" ""; json_close_object
+		json_add_object "backups_delete"; json_add_string "name" ""; json_close_object
+		json_add_object "backups_pin"; json_add_string "name" ""; json_add_string "pinned" ""; json_close_object
+		json_add_object "backups_restore"; json_add_string "name" ""; json_close_object
+		json_add_object "config_diff"; json_add_string "name" ""; json_close_object
+		json_add_object "e2e_start"; json_close_object
+		json_add_object "e2e_status"; json_close_object
 		json_dump
 	;;
 	call)
@@ -300,42 +595,72 @@ case "$1" in
 				cfg=$(config_file)
 				json_init
 				json_add_string path "$cfg"
+				json_add_string hash "$(config_hash "$cfg")"
 				json_add_string config "$(cat "$cfg" 2>/dev/null)"
 				json_dump
 			;;
 			config_test)
 				input=$(cat)
-				tmp=$(mktemp)
-				printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
-				out=$($XRAY -test -format json -config "$tmp" 2>&1); rc=$?
-				rm -f "$tmp"
-				msg=$(printf '%s\n' "$out" | grep -viE '^Xray [0-9]|Penetrates Everything|unified platform|infra/conf/serial: Reading' | tr -s '\r\n\t ' ' ')
-				json_init
-				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-				json_add_string msg "${msg:-no output}"
-				json_dump
+				tmp=$(mktemp -d)
+				if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+					json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp dir"; json_dump
+				else
+					tmp="$tmp/config.json"
+					printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
+					out=$($XRAY -test -format json -config "$tmp" 2>&1); rc=$?
+					rm -rf "${tmp%/*}"
+					msg=$(printf '%s\n' "$out" | grep -viE '^Xray [0-9]|Penetrates Everything|unified platform|infra/conf/serial: Reading' | tr -s '\r\n\t ' ' ')
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "${msg:-no output}"
+					json_dump
+				fi
 			;;
+			# Optimistic locking (F17): the raw editor sends the "hash" it got
+			# from config_get with the content it shows. A mismatch means the
+			# file on the router changed since (other tab, other person, cron
+			# fetch + auto-apply) - refuse instead of clobbering it. Absent or
+			# empty expected_hash = no check: the previous behavior, still
+			# allowed for scripts/older UIs (the UI always sends it). Checked
+			# here, right before the locked write, so the window is only the
+			# few ms until xray-sub takes the mutation lock.
 			config_save)
 				input=$(cat)
-				tmp=$(mktemp)
-				printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
-				msg=$("$SUB" config-save "$tmp" 2>&1); rc=$?
-				rm -f "$tmp"
-				json_init
-				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-				json_add_string msg "$msg"
-				json_dump
+				exp=$(printf '%s' "$input" | jsonfilter -e '@.expected_hash' 2>/dev/null)
+				cfg=$(config_file)
+				if [ -n "$exp" ] && [ "$exp" != "$(config_hash "$cfg")" ]; then
+					json_init
+					json_add_boolean ok 0
+					json_add_boolean conflict 1
+					json_add_string msg "config changed on the router since you loaded it - reload and re-apply your edits"
+					json_dump
+				else
+					tmp=$(mktemp -d)
+					if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+						json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp dir"; json_dump
+					else
+						tmp="$tmp/config.json"
+						printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
+						msg=$("$SUB" config-save "$tmp" 2>&1); rc=$?
+						rm -rf "${tmp%/*}"
+						json_init
+						json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+						json_add_string msg "$msg"
+						json_dump
+					fi
+				fi
 			;;
 			sub_get)   "$SUB" status ;;
-			sub_fetch) run_ok "$SUB" fetch ;;
-			sub_apply) run_ok "$SUB" apply ;;
+			sub_fetch) sub_msg fetch ;;
+			sub_apply) sub_msg apply ;;
 			sub_setcfg)
 				input=$(cat)
 				c=$(echo "$input"  | jsonfilter -e '@.cron' 2>/dev/null)
 				s=$(echo "$input"  | jsonfilter -e '@.cron_schedule' 2>/dev/null)
 				a=$(echo "$input"  | jsonfilter -e '@.auto_apply' 2>/dev/null)
 				ug=$(echo "$input" | jsonfilter -e '@.user_agent' 2>/dev/null)
-				msg=$("$SUB" set-cfg "$c" "$s" "$a" "$ug" 2>&1); rc=$?
+				hs=$(echo "$input" | jsonfilter -e '@.hot_swap' 2>/dev/null)
+				msg=$("$SUB" set-cfg "$c" "$s" "$a" "$ug" "$hs" 2>&1); rc=$?
 				json_init; json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"; json_add_string msg "$msg"; json_dump
 			;;
 			sub_add)
@@ -364,13 +689,17 @@ case "$1" in
 			routing_set)
 				input=$(cat)
 				f=$(mktemp)
-				echo "$input" | jsonfilter -e '@.inbounds' > "$f" 2>/dev/null
-				msg=$("$SUB" routing-set "$f" 2>&1); rc=$?
-				rm -f "$f"
-				json_init
-				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-				json_add_string msg "$msg"
-				json_dump
+				if [ -z "$f" ] || [ ! -f "$f" ]; then
+					json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp file"; json_dump
+				else
+					echo "$input" | jsonfilter -e '@.inbounds' > "$f" 2>/dev/null
+					msg=$("$SUB" routing-set "$f" 2>&1); rc=$?
+					rm -f "$f"
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				fi
 			;;
 			enable_api)
 				msg=$("$SUB" enable-api 2>&1); rc=$?
@@ -389,24 +718,184 @@ case "$1" in
 				json_dump
 			;;
 			update_apply)
-				# detach so the rpcd restart during opkg install can't kill the update
-				setsid sh -c 'sleep 2; /usr/share/xray-monitor/xray-sub self-update > /tmp/xraymon-update.log 2>&1' >/dev/null 2>&1 &
+				# Detach so the rpcd restart during opkg install can't kill the
+				# update. setsid is deliberately NOT used: busybox builds without
+				# that applet exist (this 23.05 box has none - the same reason
+				# the tmpxray watchdog falls back to a plain background shell),
+				# and `setsid: not found` would leave the button dead. Ignoring
+				# SIGHUP covers the caller's death. The detached shell also
+				# drops XRAYMON_NOWAIT (exported above for every xray-sub call
+				# from this backend): the package postinst runs `xray-sub
+				# cron-sync` and `enable-api`, which take the same mutation
+				# lock - with NOWAIT inherited they would fail fast whenever a
+				# cron fetch happened to hold it.
+				sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; sleep 2; exec /usr/share/xray-monitor/xray-sub self-update' \
+					>/tmp/xraymon-update.log 2>&1 </dev/null &
 				json_init
 				json_add_boolean ok 1
 				json_add_string msg "Update started; the page will reconnect in a few seconds."
 				json_dump
 			;;
 			balancers_get) "$SUB" balancers-get ;;
+			balancers_live) get_balancers_live ;;
+			balancer_override_set) do_override_set ;;
+			balancer_override_del) do_override_del ;;
+			# re-apply every persisted override to the running xray (bo);
+			# serialized with config writes by the mutation lock inside
+			# xray-sub (fail-fast here: a UI click must not sit out the poll)
+			balancer_override_apply) sub_msg overrides-apply ;;
 			balancers_set)
 				input=$(cat)
 				f=$(mktemp)
-				echo "$input" | jsonfilter -e '@.balancers' > "$f" 2>/dev/null
-				msg=$("$SUB" balancers-set "$f" 2>&1); rc=$?
-				rm -f "$f"
-				json_init
-				json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
-				json_add_string msg "$msg"
-				json_dump
+				if [ -z "$f" ] || [ ! -f "$f" ]; then
+					json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp file"; json_dump
+				else
+					echo "$input" | jsonfilter -e '@.balancers' > "$f" 2>/dev/null
+					msg=$("$SUB" balancers-set "$f" 2>&1); rc=$?
+					rm -f "$f"
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				fi
+			;;
+			backups_list) "$SUB" backups-list ;;
+			backups_get)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if p=$(backup_check "$nm") && [ -r "$p" ]; then
+					# keep the file byte-exact (incl. its trailing newline)
+					# so View and Download match the backup on disk
+					cfg_txt=$(cat "$p" 2>/dev/null; echo x)
+					cfg_txt="${cfg_txt%x}"
+					json_init
+					json_add_boolean ok 1
+					json_add_string name "$nm"
+					json_add_string config "$cfg_txt"
+					json_dump
+				else
+					json_init
+					json_add_boolean ok 0
+					json_add_string msg "no such backup"
+					json_dump
+				fi
+			;;
+			backups_delete)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if backup_check "$nm" >/dev/null; then
+					msg=$("$SUB" backups-delete "$nm" 2>&1); rc=$?
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				else
+					json_init; json_add_boolean ok 0; json_add_string msg "no such backup"; json_dump
+				fi
+			;;
+			backups_pin)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				pin=$(echo "$input" | jsonfilter -e '@.pinned' 2>/dev/null)
+				case "$pin" in 0|1) ;; *) pin="" ;; esac
+				if backup_check "$nm" >/dev/null && [ -n "$pin" ]; then
+					msg=$("$SUB" backups-pin "$nm" "$pin" 2>&1); rc=$?
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"   # msg = the new (renamed) basename on success
+					json_dump
+				else
+					json_init; json_add_boolean ok 0; json_add_string msg "no such backup"; json_dump
+				fi
+			;;
+			backups_restore)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if backup_check "$nm" >/dev/null; then
+					msg=$("$SUB" backups-restore "$nm" 2>&1); rc=$?
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				else
+					json_init; json_add_boolean ok 0; json_add_string msg "no such backup"; json_dump
+				fi
+			;;
+			# Semantic diff of the current config vs a backup, as
+			# paths_diff(current, backup): added = restore would add it,
+			# removed = restore would drop it, changed = differs either way.
+			config_diff)
+				input=$(cat)
+				nm=$(echo "$input" | jsonfilter -e '@.name' 2>/dev/null)
+				if p=$(backup_check "$nm"); then
+					"$SHARE/jsondiff-cli.uc" "$(config_file)" "$p" 2>/dev/null \
+						|| { printf '{"added":[],"removed":[],"changed":[],"error":"diff failed"}'; }
+				else
+					printf '{"added":[],"removed":[],"changed":[],"error":"no such backup"}'
+				fi
+			;;
+			# Kick the end-to-end exit check in the background (F13): it takes
+			# tens of seconds (one tmpxray + 2 curls per exit) and must never
+			# run synchronously inside the ubus call. Detached exactly like
+			# update_apply: trap "" HUP survives the caller's death, and
+			# XRAYMON_NOWAIT is dropped so the run behaves like the cron one.
+			# Progress/results are polled via e2e_status (e2e.json + e2e.run).
+			# A run already in flight is reported, not restarted.
+			e2e_start)
+				if e2e_running; then
+					json_init
+					json_add_boolean ok 1
+					json_add_boolean running 1
+					json_add_string msg "An E2E check is already running"
+					json_dump
+				else
+					mkdir -p "$E2E_STATE"
+					sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; exec /usr/share/xray-monitor/xray-sub e2e' \
+						>"$E2E_STATE/e2e.log" 2>&1 </dev/null &
+					json_init
+					json_add_boolean ok 1
+					json_add_boolean running 1
+					json_add_string msg "E2E check started"
+					json_dump
+				fi
+			;;
+			# e2e.json (contract B3) plus the running flag (from e2e.run); the
+			# flag deliberately lives outside e2e.json so the file stays exactly
+			# the contract shape for F18.
+			e2e_status)
+				running=0; e2e_running && running=1
+				if command -v ucode >/dev/null 2>&1; then
+					"$SHARE/e2e.uc" status "$E2E_STATE/e2e.json" "$running" 2>/dev/null \
+						|| printf '{"running":%s,"ts":0,"results":{}}' "$running"
+				else
+					printf '{"running":%s,"ts":0,"results":{}}' "$running"
+				fi
+			;;
+			# Semantic diff of the raw editor's text against the LIVE config, as
+			# paths_diff(live, edited) - the save-side twin of config_diff above:
+			# added = saving the editor content would add it, removed = it would
+			# drop it, changed = differs either way. Same reply shape and error
+			# convention, so the UI renders both the same way. The text lands in
+			# a temp config.json (never next to the live config) and is parsed by
+			# the very jsondiff.uc the pipeline uses: the first self-diff only
+			# proves the text parses, so text that does not is reported as
+			# "invalid JSON" rather than a generic failure.
+			config_diff_text)
+				input=$(cat)
+				tmp=$(mktemp -d)
+				if [ -z "$tmp" ] || [ ! -d "$tmp" ]; then
+					printf '{"added":[],"removed":[],"changed":[],"error":"cannot create temp dir"}'
+				else
+					tmp="$tmp/config.json"
+					printf '%s' "$input" | jsonfilter -e '@.config' > "$tmp" 2>/dev/null
+					if "$SHARE/jsondiff-cli.uc" "$tmp" "$tmp" >/dev/null 2>&1; then
+						"$SHARE/jsondiff-cli.uc" "$(config_file)" "$tmp" 2>/dev/null \
+							|| { printf '{"added":[],"removed":[],"changed":[],"error":"diff failed"}'; }
+					else
+						printf '{"added":[],"removed":[],"changed":[],"error":"invalid JSON"}'
+					fi
+					rm -rf "${tmp%/*}"
+				fi
 			;;
 			*)         printf '{}' ;;
 		esac

@@ -1,0 +1,1 @@
+[ { "tag": "any-balancer", "selector": [ "proxy-", "work-" ], "strategy": "leastPing", "fallbackTag": "proxy-fi" } ]

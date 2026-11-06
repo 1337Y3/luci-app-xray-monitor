@@ -2,9 +2,13 @@ name: build-feed
 
 # Rebuild the .ipk + opkg index whenever the package source changes.
 # Skips when only the generated feed (docs/) changes, so the auto-commit
-# below can't trigger an infinite loop.
+# below can't trigger an infinite loop. PRs only run the tests job.
 on:
   push:
+    branches: [ main ]
+    paths-ignore:
+      - 'docs/**'
+  pull_request:
     branches: [ main ]
     paths-ignore:
       - 'docs/**'
@@ -13,8 +17,135 @@ on:
 permissions:
   contents: write
 
+# Tests run on TWO ucode builds: the exact one shipped by OpenWrt 23.05
+# (1a8a0bcf - the oldest interpreter the package supports; among other
+# things it drops a literal `--` from a script's ARGV, which is why diff.uc
+# and hotswap.uc take ignore paths as ignore=<path> arguments) and the
+# current ucode master. Everything else in the two legs is identical.
 jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ucode_ref: "1a8a0bcf725520820802ad433db22d8f64fbed6c"
+            ucode_label: "ucode 23.05 (1a8a0bcf)"
+          - ucode_ref: "HEAD"
+            ucode_label: "ucode current"
+    name: tests (${{ matrix.ucode_label }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The 475d8a1 regression (an unclosed block comment swallowing a var
+      # definition) was syntactically valid JS - only EXECUTING the module
+      # catches it. Node is preinstalled on the runner.
+      - name: JS checks (xray-diff functional, view syntax)
+        run: sh tests/js-test.sh
+
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libjson-c-dev
+
+      # ucode is only packaged by OpenWrt itself; build it from source with
+      # every integration module (ubus/uci/uloop/ffi/...) disabled so plain
+      # ubuntu runners can run the .uc helpers. Installing to /usr matches
+      # the #!/usr/bin/ucode shebangs of the scripts under test. The 23.05
+      # leg shallow-fetches the exact pinned commit (no branch assumptions),
+      # the other leg tracks master.
+      - name: Build ucode from source
+        run: |
+          git init /tmp/ucode
+          git -C /tmp/ucode remote add origin https://github.com/ucode-lang/ucode
+          git -C /tmp/ucode fetch --depth 1 origin "${{ matrix.ucode_ref }}"
+          git -C /tmp/ucode checkout --detach FETCH_HEAD
+          git -C /tmp/ucode log --oneline -1
+          # ucode hard-codes -Werror; GCC 15 (ubuntu-26.04 image) promotes
+          # fresh warnings in the pinned 23.05 tree to hard build errors
+          # (discarded-qualifiers et al). We need a working interpreter, not
+          # upstream warning hygiene - defuse -Werror for both legs.
+          sed -i -e 's/-Werror=[a-z=-]*//g' -e 's/-Werror//g' /tmp/ucode/CMakeLists.txt
+          cmake -S /tmp/ucode -B /tmp/ucode/build -DCMAKE_INSTALL_PREFIX=/usr \
+            -DUBUS_SUPPORT=OFF -DUCI_SUPPORT=OFF -DULOOP_SUPPORT=OFF \
+            -DFFI_SUPPORT=OFF -DRTNL_SUPPORT=OFF -DNL80211_SUPPORT=OFF
+          cmake --build /tmp/ucode/build -j"$(nproc)"
+          sudo cmake --install /tmp/ucode/build
+          ucode -e 'print("ucode ok")'
+          # informational: does this build keep a literal `--` in ARGV?
+          # (23.05: dropped - the reason the ignore= argument form exists)
+          printf 'print(join("|", ARGV))' > /tmp/argv.uc
+          echo "ucode ARGV(a -- b) = $(ucode /tmp/argv.uc a -- b)"
+
+      # ubuntu-latest moved to 26.04, whose busybox-static trims its applet
+      # set (no flock - the guard below caught it) and will drift again with
+      # every image. Build our own full-applet BusyBox (defconfig) so the
+      # userspace under test no longer depends on distro packaging.
+      - name: Build BusyBox from source
+        run: |
+          curl -fsSL --retry 3 -o /tmp/busybox.tar.bz2 \
+            https://busybox.net/downloads/busybox-1.38.0.tar.bz2
+          mkdir /tmp/busybox && tar -xjf /tmp/busybox.tar.bz2 -C /tmp/busybox --strip-components=1
+          make -C /tmp/busybox defconfig
+          # 1.38's networking/tc.c still uses CBQ uapi constants that linux
+          # >=6.15 headers (ubuntu-26.04) dropped; the suite never needs tc.
+          sed -i 's/^CONFIG_TC=y$/# CONFIG_TC is not set/' /tmp/busybox/.config
+          yes '' | make -C /tmp/busybox oldconfig
+          make -C /tmp/busybox -j"$(nproc)"
+          sudo install -m 0755 /tmp/busybox/busybox /usr/local/bin/busybox
+          /usr/local/bin/busybox | sed -n '1p'
+
+      # The pipeline scenario (and xray-sub itself) lean on the OpenWrt
+      # userspace: BusyBox ash as `sh`, libubox (jshn.sh + headers + the
+      # library jsonpath links against), and jsonfilter compiled from
+      # openwrt/jsonpath (its CMake only works in-source, so `cmake .` runs
+      # inside the checkout). /usr/local/bin precedes /usr/bin in the runner
+      # PATH, so every `sh ...` below - including the two test steps -
+      # resolves to busybox ash.
+      - name: BusyBox ash, jshn and jsonfilter
+        run: |
+          sudo ln -sf /usr/local/bin/busybox /usr/local/bin/sh
+          echo "sh under test: $(sh -c 'echo ash ok')"
+          busybox --list | grep -qx flock || { echo "busybox lacks flock"; exit 1; }
+          git clone --depth 1 https://github.com/openwrt/libubox /tmp/libubox
+          # libubox hard-codes -Werror too (same GCC 15 story as ucode);
+          # install brings headers, libubox.so and sh/*.sh (jshn.sh) along
+          sed -i -e 's/-Werror=[a-z=-]*//g' -e 's/-Werror//g' /tmp/libubox/CMakeLists.txt
+          cmake -S /tmp/libubox -B /tmp/libubox/build -DCMAKE_INSTALL_PREFIX=/usr \
+            -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF
+          cmake --build /tmp/libubox/build -j"$(nproc)"
+          sudo cmake --install /tmp/libubox/build
+          sudo ldconfig
+          [ -f /usr/share/libubox/jshn.sh ] || { echo "jshn.sh not installed"; exit 1; }
+          git clone --depth 1 https://github.com/openwrt/jsonpath /tmp/jsonpath
+          # jsonpath also hard-codes -Werror (same GCC 15 story as ucode)
+          sed -i -e 's/-Werror=[a-z=-]*//g' -e 's/-Werror//g' /tmp/jsonpath/CMakeLists.txt
+          (cd /tmp/jsonpath && cmake -DCMAKE_BUILD_TYPE=Release . && make -j"$(nproc)")
+          # upstream builds the binary as `jsonpath`; OpenWrt's package
+          # Makefile is what renames it to jsonfilter on the router
+          JP_BIN=/tmp/jsonpath/jsonfilter
+          [ -f "$JP_BIN" ] || JP_BIN=/tmp/jsonpath/jsonpath
+          sudo install -m 0755 "$JP_BIN" /usr/bin/jsonfilter
+          echo '{"a":["b","c"]}' | jsonfilter -e '@.a[0]'
+
+      - name: Golden tests (parse/apply/diff/routing/balancers)
+        run: sh tests/run.sh
+
+      # Same suite, with every produced config additionally validated by a
+      # real xray-core binary (`xray -test`).
+      - name: Golden tests with xray -test validation
+        run: |
+          curl -fsSL --retry 3 -o /tmp/xray.zip \
+            https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          mkdir /tmp/xray && unzip -q /tmp/xray.zip -d /tmp/xray
+          XRAY=/tmp/xray/xray sh tests/run.sh
+
+      # Full pipeline scenario under BusyBox ash: fetch/apply/hot-swap/e2e/
+      # rpcd contracts against a sandboxed xray-sub copy - the same run the
+      # router gets in /tmp/t-*, here on a GNU coreutils userspace.
+      - name: Pipeline scenario under BusyBox ash
+        run: sh tests/pipeline-scenario.sh
+
   build:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,7 +169,7 @@ jobs:
             git push
           fi
 
-      - name: Publish GitHub Release (stable-named asset)
+      - name: Publish GitHub Release (stable-named asset + sha256 sidecar)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -46,10 +177,13 @@ jobs:
           tag="v${ver}"
           # stable asset name so /releases/latest/download/<name> is constant
           cp "docs/luci-app-xray-monitor_${ver}_all.ipk" luci-app-xray-monitor.ipk
+          # sidecar consumed by `xray-sub self-update` before handing the
+          # package to opkg (fallback: the SHA256sum in docs/Packages)
+          sha256sum luci-app-xray-monitor.ipk > luci-app-xray-monitor.ipk.sha256
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" luci-app-xray-monitor.ipk --clobber
+            gh release upload "$tag" luci-app-xray-monitor.ipk luci-app-xray-monitor.ipk.sha256 --clobber
             gh release edit "$tag" --latest
           else
-            gh release create "$tag" luci-app-xray-monitor.ipk \
+            gh release create "$tag" luci-app-xray-monitor.ipk luci-app-xray-monitor.ipk.sha256 \
               --title "$tag" --notes "Automated build of ${ver}. Install/upgrade: see README." --latest
           fi

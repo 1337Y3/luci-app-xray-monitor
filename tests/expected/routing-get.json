@@ -1,0 +1,1 @@
+{ "inbounds": [ { "tag": "tproxy-in", "port": 12345, "exit": "proxy-fi" } ], "exits": [ { "tag": "proxy-fi", "kind": "outbound" }, { "tag": "proxy-ch", "kind": "outbound" }, { "tag": "manual-vps", "kind": "outbound" }, { "tag": "direct", "kind": "outbound" }, { "tag": "block", "kind": "outbound" }, { "tag": "any-balancer", "kind": "balancer" } ] }

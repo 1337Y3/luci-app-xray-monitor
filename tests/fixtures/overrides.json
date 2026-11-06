@@ -1,0 +1,12 @@
+{
+  "proxy-srv": {
+    "streamSettings": {
+      "sockopt": { "tcpFastOpen": true, "dialerProxy": "direct" }
+    }
+  },
+  "work-de-frankfurt": {
+    "streamSettings": {
+      "realitySettings": { "fingerprint": "firefox" }
+    }
+  }
+}
