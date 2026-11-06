@@ -94,22 +94,27 @@ jobs:
           /usr/local/bin/busybox | sed -n '1p'
 
       # The pipeline scenario (and xray-sub itself) lean on the OpenWrt
-      # userspace: BusyBox ash as `sh`, jshn from libubox, and jsonfilter
-      # compiled from openwrt/jsonpath (its CMake only works in-source, so
-      # `cmake .` runs inside the checkout). /usr/local/bin precedes
-      # /usr/bin in the runner PATH, so every `sh ...` below - including
-      # the two test steps - resolves to busybox ash.
+      # userspace: BusyBox ash as `sh`, libubox (jshn.sh + headers + the
+      # library jsonpath links against), and jsonfilter compiled from
+      # openwrt/jsonpath (its CMake only works in-source, so `cmake .` runs
+      # inside the checkout). /usr/local/bin precedes /usr/bin in the runner
+      # PATH, so every `sh ...` below - including the two test steps -
+      # resolves to busybox ash.
       - name: BusyBox ash, jshn and jsonfilter
         run: |
           sudo ln -sf /usr/local/bin/busybox /usr/local/bin/sh
           echo "sh under test: $(sh -c 'echo ash ok')"
           busybox --list | grep -qx flock || { echo "busybox lacks flock"; exit 1; }
           git clone --depth 1 https://github.com/openwrt/libubox /tmp/libubox
-          # libubox master moved jshn.sh from the repo root into sh/ - take
-          # it from wherever this clone keeps it.
-          JSHN_SH="$(find /tmp/libubox -maxdepth 2 -name jshn.sh | head -n1)"
-          [ -n "$JSHN_SH" ] || { echo "jshn.sh not found in libubox"; exit 1; }
-          sudo install -D -m 0644 "$JSHN_SH" /usr/share/libubox/jshn.sh
+          # libubox hard-codes -Werror too (same GCC 15 story as ucode);
+          # install brings headers, libubox.so and sh/*.sh (jshn.sh) along
+          sed -i -e 's/-Werror=[a-z=-]*//g' -e 's/-Werror//g' /tmp/libubox/CMakeLists.txt
+          cmake -S /tmp/libubox -B /tmp/libubox/build -DCMAKE_INSTALL_PREFIX=/usr \
+            -DBUILD_LUA=OFF -DBUILD_EXAMPLES=OFF
+          cmake --build /tmp/libubox/build -j"$(nproc)"
+          sudo cmake --install /tmp/libubox/build
+          sudo ldconfig
+          [ -f /usr/share/libubox/jshn.sh ] || { echo "jshn.sh not installed"; exit 1; }
           git clone --depth 1 https://github.com/openwrt/jsonpath /tmp/jsonpath
           # jsonpath also hard-codes -Werror (same GCC 15 story as ucode)
           sed -i -e 's/-Werror=[a-z=-]*//g' -e 's/-Werror//g' /tmp/jsonpath/CMakeLists.txt
