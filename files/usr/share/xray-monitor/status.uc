@@ -1,12 +1,15 @@
 #!/usr/bin/ucode
 // Compose the sub_get response: subscriptions + global settings (from UCI) +
 // fetch state + the INSTALLED proxy outbounds (from the live config) + pending diff.
-//   status.uc <last_fetch> <status> <pending> <config.json> <diff.json>
+//   status.uc <last_fetch> <status> <pending> <config.json> <diff.json> [state_dir] [xray_hysteria_ok]
+// xray_hysteria_ok: '1'/'0' from the caller's `xray version` check ('' = core
+// version unverifiable) - surfaced as hysteria_xray_ok so the UI can warn when
+// hysteria exits exist on a core older than the protocol (Xray >= 26.1.23).
 'use strict';
 import { readfile } from 'fs';
 import { cursor } from 'uci';
 
-let lf = ARGV[0], st = ARGV[1], pending = ARGV[2], cfg_path = ARGV[3], diff_path = ARGV[4], state_dir = ARGV[5];
+let lf = ARGV[0], st = ARGV[1], pending = ARGV[2], cfg_path = ARGV[3], diff_path = ARGV[4], state_dir = ARGV[5], hy_arg = ARGV[6] ?? '';
 
 function load(p, dflt) { let s = p ? readfile(p) : null; return s ? json(s) : dflt; }
 function mask(u) { if (!u || !length(u)) return ''; let p = split(u, '/'); return (length(p) >= 3) ? (p[0] + '//' + p[2] + '/****') : '****'; }
@@ -43,18 +46,36 @@ let last_apply = state_dir ? load(state_dir + '/last-apply.json', null) : null;
 function readtok(p) { let s = p ? readfile(p) : null; return s ? trim(s) : ''; }
 let fetch_path = state_dir ? readtok(state_dir + '/fetch_path') : '';
 let update_path = state_dir ? readtok(state_dir + '/update_path') : '';
-let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
+let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria' ];
 let servers = [], obs = cfg.outbounds ?? [];
+let hysteria_present = false;
 for (let i = 0; i < length(obs); i++) {
 	let o = obs[i];
 	if (!(o.protocol in proxy_protos)) continue;
+	if (o.protocol == 'hysteria') hysteria_present = true;
 	// vless/vmess keep the endpoint in settings.vnext[0]; trojan/shadowsocks
-	// (and anything else without vnext) in settings.servers[0].
+	// (and anything else without vnext) in settings.servers[0]; hysteria
+	// carries a flat settings.address/port (no vnext/servers arrays).
 	let s = o.settings ?? {};
 	let v = (s.vnext && s.vnext[0]) ? s.vnext[0] :
-	        (s.servers && s.servers[0]) ? s.servers[0] : {};
-	let ss = o.streamSettings ?? {}, rs = ss.realitySettings ?? {}, xs = ss.xhttpSettings ?? {};
-	push(servers, { tag: o.tag, address: v.address, port: v.port, network: ss.network, mode: xs.mode, sni: rs.serverName });
+	        (s.servers && s.servers[0]) ? s.servers[0] :
+	        (o.protocol == 'hysteria') ? { address: s.address, port: s.port } : {};
+	let ss = o.streamSettings ?? {}, rs = ss.realitySettings ?? {}, xs = ss.xhttpSettings ?? {}, ts = ss.tlsSettings ?? {};
+	// reality carries the SNI in realitySettings; tls-only outbounds (hysteria,
+	// plain trojan/ws) in tlsSettings
+	push(servers, { tag: o.tag, protocol: o.protocol, address: v.address, port: v.port, network: ss.network, mode: xs.mode, sni: rs.serverName ?? ts.serverName });
+}
+// staged counts too: on the FIRST fetch of a hysteria subscription the exits
+// live only in staged.json - the unsupported-core warning must fire before
+// Apply trips over xray -test, not after
+if (!hysteria_present && state_dir) {
+	let sd = load(state_dir + '/staged.json', null);
+	let groups = (type(sd) == 'object' && type(sd.groups) == 'array') ? sd.groups : [];
+	for (let g = 0; g < length(groups) && !hysteria_present; g++) {
+		let go = (type(groups[g]) == 'object' && type(groups[g].outbounds) == 'array') ? groups[g].outbounds : [];
+		for (let i = 0; i < length(go); i++)
+			if (type(go[i]) == 'object' && go[i].protocol == 'hysteria') { hysteria_present = true; break; }
+	}
 }
 
 printf('%J\n', {
@@ -71,5 +92,9 @@ printf('%J\n', {
 	pending: (pending == '1') ? true : false,
 	diff: diff,
 	last_apply: last_apply,
+	// hysteria support surface: present=true with xray_ok=false means applying
+	// will fail `xray -test` on this core (null = version unknown)
+	hysteria_present: hysteria_present,
+	hysteria_xray_ok: (hy_arg == '1') ? true : ((hy_arg == '0') ? false : null),
 	servers: servers
 });

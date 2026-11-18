@@ -14,7 +14,7 @@
 # trap for $WORK is installed here. VER lives here, once.
 
 PKG="luci-app-xray-monitor"
-VER="1.23-1"
+VER="1.24-1"
 ARCH="all"
 
 stage_package() {

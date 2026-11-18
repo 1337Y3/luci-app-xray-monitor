@@ -21,7 +21,8 @@
 //   e2e.uc skipped              the probe_disabled record (never dialled)
 //   e2e.uc tags <config.json>   probeable exit tags, one per line, config
 //                               order: outbounds whose settings carry a
-//                               server endpoint (vnext[0]/servers[0].address),
+//                               server endpoint (vnext[0]/servers[0].address,
+//                               or flat settings.address for hysteria),
 //                               the same rule the rpcd probe list uses
 //   e2e.uc merge <e2e.json> <run_ts> <tag> <record>
 //                               read e2e.json (fresh when absent/unparsable),
@@ -70,7 +71,10 @@ function print_tags(cfg_path) {
 		let o = obs[i];
 		let s = (type(o.settings) == 'object') ? o.settings : {};
 		let has = (type(s.vnext) == 'array' && type(s.vnext[0]) == 'object' && s.vnext[0].address)
-		       || (type(s.servers) == 'array' && type(s.servers[0]) == 'object' && s.servers[0].address);
+		       || (type(s.servers) == 'array' && type(s.servers[0]) == 'object' && s.servers[0].address)
+		       // hysteria keeps the endpoint flat in settings - gated by protocol
+		       // so a dns outbound's settings.address never reads as an exit
+		       || (o.protocol == 'hysteria' && s.address);
 		if (o.tag && has)
 			print(o.tag + '\n');
 	}

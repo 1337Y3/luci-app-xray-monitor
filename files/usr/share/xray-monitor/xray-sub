@@ -24,6 +24,23 @@ config_file() {
 	[ -f "$f" ] && { echo "$f"; return; }
 	echo "/etc/xray/config.json"
 }
+
+# Oldest Xray that speaks the hysteria protocol (Hysteria 2): 26.1.23 added
+# the outbound; older cores (incl. every 1.8.x) reject such a config at
+# `xray -test`. The status surface reports it so the UI can warn while
+# hysteria exits are staged/installed on an unsupported core.
+XRAY_HY_MIN="26.1.23"
+ver_ge() {  # <have> <need>: rc 0 when have >= need (numeric dot segments)
+	local have="${1#v}" need="${2#v}" i h n
+	for i in 1 2 3 4 5; do
+		h=$(printf '%s.' "$have" | cut -d. -f$i); n=$(printf '%s.' "$need" | cut -d. -f$i)
+		h=${h:-0}; n=${n:-0}
+		case "$h$n" in *[!0-9]*) return 1 ;; esac   # junk -> unverifiable
+		[ "$h" -gt "$n" ] && return 0
+		[ "$h" -lt "$n" ] && return 1
+	done
+	return 0
+}
 CFG=$(config_file)
 mkdir -p "$STATE"
 
@@ -1181,7 +1198,9 @@ do_e2e() {  # [tag ...]
 #    outbounds surface - `ubus call xray-monitor outbounds` probes every
 #    endpoint (bare TCP, ~3 s, honors probe_disabled) and answers them in
 #    CONFIG order; the FIRST outbound with up=1 wins (up=0 down, -1 no probe
-#    tool and -2 probe-disabled never match).
+#    tool/no verdict and -2 probe-disabled never match). Hysteria exits are
+#    never TCP-dialled (QUIC/UDP - there is no TCP ear to reach); their up
+#    mirrors the freshest E2E verdict: ok=1, stalled/fail=0, none/stale=-1.
 # 4. neither source names an exit -> rc 1: a fetch/update configured to go via
 #    xray then fails with today's honest failure statuses. In proxy mode there
 #    is NEVER a silent direct retry - the whole point is that direct is blocked
@@ -1388,7 +1407,11 @@ case "$1" in
 
 	status)
 		lf=$(cat "$STATE/last_fetch" 2>/dev/null); st=$(cat "$STATE/status" 2>/dev/null); pending=$(cat "$STATE/pending" 2>/dev/null)
-		"$SHARE/status.uc" "${lf:-0}" "${st:-never}" "${pending:-0}" "$CFG" "$STATE/diff.json" "$STATE"
+		# hysteria vs the installed core: '' = unverifiable, 1 = ok, 0 = too old
+		hy_ok=""
+		xver=$("$XRAY" version 2>/dev/null | sed -n '1s/^Xray v\{0,1\}\([0-9][0-9.]*\).*/\1/p')
+		[ -n "$xver" ] && { ver_ge "$xver" "$XRAY_HY_MIN" && hy_ok=1 || hy_ok=0; }
+		"$SHARE/status.uc" "${lf:-0}" "${st:-never}" "${pending:-0}" "$CFG" "$STATE/diff.json" "$STATE" "$hy_ok"
 		;;
 
 	sub-add)

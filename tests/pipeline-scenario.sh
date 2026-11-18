@@ -1382,6 +1382,24 @@ EOF
 	out=$(rpccall config_get)
 	ok_eq "rpcd config_get(no config file): hash empty" "" "$(jget "$out" '@.hash')"
 	ok_eq "rpcd config_get(no config file): text empty, not an error" "" "$(jget "$out" '@.config')"
+
+	echo "== rpcd out_meta: probeable-exit discovery (hysteria flat endpoint, dns excluded)"
+	# the same endpoint rule feeds get_outbounds (the probing surface): hysteria
+	# must be discovered through its flat settings.address, and a dns
+	# outbound's own settings.address must NOT read as an exit
+	cat > "$CFG" <<'EOF'
+{ "outbounds": [
+  { "tag": "proxy-fi", "protocol": "vless", "settings": { "vnext": [ { "address": "fi1.example.org", "port": 443 } ] } },
+  { "tag": "proxy-h2", "protocol": "hysteria", "settings": { "address": "h2.example.org", "port": 443, "version": 2 } },
+  { "tag": "dns-out", "protocol": "dns", "settings": { "address": "localhost" } },
+  { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIP" } }
+] }
+EOF
+	out=$(rpccall out_meta)
+	ok_eq "out_meta: vless exit listed first (config order)" "proxy-fi" "$(jget "$out" '@.outbounds[0].tag')"
+	ok_eq "out_meta: hysteria flat-settings exit listed" "proxy-h2" "$(jget "$out" '@.outbounds[1].tag')"
+	is "out_meta: dns outbound not an exit" "$(printf '%s' "$out" | grep -q dns-out && echo 1 || echo 0)" 0
+	is "out_meta: freedom not an exit" "$(printf '%s' "$out" | grep -q direct && echo 1 || echo 0)" 0
 	reset_cfg
 fi
 echo "== fetch/self-update via xray (F18): exit selection order + honest proxy failures"

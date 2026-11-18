@@ -1,0 +1,133 @@
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "tproxy-in",
+      "protocol": "dokodemo-door",
+      "listen": "0.0.0.0",
+      "port": 12345,
+      "settings": {
+        "network": "tcp,udp",
+        "followRedirect": true
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": [
+          "http",
+          "tls"
+        ]
+      },
+      "streamSettings": {
+        "sockopt": {
+          "tproxy": "tproxy"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    // === subscription: proxy ===,
+    {
+      "protocol": "hysteria",
+      "tag": "proxy-h2",
+      "streamSettings": {
+        "tlsSettings": {
+          "alpn": [
+            "h3"
+          ],
+          "fingerprint": "chrome",
+          "enableSessionResumption": false,
+          "serverName": "h2.example.org"
+        },
+        "security": "tls",
+        "hysteriaSettings": {
+          "auth": "d342d11e-d424-4583-b36e-524ab1f0afa4",
+          "version": 2
+        },
+        "network": "hysteria"
+      },
+      "settings": {
+        "version": 2,
+        "port": 443,
+        "address": "h2.example.org"
+      }
+    },
+    // === local ===,
+    {
+      "tag": "manual-vps",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "5.6.7.8",
+            "port": 2053,
+            "users": [
+              {
+                "id": "f56cf220-d424-4583-b36e-524ab1f0afa4",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "manual.example.org",
+          "fingerprint": "chrome",
+          "publicKey": "pbVjhWqqvXcvKZW2jH3mBa9BHuK5iOLXeiCBBB9XKA0",
+          "shortId": "",
+          "spiderX": "/"
+        }
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "UseIP"
+      }
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": {
+        "response": {
+          "type": "http"
+        }
+      }
+    }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {
+        "type": "field",
+        "inboundTag": [
+          "tproxy-in"
+        ],
+        "outboundTag": "proxy-fi"
+      }
+    ],
+    "balancers": [
+      {
+        "tag": "any-balancer",
+        "selector": [
+          "proxy-"
+        ],
+        "strategy": {
+          "type": "random"
+        }
+      }
+    ]
+  },
+  "observatory": {
+    "subjectSelector": [
+      "proxy-"
+    ],
+    "probeUrl": "https://www.gstatic.com/generate_204",
+    "probeInterval": "1m"
+  }
+}

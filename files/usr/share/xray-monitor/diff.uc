@@ -29,7 +29,9 @@ for (let i = 2; i < length(ARGV); i++) {
 	else push(prefixes, ARGV[i]);
 }
 if (!length(ignores)) push(ignores, 'streamSettings.realitySettings.spiderX');
-let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
+// installed-side filter: an unlisted protocol (e.g. hysteria) reads as
+// "added" on EVERY fetch - pending=1 forever, never converging.
+let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria' ];
 
 function is_managed(tag) {
 	if (!tag) return false;

@@ -177,6 +177,31 @@
         }
       }
     },
+    {
+      "tag": "proxy-h2us",
+      "protocol": "hysteria",
+      "settings": {
+        "address": "us2.example.org",
+        "port": 443,
+        "version": 2
+      },
+      "streamSettings": {
+        "network": "hysteria",
+        "hysteriaSettings": {
+          "version": 2,
+          "auth": "d342d11e-d424-4583-b36e-524ab1f0afa4"
+        },
+        "security": "tls",
+        "tlsSettings": {
+          "serverName": "us2.example.org",
+          "enableSessionResumption": false,
+          "fingerprint": "chrome",
+          "alpn": [
+            "h3"
+          ]
+        }
+      }
+    },
     // === subscription: work ===,
     {
       "tag": "work-de-frankfurt",

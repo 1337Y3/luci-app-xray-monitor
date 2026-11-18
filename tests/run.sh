@@ -131,6 +131,51 @@ else
 	echo "FAIL   apply: duplicate staged tag rejected, tag named"; fails=$((fails + 1))
 fi
 
+echo "== hysteria protocol (managed at every gate: flat settings endpoint)"
+# An INSTALLED hysteria exit with a managed tag must be recognized everywhere:
+# diff must not count it as "added" on each fetch (the eternal-pending wedge),
+# apply must re-stage it without the duplicate-tag error, hotswap must treat a
+# body change as membership (live rmo/ado), snapshot must capture it.
+"$SHARE/diff.uc" "$FIX/staged-hy2.json" "$FIX/config-hy2.json" proxy > "$W/diff-hy2.json"
+check "diff: installed hysteria not phantom-added" "$EXP/diff-hy2.json" "$W/diff-hy2.json"
+if "$SHARE/apply.uc" "$FIX/config-hy2.json" "$FIX/staged-hy2.json" "$W/apply-hy2.json" proxy >/dev/null 2>&1; then
+	echo "PASS   apply: installed hysteria re-staged, no duplicate tag"
+else
+	echo "FAIL   apply: installed hysteria re-staged, no duplicate tag"; fails=$((fails + 1))
+fi
+check "apply: hysteria in the subscription block" "$EXP/apply-hy2.json" "$W/apply-hy2.json"
+xraytest "apply hysteria output" "$W/apply-hy2.json"
+"$SHARE/snapshot.uc" "$FIX/config-hy2.json" proxy > "$W/snapshot-hy2.json"
+check "snapshot: hysteria exit captured" "$EXP/snapshot-hy2.json" "$W/snapshot-hy2.json"
+"$SHARE/hotswap.uc" plan "$FIX/config-hy2.json" "$FIX/hs-cand-hy2.json" proxy > "$W/hs-hy2.json"
+check "hotswap: hysteria body change -> live remove+add" "$EXP/hs-plan-hy2.json" "$W/hs-hy2.json"
+
+# status.uc imports uci, so CI (plain ucode build, no ucode-mod-uci) skips it;
+# anywhere the module exists (e.g. the router) UCI_CONFIG_DIR pins the fixture
+# and the whole sub_get serialization becomes deterministic.
+echo "== status.uc serialization (sub_get surface; UCI fixture via UCI_CONFIG_DIR)"
+if "$UC" -e 'import * as u from "uci";' >/dev/null 2>&1; then
+	UCI_CONFIG_DIR="$FIX/uci" "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config-status.json" "$FIX/staged-clean.json" "" 1 > "$W/status.json" \
+		|| { echo "FAIL   status.uc exited non-zero"; fails=$((fails + 1)); }
+	check "status: servers rows (hysteria endpoint, tls SNI fallback, dns excluded) + hysteria_xray_ok=true" "$EXP/status.json" "$W/status.json"
+	if UCI_CONFIG_DIR="$FIX/uci" "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config-status.json" "$FIX/staged-clean.json" "" 0 2>/dev/null \
+		| grep -q '"hysteria_xray_ok": false'; then
+		echo "PASS   status: old xray flagged (hysteria_xray_ok=false)"
+	else
+		echo "FAIL   status: old xray flagged (hysteria_xray_ok=false)"; fails=$((fails + 1))
+	fi
+	# staged-only hysteria: cfg without hysteria + staged.json with one - the
+	# warning surface must fire before the first Apply, not after
+	if UCI_CONFIG_DIR="$FIX/uci" "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config.json" "$FIX/staged-clean.json" "$FIX/state-hy" 0 2>/dev/null \
+		| grep -q '"hysteria_present": true'; then
+		echo "PASS   status: staged-only hysteria detected (first fetch on an old core)"
+	else
+		echo "FAIL   status: staged-only hysteria detected (first fetch on an old core)"; fails=$((fails + 1))
+	fi
+else
+	echo "SKIP   status.uc serialization (ucode-mod-uci not installed)"
+fi
+
 echo "== routing / balancers (task 7: comments survive rewrites)"
 "$SHARE/routing.uc" get "$FIX/config.json" > "$W/routing-get.json"
 check "routing get" "$EXP/routing-get.json" "$W/routing-get.json"
@@ -261,6 +306,8 @@ echo "== e2e tag discovery (probeable exits only)"
 check "e2e tags: vnext/servers exits listed, direct/block excluded" "$EXP/e2e-tags.json" "$W/e2e-tags.json"
 "$E" tags "$FIX/e2e-config.json" > "$W/e2e-tags2.json"
 check "e2e tags: e2e fixture exits, freedom excluded" "$EXP/e2e-tags2.json" "$W/e2e-tags2.json"
+"$E" tags "$FIX/config-hy2.json" > "$W/e2e-tags-hy2.json"
+check "e2e tags: hysteria flat-settings exit listed" "$EXP/e2e-tags-hy2.json" "$W/e2e-tags-hy2.json"
 
 echo "== e2e.json merge / status / summary (contract B3)"
 # merge is the file writer: it prints the whole file, the caller moves it into
