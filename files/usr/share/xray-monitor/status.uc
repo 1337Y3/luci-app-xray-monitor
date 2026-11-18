@@ -65,6 +65,18 @@ for (let i = 0; i < length(obs); i++) {
 	// plain trojan/ws) in tlsSettings
 	push(servers, { tag: o.tag, protocol: o.protocol, address: v.address, port: v.port, network: ss.network, mode: xs.mode, sni: rs.serverName ?? ts.serverName });
 }
+// staged counts too: on the FIRST fetch of a hysteria subscription the exits
+// live only in staged.json - the unsupported-core warning must fire before
+// Apply trips over xray -test, not after
+if (!hysteria_present && state_dir) {
+	let sd = load(state_dir + '/staged.json', null);
+	let groups = (type(sd) == 'object' && type(sd.groups) == 'array') ? sd.groups : [];
+	for (let g = 0; g < length(groups) && !hysteria_present; g++) {
+		let go = (type(groups[g]) == 'object' && type(groups[g].outbounds) == 'array') ? groups[g].outbounds : [];
+		for (let i = 0; i < length(go); i++)
+			if (type(go[i]) == 'object' && go[i].protocol == 'hysteria') { hysteria_present = true; break; }
+	}
+}
 
 printf('%J\n', {
 	subscriptions: subs,

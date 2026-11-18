@@ -256,10 +256,20 @@ get_outbounds() {
 	if [ -s "$E2E_STATE/e2e.json" ] && command -v ucode >/dev/null 2>&1; then
 		e2e_tab=$(ucode -e 'import { readfile } from "fs";
 			let d = json(readfile(ARGV[0]));
-			if (type(d) == "object" && type(d.results) == "object" && (time() - int(d.ts ?? 0)) <= 3600)
+			let now = time();
+			// fresh = run ts AND the record ts both within [now-3600, now+300]:
+			// a future stamp is clock skew (pickexit rejects >300 s the same
+			// way), and a stale per-tag record under a fresh run ts - a tag
+			// that was not re-checked in the latest run - must not resurrect
+			function fresh(ts) {
+				let age = now - int(ts ?? 0);
+				return (age >= -300 && age <= 3600);
+			}
+			if (type(d) == "object" && type(d.results) == "object" && fresh(d.ts))
 				for (let t in d.results) {
 					let r = d.results[t];
-					if (type(r) == "object") print(t + "\t" + (r.status ?? "") + "\t" + int(r.ttfb_ms ?? 0) + "\n");
+					if (type(r) == "object" && fresh(r.ts))
+						print(t + "\t" + (r.status ?? "") + "\t" + int(r.ttfb_ms ?? 0) + "\n");
 				}' "$E2E_STATE/e2e.json" 2>/dev/null)
 	fi
 	i=0

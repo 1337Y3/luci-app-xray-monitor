@@ -164,6 +164,14 @@ if "$UC" -e 'import * as u from "uci";' >/dev/null 2>&1; then
 	else
 		echo "FAIL   status: old xray flagged (hysteria_xray_ok=false)"; fails=$((fails + 1))
 	fi
+	# staged-only hysteria: cfg without hysteria + staged.json with one - the
+	# warning surface must fire before the first Apply, not after
+	if UCI_CONFIG_DIR="$FIX/uci" "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config.json" "$FIX/staged-clean.json" "$FIX/state-hy" 0 2>/dev/null \
+		| grep -q '"hysteria_present": true'; then
+		echo "PASS   status: staged-only hysteria detected (first fetch on an old core)"
+	else
+		echo "FAIL   status: staged-only hysteria detected (first fetch on an old core)"; fails=$((fails + 1))
+	fi
 else
 	echo "SKIP   status.uc serialization (ucode-mod-uci not installed)"
 fi

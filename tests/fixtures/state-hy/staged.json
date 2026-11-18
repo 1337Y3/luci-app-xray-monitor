@@ -1,0 +1,1 @@
+{"groups":[{"label":"proxy","outbounds":[{ "tag": "proxy-h2", "protocol": "hysteria", "settings": { "address": "h2.example.org", "port": 443, "version": 2 }, "streamSettings": { "network": "hysteria", "security": "tls", "tlsSettings": { "serverName": "h2.example.org", "alpn": [ "h3" ] } } }]}]}
