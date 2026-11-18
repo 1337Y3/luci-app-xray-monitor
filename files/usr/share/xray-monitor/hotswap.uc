@@ -12,9 +12,9 @@
 // 1. app/proxyman/command/command.go (HandlerService):
 //    - AddOutbound  -> core.AddOutboundHandler (core/xray.go): builds the
 //      handler through the same object registry as a config-file load, then
-//      outbound.Manager.AddHandler. Every outbound protocol - incl. all four
-//      managed ones (vless/vmess/trojan/shadowsocks) - is an ordinary outbound
-//      handler, so ALL are live-addable.
+//      outbound.Manager.AddHandler. Every outbound protocol - incl. all five
+//      managed ones (vless/vmess/trojan/shadowsocks/hysteria) - is an ordinary
+//      outbound handler, so ALL are live-addable.
 //    - RemoveOutbound -> outbound.Manager.RemoveHandler.
 //    - ListOutbounds returns every user outbound's tag; the commander's
 //      internal gRPC outbound is skipped, and the order is random (Go map
@@ -134,7 +134,10 @@ import { readfile } from 'fs';
 import { owner_prefix } from 'render';
 import { canonsig, deep_copy } from 'jsondiff';
 
-let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
+// 'hysteria' included: an unmanaged-by-list hysteria outbound lands in the
+// x-local-outbounds bucket below and every membership change reads as "beyond"
+// - forcing restarts (see B) for what rmo/ado reconciles fine.
+let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria' ];
 
 function prune(o, path) {  // same semantics as diff.uc
 	let segs = split(path, '.');

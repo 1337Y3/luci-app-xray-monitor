@@ -131,6 +131,25 @@ else
 	echo "FAIL   apply: duplicate staged tag rejected, tag named"; fails=$((fails + 1))
 fi
 
+echo "== hysteria protocol (managed at every gate: flat settings endpoint)"
+# An INSTALLED hysteria exit with a managed tag must be recognized everywhere:
+# diff must not count it as "added" on each fetch (the eternal-pending wedge),
+# apply must re-stage it without the duplicate-tag error, hotswap must treat a
+# body change as membership (live rmo/ado), snapshot must capture it.
+"$SHARE/diff.uc" "$FIX/staged-hy2.json" "$FIX/config-hy2.json" proxy > "$W/diff-hy2.json"
+check "diff: installed hysteria not phantom-added" "$EXP/diff-hy2.json" "$W/diff-hy2.json"
+if "$SHARE/apply.uc" "$FIX/config-hy2.json" "$FIX/staged-hy2.json" "$W/apply-hy2.json" proxy >/dev/null 2>&1; then
+	echo "PASS   apply: installed hysteria re-staged, no duplicate tag"
+else
+	echo "FAIL   apply: installed hysteria re-staged, no duplicate tag"; fails=$((fails + 1))
+fi
+check "apply: hysteria in the subscription block" "$EXP/apply-hy2.json" "$W/apply-hy2.json"
+xraytest "apply hysteria output" "$W/apply-hy2.json"
+"$SHARE/snapshot.uc" "$FIX/config-hy2.json" proxy > "$W/snapshot-hy2.json"
+check "snapshot: hysteria exit captured" "$EXP/snapshot-hy2.json" "$W/snapshot-hy2.json"
+"$SHARE/hotswap.uc" plan "$FIX/config-hy2.json" "$FIX/hs-cand-hy2.json" proxy > "$W/hs-hy2.json"
+check "hotswap: hysteria body change -> live remove+add" "$EXP/hs-plan-hy2.json" "$W/hs-hy2.json"
+
 echo "== routing / balancers (task 7: comments survive rewrites)"
 "$SHARE/routing.uc" get "$FIX/config.json" > "$W/routing-get.json"
 check "routing get" "$EXP/routing-get.json" "$W/routing-get.json"
@@ -261,6 +280,8 @@ echo "== e2e tag discovery (probeable exits only)"
 check "e2e tags: vnext/servers exits listed, direct/block excluded" "$EXP/e2e-tags.json" "$W/e2e-tags.json"
 "$E" tags "$FIX/e2e-config.json" > "$W/e2e-tags2.json"
 check "e2e tags: e2e fixture exits, freedom excluded" "$EXP/e2e-tags2.json" "$W/e2e-tags2.json"
+"$E" tags "$FIX/config-hy2.json" > "$W/e2e-tags-hy2.json"
+check "e2e tags: hysteria flat-settings exit listed" "$EXP/e2e-tags-hy2.json" "$W/e2e-tags-hy2.json"
 
 echo "== e2e.json merge / status / summary (contract B3)"
 # merge is the file writer: it prints the whole file, the caller moves it into

@@ -9,7 +9,9 @@
 'use strict';
 import { writefile } from 'fs';
 
-let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
+// 'hysteria' included so split_outbounds keeps installed hysteria exits in
+// their subscription group when routing/balancers re-emit the config.
+let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria' ];
 
 function indent(s, pad) {
 	let lines = split(s, "\n"), out = [];

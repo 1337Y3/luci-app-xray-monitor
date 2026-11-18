@@ -20,7 +20,9 @@ let pfx = ARGV[1] ?? '';
 let prefixes = [ pfx ];
 for (let i = 2; i < length(ARGV); i++) push(prefixes, ARGV[i]);
 
-let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
+// 'hysteria' included: a dropped protocol here would silently LOSE the
+// installed hysteria exits of a failed-fetch subscription in its snapshot.
+let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria' ];
 let out = [], obs = cfg.outbounds ?? [];
 for (let i = 0; i < length(obs); i++)
 	if (obs[i].tag && obs[i].protocol in proxy_protos && owner_prefix(obs[i].tag, prefixes) == pfx)

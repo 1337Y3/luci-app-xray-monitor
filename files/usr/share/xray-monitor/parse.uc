@@ -50,7 +50,9 @@ function deepmerge(base, ovr) {
 	return base;
 }
 
-let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
+// 'hysteria' covers Hysteria/Hysteria2 (settings carry version: 2) - Xray-core
+// speaks the protocol natively; Remnawave labels both generations "hysteria".
+let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria' ];
 let out = [], changed = false;
 // every base known to tagmap or freshly assigned here (collision domain), and
 // every full tag emitted in this run (final uniqueness guarantee)

@@ -62,6 +62,8 @@ fetch → `parse.uc` (subscription JSON → outbounds with stable `<prefix>-<bas
 
 **Ownership rule**: outbounds tagged `<prefix>` or `<prefix>-*` for any configured subscription prefix are managed (replaced/pruned by fetch/apply); longest prefix wins on overlap (`proxy` vs `proxy-work`); everything else is local and untouched. Never tag a manual outbound with a subscription prefix.
 
+**Protocol allowlist rule**: the managed-proxy protocol list (`vless/vmess/trojan/shadowsocks/hysteria`) is deliberately duplicated in parse.uc, apply.uc, diff.uc, hotswap.uc, snapshot.uc, status.uc and render.uc (plus the rpcd probe list and `e2e.uc tags`, which select by endpoint *shape* — `settings.vnext[0]`/`servers[0]`, or flat `settings.address` for hysteria). Extend ALL of them together: a protocol missing from diff.uc/apply.uc wedges the pipeline (an installed exit of it reads as a phantom "added" on every fetch, and apply rejects the re-staged tag as a duplicate). Hysteria (Hysteria 2) needs Xray-core ≥ 26.1.23 — the protocol name is `hysteria`, never `hysteria2`.
+
 Note the argv order difference: `diff.uc` takes `<staged> <config>` (staged first), while `hotswap.uc plan` takes `<installed> <candidate>` (old config first).
 
 ### State locations

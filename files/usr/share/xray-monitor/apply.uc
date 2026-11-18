@@ -24,7 +24,10 @@ function is_managed(tag) {
 	return owner_prefix(tag, prefixes) != null;
 }
 
-let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
+// 'hysteria' must be here: an INSTALLED hysteria exit tagged <prefix>-* kept as
+// a "local" while the staged group re-emits the same tag is the duplicate-tag
+// wedge (the protocol gate runs before the prefix-ownership check below).
+let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria' ];
 let kept = [];
 let old = cfg.outbounds ?? [];
 for (let i = 0; i < length(old); i++)

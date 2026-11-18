@@ -43,18 +43,22 @@ let last_apply = state_dir ? load(state_dir + '/last-apply.json', null) : null;
 function readtok(p) { let s = p ? readfile(p) : null; return s ? trim(s) : ''; }
 let fetch_path = state_dir ? readtok(state_dir + '/fetch_path') : '';
 let update_path = state_dir ? readtok(state_dir + '/update_path') : '';
-let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks' ];
+let proxy_protos = [ 'vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria' ];
 let servers = [], obs = cfg.outbounds ?? [];
 for (let i = 0; i < length(obs); i++) {
 	let o = obs[i];
 	if (!(o.protocol in proxy_protos)) continue;
 	// vless/vmess keep the endpoint in settings.vnext[0]; trojan/shadowsocks
-	// (and anything else without vnext) in settings.servers[0].
+	// (and anything else without vnext) in settings.servers[0]; hysteria
+	// carries a flat settings.address/port (no vnext/servers arrays).
 	let s = o.settings ?? {};
 	let v = (s.vnext && s.vnext[0]) ? s.vnext[0] :
-	        (s.servers && s.servers[0]) ? s.servers[0] : {};
-	let ss = o.streamSettings ?? {}, rs = ss.realitySettings ?? {}, xs = ss.xhttpSettings ?? {};
-	push(servers, { tag: o.tag, address: v.address, port: v.port, network: ss.network, mode: xs.mode, sni: rs.serverName });
+	        (s.servers && s.servers[0]) ? s.servers[0] :
+	        (o.protocol == 'hysteria') ? { address: s.address, port: s.port } : {};
+	let ss = o.streamSettings ?? {}, rs = ss.realitySettings ?? {}, xs = ss.xhttpSettings ?? {}, ts = ss.tlsSettings ?? {};
+	// reality carries the SNI in realitySettings; tls-only outbounds (hysteria,
+	// plain trojan/ws) in tlsSettings
+	push(servers, { tag: o.tag, address: v.address, port: v.port, network: ss.network, mode: xs.mode, sni: rs.serverName ?? ts.serverName });
 }
 
 printf('%J\n', {

@@ -255,6 +255,12 @@ get_outbounds() {
 		port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.vnext[0].port" 2>/dev/null)
 		[ -n "$addr" ] || addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].address" 2>/dev/null)
 		[ -n "$port" ] || port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].port" 2>/dev/null)
+		# hysteria keeps a flat settings.address/port (no vnext/servers arrays);
+		# gated by protocol so a dns outbound's settings.address never counts
+		if [ -z "$addr" ] && [ "$(jsonfilter -i "$cfg" -e "@.outbounds[$i].protocol" 2>/dev/null)" = hysteria ]; then
+			addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.address" 2>/dev/null)
+			port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.port" 2>/dev/null)
+		fi
 		case "$dlist" in *" $tag "*) dis=1 ;; *) dis=0 ;; esac
 		if [ -n "$addr" ] && [ -n "$port" ]; then
 			(
@@ -332,6 +338,12 @@ get_outmeta() {
 		port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.vnext[0].port" 2>/dev/null)
 		[ -n "$addr" ] || addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].address" 2>/dev/null)
 		[ -n "$port" ] || port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].port" 2>/dev/null)
+		# hysteria keeps a flat settings.address/port (no vnext/servers arrays);
+		# gated by protocol so a dns outbound's settings.address never counts
+		if [ -z "$addr" ] && [ "$(jsonfilter -i "$cfg" -e "@.outbounds[$i].protocol" 2>/dev/null)" = hysteria ]; then
+			addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.address" 2>/dev/null)
+			port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.port" 2>/dev/null)
+		fi
 		if [ -n "$addr" ] && [ -n "$port" ]; then
 			case "$dlist" in *" $tag "*) dis=1 ;; *) dis=0 ;; esac
 			json_add_object
