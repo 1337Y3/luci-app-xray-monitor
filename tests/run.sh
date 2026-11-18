@@ -150,6 +150,24 @@ check "snapshot: hysteria exit captured" "$EXP/snapshot-hy2.json" "$W/snapshot-h
 "$SHARE/hotswap.uc" plan "$FIX/config-hy2.json" "$FIX/hs-cand-hy2.json" proxy > "$W/hs-hy2.json"
 check "hotswap: hysteria body change -> live remove+add" "$EXP/hs-plan-hy2.json" "$W/hs-hy2.json"
 
+# status.uc imports uci, so CI (plain ucode build, no ucode-mod-uci) skips it;
+# anywhere the module exists (e.g. the router) UCI_CONFIG_DIR pins the fixture
+# and the whole sub_get serialization becomes deterministic.
+echo "== status.uc serialization (sub_get surface; UCI fixture via UCI_CONFIG_DIR)"
+if "$UC" -e 'import * as u from "uci";' >/dev/null 2>&1; then
+	UCI_CONFIG_DIR="$FIX/uci" "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config-status.json" "$FIX/staged-clean.json" "" 1 > "$W/status.json" \
+		|| { echo "FAIL   status.uc exited non-zero"; fails=$((fails + 1)); }
+	check "status: servers rows (hysteria endpoint, tls SNI fallback, dns excluded) + hysteria_xray_ok=true" "$EXP/status.json" "$W/status.json"
+	if UCI_CONFIG_DIR="$FIX/uci" "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config-status.json" "$FIX/staged-clean.json" "" 0 2>/dev/null \
+		| grep -q '"hysteria_xray_ok": false'; then
+		echo "PASS   status: old xray flagged (hysteria_xray_ok=false)"
+	else
+		echo "FAIL   status: old xray flagged (hysteria_xray_ok=false)"; fails=$((fails + 1))
+	fi
+else
+	echo "SKIP   status.uc serialization (ucode-mod-uci not installed)"
+fi
+
 echo "== routing / balancers (task 7: comments survive rewrites)"
 "$SHARE/routing.uc" get "$FIX/config.json" > "$W/routing-get.json"
 check "routing get" "$EXP/routing-get.json" "$W/routing-get.json"

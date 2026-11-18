@@ -279,6 +279,8 @@ function redraw() {
 	if (laBadge)
 		statusRows.push(row(_('Last apply'), E('span', {}, [ document.createTextNode(fmtAgo(state.last_apply.ts) + '  '), laBadge ])));
 	statusRows.push(row(_('Pending'), state.pending ? E('span', { 'style': 'color:#cc7a00;font-weight:bold;' }, _('changes staged — not yet applied')) : E('span', { 'style': 'color:#46a546;' }, _('config up to date'))));
+	if (state.hysteria_present && state.hysteria_xray_ok === false)
+		statusRows.push(row(_('Hysteria'), E('span', { 'style': 'color:#cc3300;font-weight:bold;' }, _('the installed Xray does not support the hysteria protocol (needs Xray ≥ 26.1.23) - applying the staged hysteria exits will fail xray -test'))));
 	statusRows.push(row(_('Fetch path'), pathBadge(state.fetch_path)));
 	statusRows.push(row(_('Self-update path'), pathBadge(state.update_path)));
 	statusRows.push(row(_('Auto-apply'), state.auto_apply ? E('span', { 'style': 'color:#cc7a00;' }, _('ON')) : E('span', { 'style': 'color:#888;' }, _('off'))));

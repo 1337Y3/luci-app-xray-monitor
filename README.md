@@ -11,7 +11,13 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 > wedged the pipeline: every fetch counted it as a phantom "added" node
 > (pending forever) and applying tripped a duplicate-tag error. Requires
 > **Xray-core ≥ 26.1.23** (which added the `hysteria` outbound); on older
-> cores `xray -test` rejects the config before anything is applied.
+> cores `xray -test` rejects the config before anything is applied, and the
+> Subscriptions tab shows a red **Hysteria** warning row while hysteria
+> exits exist on such a core. Hysteria exits are also never actively
+> probed over TCP — their connectivity status comes from the freshest E2E
+> verdict (or shows unknown), so the fetch-through-proxy fallback and the
+> Overview column judge them by real traffic, not by a TCP connect they
+> legitimately refuse.
 >
 > **1.22 — live hot-swap, balancer pins, E2E exit checks, config editor with
 > optimistic locking, fetch-through-proxy.** Subscription outbound changes now
@@ -58,7 +64,20 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 **Overview**
 - Service status: running/stopped, PID, uptime, version
 - Per-**outbound** (VPS exits) upload/download totals + live ↑/↓ rates +
-  a **connectivity status** column (reachable + latency / down / live)
+  a **connectivity status** column (reachable + latency / down / live).
+  TCP-based exits get a zero-payload TCP probe; **hysteria exits are never
+  TCP-dialled** (QUIC/UDP — there is no TCP ear to reach): their status
+  mirrors the freshest E2E verdict (`ok` → reachable with TTFB,
+  `stalled`/`fail` → down, no fresh verdict → unknown), so a healthy
+  hysteria server is never shown red just because port 443 refuses TCP.
+- A per-outbound **Ping check** toggle: turn off the active TCP probe for an
+  exit so it's never dialled. Use it for a "blown"/blocked server whose
+  handshake draws a connection reset from your ISP — flip it off to stop poking
+  that IP until your next config update. The status shows `○ ping off`; the
+  passive live-connection check still runs (it only reads conntrack). The
+  disabled set persists in UCI (`xray-monitor.sub.probe_disabled`). The toggles
+  render on first paint (a probe-free `out_meta` call), so you can flip one
+  before connectivity finishes loading.
 - A per-outbound **Ping check** toggle: turn off the active TCP probe for an
   exit so it's never dialled. Use it for a "blown"/blocked server whose
   handshake draws a connection reset from your ISP — flip it off to stop poking

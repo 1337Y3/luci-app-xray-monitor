@@ -243,21 +243,36 @@ probe_disabled_list() {
 }
 
 get_outbounds() {
-	local cfg n i tag addr port up ms active dis dlist tmp f
+	local cfg n i tag addr port up ms active dis dlist tmp f proto verdict e2e_tab
 	cfg=$(config_file)
 	dlist=$(probe_disabled_list)
 	n=$(jsonfilter -i "$cfg" -e '@.outbounds[*].tag' 2>/dev/null | wc -l)
 	tmp=$(mktemp -d) || { json_init; json_add_array "outbounds"; json_close_array; json_dump; return; }
+	# Hysteria runs over QUIC/UDP - nothing listens on TCP there, so a bare TCP
+	# probe would read a healthy hysteria exit as "down". Hysteria rows are
+	# never dialled: their status mirrors the freshest E2E verdict instead
+	# (passive file read; ok=up, stalled/fail=down, none/stale=unknown).
+	e2e_tab=""
+	if [ -s "$E2E_STATE/e2e.json" ] && command -v ucode >/dev/null 2>&1; then
+		e2e_tab=$(ucode -e 'import { readfile } from "fs";
+			let d = json(readfile(ARGV[0]));
+			if (type(d) == "object" && type(d.results) == "object" && (time() - int(d.ts ?? 0)) <= 3600)
+				for (let t in d.results) {
+					let r = d.results[t];
+					if (type(r) == "object") print(t + "\t" + (r.status ?? "") + "\t" + int(r.ttfb_ms ?? 0) + "\n");
+				}' "$E2E_STATE/e2e.json" 2>/dev/null)
+	fi
 	i=0
 	while [ "$i" -lt "$n" ]; do
 		tag=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].tag" 2>/dev/null)
+		proto=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].protocol" 2>/dev/null)
 		addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.vnext[0].address" 2>/dev/null)
 		port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.vnext[0].port" 2>/dev/null)
 		[ -n "$addr" ] || addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].address" 2>/dev/null)
 		[ -n "$port" ] || port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.servers[0].port" 2>/dev/null)
 		# hysteria keeps a flat settings.address/port (no vnext/servers arrays);
 		# gated by protocol so a dns outbound's settings.address never counts
-		if [ -z "$addr" ] && [ "$(jsonfilter -i "$cfg" -e "@.outbounds[$i].protocol" 2>/dev/null)" = hysteria ]; then
+		if [ -z "$addr" ] && [ "$proto" = hysteria ]; then
 			addr=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.address" 2>/dev/null)
 			port=$(jsonfilter -i "$cfg" -e "@.outbounds[$i].settings.port" 2>/dev/null)
 		fi
@@ -266,6 +281,15 @@ get_outbounds() {
 			(
 				if [ "$dis" = 1 ]; then
 					up=-2; ms=0   # -2 = probe disabled by user
+				elif [ "$proto" = hysteria ]; then
+					# QUIC/UDP exit - never TCP-dialled (see e2e_tab above)
+					verdict=$(printf '%s\n' "$e2e_tab" | awk -v t="$tag" '$1 == t { print $2 " " $3; exit }')
+					case "$verdict" in
+						"ok "*)      up=1;  ms=${verdict#ok } ;;
+						"stalled "*) up=0;  ms=${verdict#stalled } ;;
+						"fail "*)    up=0;  ms=${verdict#fail } ;;
+						*)           up=-1; ms=0 ;;   # no fresh verdict -> unknown
+					esac
 				else
 					set -- $(probe "$addr" "$port"); up="$1"; ms="$2"
 				fi

@@ -1,0 +1,19 @@
+{
+  "outbounds": [
+    { "tag": "proxy-fi", "protocol": "vless",
+      "settings": { "vnext": [ { "address": "fi1.example.org", "port": 443 } ] },
+      "streamSettings": { "network": "tcp", "security": "reality",
+        "realitySettings": { "serverName": "fi.example.org" } } },
+    { "tag": "proxy-tr", "protocol": "trojan",
+      "settings": { "servers": [ { "address": "tr1.example.org", "port": 443 } ] },
+      "streamSettings": { "network": "ws", "security": "tls",
+        "tlsSettings": { "serverName": "tr.example.org" } } },
+    { "tag": "proxy-h2", "protocol": "hysteria",
+      "settings": { "address": "h2.example.org", "port": 443, "version": 2 },
+      "streamSettings": { "network": "hysteria", "security": "tls",
+        "tlsSettings": { "serverName": "h2.example.org", "alpn": [ "h3" ] } } },
+    { "tag": "dns-out", "protocol": "dns", "settings": { "address": "localhost" } },
+    { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIP" } },
+    { "tag": "block", "protocol": "blackhole", "settings": {} }
+  ]
+}

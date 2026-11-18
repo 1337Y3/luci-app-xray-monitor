@@ -1,0 +1,10 @@
+config sub 'sub'
+	option auto_apply '1'
+	option cron '1'
+	option hot_swap '1'
+	option user_agent 'v2rayNG/1.8.0'
+
+config subscription
+	option prefix 'proxy'
+	option url 'https://panel.example.org/sub/token'
+	option enabled '1'
