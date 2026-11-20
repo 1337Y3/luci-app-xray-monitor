@@ -1298,6 +1298,78 @@ MTESTLOCK=/var/lock/xray-monitor-mieru
 MIERU_GH_API="https://api.github.com/repos/enfein/mieru/releases/latest"
 MIERU_GH_DL="https://github.com/enfein/mieru/releases/download"
 
+# --- install run marker: one owner, one lock ----------------------------------
+# The marker file is NEVER unlinked - it is empty when no install runs and
+# holds the worker pid while one does. Every transition (reserve by the
+# rpcd layer, claim by the worker, clear on worker exit) happens under an
+# exclusive flock OF THE MARKER FILE ITSELF (fd 5; the file persists, so
+# the lock's inode is stable). That closes the round-2 race where a fast
+# worker's EXIT trap unlinked the marker before the parent wrote $!,
+# leaving a stale pid that blocked every later install with
+# "already running". Dead pids (SIGKILL - no trap runs) are simply
+# reclaimed by the next reservation: the validation below only accepts a
+# LIVE pid whose cmdline names mieru-install.
+# BusyBox flock has no -w: every wait is a bounded poll of non-blocking
+# tries (the same shape take_lock uses).
+mieru_marker_live() {  # <pid>: rc 0 = a live install worker
+	[ "$1" -ge 1 ] 2>/dev/null || return 1
+	kill -0 "$1" 2>/dev/null || return 1
+	tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "mieru-install"
+}
+
+# Bounded exclusive lock on the marker via fd 5 (caller must not hold it).
+# rc 0 = locked (fd 5 left OPEN for the caller), 1 = not obtained. The open
+# is PROBED in a subshell first: a failed `exec <redir>` terminates a
+# non-interactive ash outright, and the lock must degrade, not kill.
+mieru_marker_lock() {  # <tries>
+	local i=0
+	command -v flock >/dev/null 2>&1 || return 1
+	( exec 5>>"$MIERU_RUN_MARKER" ) 2>/dev/null || return 1
+	exec 5>>"$MIERU_RUN_MARKER" 2>/dev/null
+	while [ "$i" -lt "${1:-10}" ]; do
+		flock -n 5 2>/dev/null && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	exec 5>&- 2>/dev/null
+	return 1
+}
+
+mieru_marker_unlock() {
+	flock -u 5 2>/dev/null
+	exec 5>&- 2>/dev/null
+}
+
+# Claim the marker for THIS worker: under the lock, refuse when a live
+# worker already owns it, else record $$. Our OWN pid is the rpcd layer's
+# reservation for us - it must not read as a competing worker. Without
+# flock there is no protection; proceed (the mutation lock still
+# serializes the installs themselves).
+mieru_marker_claim() {
+	local mpid
+	command -v flock >/dev/null 2>&1 || return 0
+	mieru_marker_lock 10 || return 0
+	mpid=$(cat "$MIERU_RUN_MARKER" 2>/dev/null)
+	if [ "$mpid" != "$$" ] && mieru_marker_live "$mpid"; then
+		mieru_marker_unlock
+		return 1
+	fi
+	printf '%s\n' "$$" > "$MIERU_RUN_MARKER"
+	mieru_marker_unlock
+	return 0
+}
+
+# Clear the marker on worker exit - but ONLY while it still names THIS
+# process: somebody else's reservation (or a reclaim that already replaced
+# our dead pid) must survive us.
+mieru_marker_clear() {
+	command -v flock >/dev/null 2>&1 || return 0
+	mieru_marker_lock 10 || return 0
+	[ "$(cat "$MIERU_RUN_MARKER" 2>/dev/null)" = "$$" ] && : > "$MIERU_RUN_MARKER"
+	mieru_marker_unlock
+	return 0
+}
+
 # Stable section ids: -X makes uci print the cfgXXXXXX name of an anonymous
 # section instead of @mieru[N] (which shifts when rows are deleted and does
 # not pass the id charset checks below).
@@ -1417,33 +1489,18 @@ mieru_write_uci() {  # <section-id> <norm-file>
 # answers on loopback (the runtime config only exists once the service has
 # generated it) - no mieru subprocess in the poll path.
 do_mieru_get() {
-	local id label server ports sp tp rp en run first=1 inst="" inst0 vinst vver varch ipid vtests v ires
+	local id label server ports sp tp rp en run first=1 inst="" inst0 vinst vver varch vtests v ires
 	local mtu mux hs log lan srv_ip srv_dm
 	command -v ucode >/dev/null 2>&1 || { printf '{"binary":{"installed":0,"version":"","arch":"","installing":0},"instances":[],"tests":{},"install_result":null}\n'; return 0; }
 	vinst=0
 	[ -x "$MIERU" ] && vinst=1
 	vver=$(mieru_version)
 	varch=$(uname -m)
-	ipid=0
+	# read-only poll of the install marker (no writes here - the reserve/
+	# claim/clear transitions own it, see the marker block above)
 	inst0=0
-	if [ -s "$MIERU_RUN_MARKER" ]; then
-		ipid=$(cat "$MIERU_RUN_MARKER" 2>/dev/null)
-		case "$ipid" in ''|*[!0-9]*) ipid=0 ;; esac
-		if [ "$ipid" -ge 1 ] && kill -0 "$ipid" 2>/dev/null \
-			&& tr '\0' ' ' < "/proc/$ipid/cmdline" 2>/dev/null | grep -q "xray-sub.*mieru-install"; then
-			inst0=1
-		else
-			rm -f "$MIERU_RUN_MARKER"; ipid=0
-		fi
-	elif [ -e "$MIERU_RUN_MARKER" ]; then
-		# empty reservation: the rpcd layer created it atomically just
-		# before spawning the worker (which pins its pid right after) - in
-		# flight, unless it is old enough that the spawner died mid-window
-		if [ -n "$(find "$MIERU_RUN_MARKER" -mmin +5 2>/dev/null)" ]; then
-			rm -f "$MIERU_RUN_MARKER"
-		else
-			inst0=1
-		fi
+	if mieru_marker_live "$(cat "$MIERU_RUN_MARKER" 2>/dev/null)"; then
+		inst0=1
 	fi
 	for id in $(mieru_ids); do
 		en=1
@@ -1584,15 +1641,20 @@ do_mieru_del() {  # <id>
 	mieru_uci_commit || return 1
 	# Reap the instance NOW: without the restart the deleted connection's
 	# process (and its respawn) would keep serving until the next manual
-	# restart. The init script regenerates from the committed UCI, so the
-	# section - and its runtime files - are gone for good. A failed restart
-	# is reported as such: the UCI deletion stands, but the user must press
-	# Restart to actually stop the lingering instance.
-	rm -f "$MIERU_RUN/$1.json" "$MIERU_RUN/redsocks-$1.conf"
-	if [ -x "$MIERU_INIT" ] && ! "$MIERU_INIT" restart >/dev/null 2>&1 3>&- 4>&-; then
-		echo "deleted from UCI, but the service restart failed - press Restart to stop the lingering instance"
-		return 1
+	# restart. The restart comes FIRST: the service generator rebuilds the
+	# runtime directory from the committed UCI, whose keep-list already
+	# prunes removed sections - and while it FAILS, the still-running
+	# instance keeps its config (respawn and `mieru test` read it), so the
+	# user can simply press Restart again. Only a successful restart (or a
+	# missing init script, where there is nothing driving the lifecycle)
+	# falls through to the belt-and-suspenders rm below.
+	if [ -x "$MIERU_INIT" ]; then
+		if ! "$MIERU_INIT" restart >/dev/null 2>&1 3>&- 4>&-; then
+			echo "deleted from UCI, but the service restart failed - press Restart to stop the lingering instance"
+			return 1
+		fi
 	fi
+	rm -f "$MIERU_RUN/$1.json" "$MIERU_RUN/redsocks-$1.conf"
 	echo ok
 }
 
@@ -1611,10 +1673,13 @@ do_mieru_restart() {
 
 # One connectivity check through a RUNNING connection (`mieru test` talks to
 # the instance's rpc port; without a running instance there is nothing to
-# test). The verdict lands in the volatile cache the tab polls - same
+# test). The verdict lands in the volatile cache the tab polls - the same
 # atomic .new+mv write as the e2e results, with the read-merge-write held
 # under a small fd-4 lock so two concurrent tests cannot drop each other's
-# verdicts (the probes themselves still run in parallel).
+# verdicts (the probes themselves still run in parallel). Without the lock
+# (no flock, open failure, timeout) there is NO cache write at all: the
+# shared .new path must never be written unlocked, and the verdict still
+# reaches the caller through this command's reply.
 do_mieru_test() {  # <id>
 	local id="$1" cfg out rc det ok theld=0
 	case "$id" in ''|*[!A-Za-z0-9._-]*|.|..) echo "invalid id"; return 1 ;; esac
@@ -1626,15 +1691,26 @@ do_mieru_test() {  # <id>
 	det=$(printf '%s\n' "$out" | head -n1 | tr -s '\r\n\t ' ' ' | cut -c1-120)
 	ok=0; [ "$rc" -eq 0 ] && ok=1
 	mkdir -p "$TSTATE_DIR"
-	if command -v flock >/dev/null 2>&1 && exec 4>>"$MTESTLOCK" && flock -w 5 4 2>/dev/null; then
-		theld=1
-	fi
-	if "$SHARE/mieru.uc" tests "$MIERU_TEST" "$id" "$ok" "$det" > "$MIERU_TEST.new" 2>/dev/null; then
-		mv "$MIERU_TEST.new" "$MIERU_TEST"
-	else
-		rm -f "$MIERU_TEST.new"
+	# bounded poll of non-blocking tries - BusyBox flock has no -w. The open
+	# is probed in a subshell first: a failed `exec <redir>` kills a
+	# non-interactive ash outright, and a lock problem must skip the cache
+	# write, not the whole command.
+	if command -v flock >/dev/null 2>&1 && ( exec 4>>"$MTESTLOCK" ) 2>/dev/null; then
+		exec 4>>"$MTESTLOCK" 2>/dev/null
+		ti=0
+		while [ "$ti" -lt 5 ]; do
+			flock -n 4 2>/dev/null && { theld=1; break; }
+			ti=$((ti + 1))
+			sleep 1
+		done
+		[ "$theld" = 1 ] || exec 4>&- 2>/dev/null
 	fi
 	if [ "$theld" = 1 ]; then
+		if "$SHARE/mieru.uc" tests "$MIERU_TEST" "$id" "$ok" "$det" > "$MIERU_TEST.new" 2>/dev/null; then
+			mv "$MIERU_TEST.new" "$MIERU_TEST"
+		else
+			rm -f "$MIERU_TEST.new"
+		fi
 		flock -u 4 2>/dev/null
 		exec 4>&-
 	fi
@@ -2268,12 +2344,18 @@ case "$1" in
 	mieru-restart) do_mieru_restart ;;
 	mieru-test)    do_mieru_test "$2" ;;
 	# The install can be detached by the rpcd layer (a ~25 MB download must
-	# not sit inside the ubus call); the run marker lets the polled status
-	# surface show it in flight, and is dropped on every exit path.
+	# not sit inside the ubus call). Claim the run marker first - a live
+	# worker means somebody else owns the install - then clear it on every
+	# exit path (the EXIT trap; a SIGKILLed worker leaves its pid behind,
+	# which the next reservation reclaims after the liveness check).
 	mieru-install)
 		mkdir -p "$TSTATE_DIR"
-		printf '%s\n' "$$" > "$MIERU_RUN_MARKER"
-		trap 'rm -f "$MIERU_RUN_MARKER"; cleanup' EXIT
+		if ! mieru_marker_claim; then
+			mieru_install_note 0 "another mieru install is already running"
+			echo "another mieru install is already running"
+			exit 1
+		fi
+		trap 'mieru_marker_clear; cleanup' EXIT
 		trap 'exit 1' INT TERM HUP
 		do_mieru_install "$2"
 		exit $?

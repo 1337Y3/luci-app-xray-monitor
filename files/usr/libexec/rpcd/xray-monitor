@@ -1005,34 +1005,70 @@ case "$1" in
 			# install can take the mutation lock properly). Progress is
 			# visible to the poll via mieru_get's installing flag + version,
 			# and the terminal outcome lands in mieru_get's install_result.
-			# The run marker is RESERVED atomically (noclobber create)
-			# BEFORE the worker is spawned, so two concurrent ubus calls
-			# cannot both observe "no marker" and both spawn a worker; the
-			# worker immediately rewrites the reservation with its own pid
-			# and removes the marker on every exit path.
+			# Reservation protocol (mirrors the marker block in xray-sub):
+			# every transition happens under an exclusive flock OF the
+			# marker file itself, which is never unlinked - empty = idle,
+			# a live worker pid = in flight. Here: lock, validate (a dead
+			# pid is a SIGKILLed worker and gets reclaimed by simply being
+			# overwritten), spawn, write $! and ONLY THEN unlock - so the
+			# reservation is visible before the lock drops and no window
+			# exists where the worker's own exit could outrun the pid
+			# write. The worker claims/clears the same marker under the
+			# same lock and never unlinks it. BusyBox flock has no -w, so
+			# the wait is a bounded poll of non-blocking tries.
 			mieru_install)
 				mkdir -p "$E2E_STATE"
-				if ! ( set -C; : > "$E2E_STATE/mieru-install.run" ) 2>/dev/null; then
-					json_init
-					json_add_boolean ok 1
-					json_add_boolean running 1
-					json_add_string msg "An install is already running"
+				mi_locked=0
+				if ! command -v flock >/dev/null 2>&1; then
+					json_init; json_add_boolean ok 0
+					json_add_string msg "flock(1) not available - cannot serialize writes"
+					json_dump
+				elif ! ( exec 5>>"$E2E_STATE/mieru-install.run" ) 2>/dev/null; then
+					# probed in a subshell: a failed `exec <redir>` would kill
+					# this whole rpcd handler (non-interactive ash)
+					json_init; json_add_boolean ok 0
+					json_add_string msg "cannot open the install marker"
 					json_dump
 				else
-					input=$(cat)
-					ver=$(printf '%s' "$input" | jsonfilter -e '@.version' 2>/dev/null)
-					# a `&` spawn failure cannot be observed portably in sh;
-					# the worker reports its own terminal outcome through
-					# mieru-install.result either way. $! pins the worker
-					# pid into the reservation immediately - the worker
-					# rewrites it with its own $$ and removes it on exit.
-					sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; exec /usr/share/xray-monitor/xray-sub mieru-install "$1"' sh "$ver" \
-						>"$E2E_STATE/mieru-install.log" 2>&1 </dev/null &
-					printf '%s\n' "$!" > "$E2E_STATE/mieru-install.run"
-					json_init
-					json_add_boolean ok 1
-					json_add_string msg "Download started - the version card updates when it finishes."
-					json_dump
+					exec 5>>"$E2E_STATE/mieru-install.run" 2>/dev/null
+					mi_try=0
+					while [ "$mi_try" -lt 5 ]; do
+						flock -n 5 2>/dev/null && { mi_locked=1; break; }
+						mi_try=$((mi_try + 1))
+						sleep 1
+					done
+					if [ "$mi_locked" != 1 ]; then
+						exec 5>&- 2>/dev/null
+						json_init
+						json_add_boolean ok 1
+						json_add_boolean running 1
+						json_add_string msg "An install is already running"
+						json_dump
+					elif kill -0 "$(cat "$E2E_STATE/mieru-install.run" 2>/dev/null)" 2>/dev/null \
+						&& tr '\0' ' ' < "/proc/$(cat "$E2E_STATE/mieru-install.run" 2>/dev/null)/cmdline" 2>/dev/null | grep -q "mieru-install"; then
+						# the recorded pid is a LIVE install worker
+						flock -u 5 2>/dev/null; exec 5>&- 2>/dev/null
+						json_init
+						json_add_boolean ok 1
+						json_add_boolean running 1
+						json_add_string msg "An install is already running"
+						json_dump
+					else
+						input=$(cat)
+						ver=$(printf '%s' "$input" | jsonfilter -e '@.version' 2>/dev/null)
+						# a `&` spawn failure cannot be observed portably in sh;
+						# the worker reports its own terminal outcome through
+						# mieru-install.result either way
+						sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; exec /usr/share/xray-monitor/xray-sub mieru-install "$1"' sh "$ver" \
+							>"$E2E_STATE/mieru-install.log" 2>&1 </dev/null &
+						printf '%s\n' "$!" > "$E2E_STATE/mieru-install.run"
+						flock -u 5 2>/dev/null
+						exec 5>&- 2>/dev/null
+						json_init
+						json_add_boolean ok 1
+						json_add_string msg "Download started - the version card updates when it finishes."
+						json_dump
+					fi
 				fi
 			;;
 			# Semantic diff of the raw editor's text against the LIVE config, as

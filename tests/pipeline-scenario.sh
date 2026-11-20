@@ -450,6 +450,9 @@ esac
 case " $* " in *" --socks5-hostname "*) socks=1 ;; *) socks=0 ;; esac
 echo "curl[socks=$socks] $*" >> "${STUB_CURL_LOG:-/dev/null}"
 [ -f "${STUB_CURL_FAIL_ALL:-/nonexistent}" ] && exit 22
+# optional per-call delay for the non-e2e calls (marker-race cases: keeps
+# an install worker alive long enough to observe the "already running" state)
+case "${STUB_CURL_SLEEP:-}" in ''|*[!0-9]*) ;; *) sleep "$STUB_CURL_SLEEP" ;; esac
 [ -f "${STUB_CURL_DIRECT_DOWN:-/nonexistent}" ] && [ "$socks" = 0 ] && exit 7
 url=""
 for a in "$@"; do
@@ -1519,6 +1522,54 @@ EOF
 	ok_eq "out_meta: dns outbound not an exit" 0 "$(printf '%s' "$out" | grep -q dns-out && echo 1 || echo 0)"
 	ok_eq "out_meta: freedom not an exit" 0 "$(printf '%s' "$out" | grep -q direct && echo 1 || echo 0)"
 	reset_cfg
+
+	echo "== rpcd mieru_install: marker reservation, reclamation, no stuck state"
+	# The marker lifecycle through the REAL rpcd arm and the REAL worker:
+	# reservation under flock, dead pids reclaimed, a fast-failing worker
+	# leaves the marker empty, a live worker answers "already running".
+	# Bounded polling (1 s steps) - never a blind sleep for sync. The cases
+	# run REAL installs, which replace the stub binary - save and restore it
+	# so the later mieru-section assertions see the version stub again.
+	cp "$SB/bin/mieru" "$SB/work/mieru-stub.sav"
+	MRK="$SB/tmp/xray-monitor/mieru-install.run"
+	wait_marker_empty() {  # <max-seconds>: rc 0 = marker drained
+		local i
+		for i in $(seq 1 "${1:-15}"); do
+			[ -s "$MRK" ] || return 0
+			sleep 1
+		done
+		return 1
+	}
+	# 1) a dead pid in the marker (SIGKILLed worker - no trap ran) is
+	#    reclaimed, not reported as "already running"
+	sh -c 'exit 0' & dpid=$!; wait "$dpid"
+	printf '%s\n' "$dpid" > "$MRK"
+	out=$(rpccall mieru_install)
+	is "install: dead worker pid reclaimed, install starts" "$(printf '%s' "$out" | grep -q 'Download started' && echo 1 || echo 0)"
+	is "install: reclaimed run drained the marker" "$(wait_marker_empty 100 && echo 1 || echo 0)"
+	# 2) an immediately-failing worker (bad version) must not leave a stale
+	#    pid behind (the round-3 race: parent's pid write vs worker's exit)
+	echo '{"version":"bogus"}' > "$SB/work/inst-bogus.json"
+	rpccall mieru_install "$SB/work/inst-bogus.json" >/dev/null
+	is "install: fast-failing worker clears the marker" "$(wait_marker_empty 100 && echo 1 || echo 0)"
+	is "install: fast failure recorded its outcome" "$(grep -q '"ok": false' "$SB/tmp/xray-monitor/mieru-install.result" 2>/dev/null && echo 1 || echo 0)"
+	# 3) a LIVE worker owns the install: the second call reports it, the
+	#    marker drains after the worker finishes, and the next call starts
+	#    again (no permanent "already running")
+	STUB_CURL_SLEEP=2
+	export STUB_CURL_SLEEP
+	out=$(rpccall mieru_install)
+	is "install: slow worker started" "$(printf '%s' "$out" | grep -q 'Download started' && echo 1 || echo 0)"
+	is "install: worker pid recorded while running" "$([ -s "$MRK" ] && echo 1 || echo 0)"
+	out=$(rpccall mieru_install)
+	is "install: concurrent call answered already-running" "$(printf '%s' "$out" | grep -q 'already running' && echo 1 || echo 0)"
+	is "install: worker drained the marker on exit" "$(wait_marker_empty 150 && echo 1 || echo 0)"
+	unset STUB_CURL_SLEEP
+	out=$(rpccall mieru_install)
+	is "install: next call starts after the previous worker exited" "$(printf '%s' "$out" | grep -q 'Download started' && echo 1 || echo 0)"
+	is "install: marker empty again" "$(wait_marker_empty 100 && echo 1 || echo 0)"
+	cp "$SB/work/mieru-stub.sav" "$SB/bin/mieru"
+	reset_cfg
 fi
 echo "== fetch/self-update via xray (F18): exit selection order + honest proxy failures"
 # curl / ubus / tmpxray are stubbed (see setup); uci answers, the e2e.json
@@ -1832,6 +1883,31 @@ is "mieru test: honest not-running reason" "$(printf '%s' "$out" | grep -q 'not 
 out=$(runsub mieru-test sub 2>/dev/null); rc=$?
 ok_eq "mieru test: non-mieru section id rejected rc" 1 "$rc"
 is "mieru test: non-mieru section id rejected" "$(printf '%s' "$out" | grep -q 'no such connection' && echo 1 || echo 0)"
+# concurrent tests: two verdicts in parallel must BOTH land in the cache
+# (the read-merge-write is serialized by the fd-4 lock; real flock only)
+printf '{}\n' > "$SB/var/etc/xray-monitor/mieru/$id1.json"
+printf '{}\n' > "$SB/var/etc/xray-monitor/mieru/$id2.json"
+printf '{}\n' > "$SB/var/etc/xray-monitor/mieru/$id3.json"
+rm -f "$SB/tmp/xray-monitor/mieru-test.json"
+if [ "$FLOCK_STUB" = 0 ]; then
+	( runsub mieru-test "$id1" >/dev/null 2>&1 ) & tp1=$!
+	( runsub mieru-test "$id2" >/dev/null 2>&1 ) & tp2=$!
+	wait "$tp1"; wait "$tp2"
+	is "mieru test: parallel tests both cached" \
+		"$(grep -q "\"$id1\"" "$SB/tmp/xray-monitor/mieru-test.json" 2>/dev/null \
+			&& grep -q "\"$id2\"" "$SB/tmp/xray-monitor/mieru-test.json" 2>/dev/null && echo 1 || echo 0)"
+else
+	echo "NOTE   flock(1) stubbed - parallel test-cache case skipped"
+fi
+# lock unobtainable (the lock path is a directory): NO unlocked write to
+# the shared cache - the verdict still reaches the caller through the reply
+rm -f "$SB/lock/xray-monitor-mieru"
+mkdir -p "$SB/lock/xray-monitor-mieru"
+out=$(runsub mieru-test "$id3" 2>/dev/null); rc=$?
+rmdir "$SB/lock/xray-monitor-mieru"
+ok_eq "mieru test: lock-unavailable rc still reports the verdict" 0 "$rc"
+is "mieru test: lock-unavailable reply says passed" "$(printf '%s' "$out" | grep -q 'test passed' && echo 1 || echo 0)"
+is "mieru test: no unlocked cache write" "$(grep -q "\"$id3\"" "$SB/tmp/xray-monitor/mieru-test.json" 2>/dev/null && echo 0 || echo 1)"
 # connection behind a later commit, the UI hears the failure
 touch "$STUB_UCI_SET_FAIL"
 out=$(runsub mieru-add "$SB/work/mieru-crud4.json" 2>/dev/null); rc=$?
@@ -1841,7 +1917,8 @@ is "mieru add: partial write reports the rollback" "$(printf '%s' "$out" | grep 
 out=$(runsub mieru-get 2>/dev/null)
 is "mieru add: partial write leaves no section behind" "$(printf '%s' "$out" | grep -q 'zz4' && echo 0 || echo 1)"
 # a delete whose service restart FAILS still reports the failure distinctly
-# (the UCI deletion stands; the user must press Restart)
+# (the UCI deletion stands; the user must press Restart) - and the runtime
+# config SURVIVES so the still-running instance can respawn and be tested
 touch "$STUB_INITD_MIERU_FAIL"
 out=$(runsub mieru-del "$id3" 2>/dev/null); rc=$?
 rm -f "$STUB_INITD_MIERU_FAIL"
@@ -1849,12 +1926,14 @@ ok_eq "mieru del: failed restart rc" 1 "$rc"
 is "mieru del: failed restart surfaces the distinct reason" "$(printf '%s' "$out" | grep -q 'restart failed - press Restart' && echo 1 || echo 0)"
 out=$(runsub mieru-get 2>/dev/null)
 is "mieru del: UCI deletion stood despite the failed restart" "$(printf '%s' "$out" | grep -q 'zz3' && echo 0 || echo 1)"
+is "mieru del: runtime config kept while the instance may still run" "$([ -f "$SB/var/etc/xray-monitor/mieru/$id3.json" ] && echo 1 || echo 0)"
 # delete: type guard first, then a real row; the survivor keeps its rpc port
 out=$(runsub mieru-del sub 2>/dev/null); rc=$?
 ok_eq "mieru del: the main sub section is untouchable rc" 1 "$rc"
 is "mieru del: the main sub section is untouchable" "$(printf '%s' "$out" | grep -q 'no such connection' && echo 1 || echo 0)"
 out=$(runsub mieru-del "$id1" 2>/dev/null); rc=$?
 ok_eq "mieru del: row deleted" "ok" "$out"
+is "mieru del: runtime config removed after the successful restart" "$([ -f "$SB/var/etc/xray-monitor/mieru/$id1.json" ] && echo 0 || echo 1)"
 out=$(runsub mieru-get 2>/dev/null)
 is "mieru del: deleted row gone, survivor intact" \
 	"$(printf '%s' "$out" | grep -q "\"id\":\"$id2\",\"label\":\"zz2\"" && printf '%s' "$(mrow "$id2" "$out")" | mrpc | grep -qx 10091 && echo 1 || echo 0)"
