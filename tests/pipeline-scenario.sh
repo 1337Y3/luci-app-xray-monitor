@@ -97,6 +97,7 @@ sed \
 	-e "s|^MIERU=.*|MIERU=$SB/bin/mieru|" \
 	-e "s|^MIERU_RUN=.*|MIERU_RUN=$SB/var/etc/xray-monitor/mieru|" \
 	-e "s|^MIERU_INIT=.*|MIERU_INIT=$SB/etc/init.d/mieru-monitor|" \
+	-e "s|^MTESTLOCK=.*|MTESTLOCK=$SB/lock/xray-monitor-mieru|" \
 	-e "s|echo \"/etc/xray/config.json\"|echo \"$SB/etc/xray/config.json\"|" \
 	-e "s|/etc/init\.d/xray|$SB/etc/init.d/xray|g" \
 	-e "s|/etc/init\.d/cron|$SB/etc/init.d/cron|g" \
@@ -108,7 +109,7 @@ sed \
 	-e 's|^post_restart_hooks() {$|post_restart_hooks() { echo hook >> "${STUB_HOOK_LOG:-/dev/null}";|' \
 	"$SHARESRC/xray-sub" > "$SB/sub"
 for pat in "SHARE=$SB" "STATE=$SB" "XRAY=$SB" "LOCK=$SB" "TLOCK=$SB" "TSTATE_DIR=$SB" \
-	"MIERU=$SB" "MIERU_RUN=$SB" "MIERU_INIT=$SB" \
+	"MIERU=$SB" "MIERU_RUN=$SB" "MIERU_INIT=$SB" "MTESTLOCK=$SB" \
 	"$SB/etc/xray/config.json" "$SB/etc/init.d/xray" "$SB/etc/crontabs/root" \
 	"$SB/etc/init.d/cron" "STUB_HOOK_LOG"; do
 	grep -q -- "$pat" "$SB/sub" || { echo "scenario setup failed, rewrite missed: $pat"; exit 1; }
@@ -280,21 +281,22 @@ cat > "$SB/bin/uci" <<'EOF'
 # $STUB_UCI_HOTSWAP), probe_disabled names the exit the e2e cases expect to be
 # skipped, e2e_cron answers 1 only while $STUB_UCI_E2E_CRON is set (cron-sync
 # case). Everything else is served from files in `uci show xray-monitor`
-# format: $STUB_UCI first (the default answers only backup_keep=3; the F18
-# fetch-via sections rewrite it with subscriptions and fetch_via* options),
-# then $STUB_UCI_STATE (balancer_override sections for the F15 override
-# cases). Nothing found = rc 1 / empty, so an empty sub list keeps the legacy
-# "all proxy outbounds are managed" mode. Anything else (add/set/commit/...)
-# fails like before.
+# format, first match wins per source, sources in order: $STUB_UCI_RW (a
+# writable copy the mieru CRUD cases seed - add/set/add_list/delete/commit
+# mutate ONLY that file, with deterministic cfg9xxx ids from ${RW}.n), then
+# $STUB_UCI (the default answers; the F18 fetch-via sections rewrite it with
+# subscriptions and fetch_via* options), then $STUB_UCI_STATE
+# (balancer_override sections for the F15 override cases). A get prints EVERY
+# matching line of the winning source (real uci prints each list entry).
+# Unknown flags (-X among them) are skipped like -q.
+RW=${STUB_UCI_RW:-/nonexistent}
+src() { [ -f "$RW" ] && { echo "$RW"; return; }; [ -f "${STUB_UCI_STATE:-/nonexistent}" ] && { echo "${STUB_UCI_STATE}"; return; }; [ -n "${STUB_UCI:-}" ] && echo "$STUB_UCI"; }
 while [ $# -gt 0 ]; do
 	case "$1" in
-		-q) ;;
+		-q|-X) ;;
 		show)
-			if [ -f "${STUB_UCI_STATE:-/nonexistent}" ]; then
-				cat "${STUB_UCI_STATE}"
-			else
-				[ -n "${STUB_UCI:-}" ] && cat "$STUB_UCI" 2>/dev/null
-			fi
+			s=$(src)
+			[ -n "$s" ] && cat "$s" 2>/dev/null
 			exit 0 ;;
 		get)
 			[ -n "$2" ] || exit 1
@@ -306,21 +308,56 @@ while [ $# -gt 0 ]; do
 					[ -n "${STUB_UCI_E2E_CRON:-}" ] && { echo 1; exit 0; }
 					exit 1 ;;
 			esac
+			s=$(src)
+			[ -n "$s" ] || exit 1
+			got=0
 			# fixed-prefix match via case (no regex: section ids carry
 			# [ ] and dots that must not be interpreted)
 			while IFS= read -r line; do
 				case "$line" in "$2="*)
 					v=${line#*=}; v=${v#\'}; v=${v%\'}
-					echo "$v"; exit 0 ;;
+					echo "$v"; got=1 ;;
 				esac
-			done < "${STUB_UCI:-/dev/null}"
-			# generic "<section>.<option>='value'" lookup for the override
-			# sections (the option name carries no dots, so this sed is safe)
-			if [ -f "${STUB_UCI_STATE:-/nonexistent}" ]; then
-				val=$(sed -n "s/^$(printf '%s' "$2" | sed 's/[.]/\\./g')='\\(.*\\)'$/\\1/p" "${STUB_UCI_STATE}")
-				if [ -n "$val" ]; then echo "$val"; exit 0; fi
-			fi
+			done < "$s"
+			[ "$got" = 1 ] && exit 0
 			exit 1 ;;
+		add)
+			# uci add <config> <type> -> deterministic cfg9xxx id in $RW
+			[ -f "$RW" ] || exit 1
+			n=$(cat "${RW}.n" 2>/dev/null); case "$n" in ''|*[!0-9]*) n=9000 ;; esac
+			n=$((n + 1)); echo "$n" > "${RW}.n"
+			printf 'xray-monitor.cfg%s=%s\n' "$n" "$3" >> "$RW"
+			echo "cfg$n"
+			exit 0 ;;
+		set)
+			# uci set xray-monitor.<sec>.<opt>=<val> (upsert into $RW)
+			[ -f "$RW" ] || exit 1
+			case "$2" in xray-monitor.*.*) ;; *) exit 1 ;; esac
+			key=${2%%=*}; val=${2#*=}
+			grep -v "^$(printf '%s' "$key" | sed 's/[.]/\\./g')=" "$RW" > "$RW.tmp"
+			printf "%s='%s'\n" "$key" "$val" >> "$RW.tmp"
+			mv "$RW.tmp" "$RW"
+			exit 0 ;;
+		add_list)
+			[ -f "$RW" ] || exit 1
+			case "$2" in xray-monitor.*.*) ;; *) exit 1 ;; esac
+			key=${2%%=*}; val=${2#*=}
+			printf "%s='%s'\n" "$key" "$val" >> "$RW"
+			exit 0 ;;
+		delete)
+			[ -f "$RW" ] || exit 1
+			pat=$(printf '%s' "$2" | sed 's/[.]/\\./g')
+			case "$2" in
+				xray-monitor.*.*)
+					grep -v "^${pat}=" "$RW" > "$RW.tmp" ;;
+				*)
+					# whole section: its type line and every option line
+					grep -v -E "^${pat}(=|\\.)" "$RW" > "$RW.tmp" ;;
+			esac
+			mv "$RW.tmp" "$RW"
+			exit 0 ;;
+		commit) exit 0 ;;
+		*) ;;
 	esac
 	shift
 done
@@ -581,12 +618,22 @@ sha=$(sha256sum "$STUB_CURL_IPK" 2>/dev/null | awk '{ print $1 }')
 printf '%s  luci-app-xray-monitor.ipk\n' "$sha" > "$STUB_CURL_SHA256"
 printf 'Package: luci-app-xray-monitor\nVersion: 9.9.9-1\nFilename: luci-app-xray-monitor.ipk\nSHA256sum: %s\n' "$sha" > "$STUB_CURL_PACKAGES"
 # a mieru release the curl stub can serve: the GitHub API reply, a tar.gz
-# carrying a `mieru` binary (one that answers `version`), and its sidecar
+# carrying a `mieru` binary (one that answers `version`), and its sidecar.
+# The sidecar line must name the artifact for the arch the RUNNER maps to
+# (the install now selects the checksum by filename - a hardcoded amd64
+# line would be refused on an arm64 box).
+mieru_stub_arch=$(case "$(uname -m)" in
+	x86_64) echo amd64 ;;
+	arm64|aarch64) echo arm64 ;;
+	armv7*) echo armv7 ;;
+	riscv64) echo riscv64 ;;
+	*) echo amd64 ;;
+esac)
 mkdir -p "$SB/work/fake-mieru"
 printf '#!/bin/sh\nif [ "$1" = version ]; then printf "mieru version 9.9.9\\n"; exit 0; fi\nexit 0\n' > "$SB/work/fake-mieru/mieru"
 tar -czf "$STUB_CURL_MIERU_TGZ" -C "$SB/work/fake-mieru" mieru 2>/dev/null
 msha=$(sha256sum "$STUB_CURL_MIERU_TGZ" 2>/dev/null | awk '{ print $1 }')
-printf '%s  mieru_3.39.0_linux_amd64.tar.gz\n' "$msha" > "$STUB_CURL_MIERU_SHA"
+printf '%s  mieru_3.39.0_linux_%s.tar.gz\n' "$msha" "$mieru_stub_arch" > "$STUB_CURL_MIERU_SHA"
 printf '{"tag_name":"v3.39.0"}\n' > "$STUB_CURL_GHJSON"
 
 CFG="$SB/etc/xray/config.json"
@@ -1685,14 +1732,92 @@ is "mieru: install reports the version + restart hint" "$(printf '%s' "$out" | g
 ok_eq "mieru: install fetched api + tarball + sidecar (all direct)" 3 "$(grep -c 'socks=0' "$STUB_CURL_LOG")"
 is "mieru: install replaced the binary at \$MIERU" "$("$SB/bin/mieru" version 2>/dev/null | grep -q 'mieru version 9.9.9' && echo 1 || echo 0)"
 # a corrupted sidecar must refuse to install and leave the binary alone
-printf '%s  mieru_3.39.0_linux_amd64.tar.gz\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$STUB_CURL_MIERU_SHA"
+printf '%s  mieru_3.39.0_linux_%s.tar.gz\n' "0000000000000000000000000000000000000000000000000000000000000000" "$mieru_stub_arch" > "$STUB_CURL_MIERU_SHA"
 out=$(runsub mieru-install 2>/dev/null); rc=$?
 ok_eq "mieru: install with bad SHA rc" 1 "$rc"
 is "mieru: install with bad SHA refuses with the mismatch reason" "$(printf '%s' "$out" | grep -q '^SHA256 mismatch' && echo 1 || echo 0)"
 is "mieru: bad SHA leaves the installed binary in place" "$("$SB/bin/mieru" version 2>/dev/null | grep -q 'mieru version 9.9.9' && echo 1 || echo 0)"
 # restore the good sidecar + the default uci answers
-printf '%s  mieru_3.39.0_linux_amd64.tar.gz\n' "$msha" > "$STUB_CURL_MIERU_SHA"
+printf '%s  mieru_3.39.0_linux_%s.tar.gz\n' "$msha" "$mieru_stub_arch" > "$STUB_CURL_MIERU_SHA"
 printf '%s\n' "xray-monitor.sub=xray-monitor" "xray-monitor.sub.backup_keep='3'" > "$STUB_UCI"
+
+echo "== mieru tab: CRUD round through the real handlers (stubbed uci writes)"
+# The Add -> Test -> Edit -> Delete round the live UI performs: uci
+# add/set/delete/commit mutate only $STUB_UCI_RW (seeded from the default
+# answers), so this exercises the id round-trip (add's cfg id is exactly
+# what get/edit/test/del consume - the plain-`uci show` @mieru[N] name is
+# never seen anywhere), the port bookkeeping, the type guards, and that
+# deleting one row leaves the other row's rpc port alone.
+export STUB_UCI_RW="$SB/work/uci-rw.txt"
+cp "$STUB_UCI" "$STUB_UCI_RW"
+cat > "$SB/work/mieru-crud1.json" <<'EOJ'
+{ "label": "zz1", "server_ip": "10.99.99.99", "server_ports": ["2027/tcp"], "username": "u", "password": "p", "socks5_port": 1080 }
+EOJ
+cat > "$SB/work/mieru-crud2.json" <<'EOJ'
+{ "label": "zz2", "server_domain": "zz.example.org", "server_ports": ["2028/tcp"], "username": "u", "password": "p", "socks5_port": 1081 }
+EOJ
+cat > "$SB/work/mieru-crud3.json" <<'EOJ'
+{ "label": "zz3", "server_ip": "10.99.99.98", "server_ports": ["2029/tcp"], "username": "u", "password": "p", "socks5_port": 10092 }
+EOJ
+cat > "$SB/work/mieru-crud1b.json" <<'EOJ'
+{ "label": "zz1", "server_ip": "10.99.99.99", "server_ports": ["2027/tcp"], "username": "u", "password": "p", "socks5_port": 1082 }
+EOJ
+cat > "$SB/work/mieru-crud1c.json" <<'EOJ'
+{ "label": "zz1", "server_ip": "10.99.99.99", "server_ports": ["2027/tcp"], "username": "u", "password": "p", "socks5_port": 10091 }
+EOJ
+mrow() { printf '%s' "$2" | grep -o "\"id\":\"$1\"[^}]*"; }
+mrpc() { sed -n 's/.*"rpc_port":\([0-9][0-9]*\).*/\1/p'; }
+msock() { sed -n 's/.*"socks5_port":\([0-9][0-9]*\).*/\1/p'; }
+
+out=$(runsub mieru-add "$SB/work/mieru-crud1.json" 2>/dev/null); rc=$?
+ok_eq "mieru add: first connection accepted" "ok" "$out"
+out=$(runsub mieru-add "$SB/work/mieru-crud2.json" 2>/dev/null); rc=$?
+ok_eq "mieru add: second connection accepted" "ok" "$out"
+# the stub's deterministic ids are what every other handler must consume
+id1=cfg9001; id2=cfg9002; id3=cfg9003
+out=$(runsub mieru-get 2>/dev/null)
+is "mieru crud: get lists both rows by their stable cfg ids" \
+	"$(printf '%s' "$out" | grep -q "\"id\":\"$id1\",\"label\":\"zz1\"" && printf '%s' "$out" | grep -q "\"id\":\"$id2\",\"label\":\"zz2\"" && echo 1 || echo 0)"
+ok_eq "mieru crud: first rpc port allocated" 10090 "$(printf '%s' "$(mrow "$id1" "$out")" | mrpc)"
+ok_eq "mieru crud: second rpc port allocated" 10091 "$(printf '%s' "$(mrow "$id2" "$out")" | mrpc)"
+# the rpc allocator must dodge the NEW connection's own listen port too
+out=$(runsub mieru-add "$SB/work/mieru-crud3.json" 2>/dev/null)
+ok_eq "mieru add: rpc port dodges the connection's own socks5 port" 10093 \
+	"$(printf '%s' "$(mrow "$id3" "$(runsub mieru-get 2>/dev/null)")" | mrpc)"
+# edit: full replace, blank creds = keep, the still-valid rpc port is kept
+out=$(runsub mieru-edit "$id1" "$SB/work/mieru-crud1b.json" 2>/dev/null); rc=$?
+ok_eq "mieru edit: accepted" "ok" "$out"
+out=$(runsub mieru-get 2>/dev/null)
+ok_eq "mieru edit: socks5 port updated" 1082 "$(printf '%s' "$(mrow "$id1" "$out")" | msock)"
+ok_eq "mieru edit: valid rpc port kept" 10090 "$(printf '%s' "$(mrow "$id1" "$out")" | mrpc)"
+# edit into ANOTHER row's rpc port must be rejected, naming the port
+out=$(runsub mieru-edit "$id1" "$SB/work/mieru-crud1c.json" 2>/dev/null); rc=$?
+ok_eq "mieru edit: collision rejected rc" 1 "$rc"
+is "mieru edit: collision names the port" "$(printf '%s' "$out" | grep -q 'socks5 port 10091 already in use' && echo 1 || echo 0)"
+# test: honest "not running" without a service-generated runtime config,
+# and the section-TYPE guard keeps unrelated sections out
+out=$(runsub mieru-test "$id1" 2>/dev/null); rc=$?
+ok_eq "mieru test: not-running rc" 1 "$rc"
+is "mieru test: honest not-running reason" "$(printf '%s' "$out" | grep -q 'not running - restart' && echo 1 || echo 0)"
+out=$(runsub mieru-test sub 2>/dev/null); rc=$?
+ok_eq "mieru test: non-mieru section id rejected rc" 1 "$rc"
+is "mieru test: non-mieru section id rejected" "$(printf '%s' "$out" | grep -q 'no such connection' && echo 1 || echo 0)"
+# delete: type guard first, then a real row; the survivor keeps its rpc port
+out=$(runsub mieru-del sub 2>/dev/null); rc=$?
+ok_eq "mieru del: the main sub section is untouchable rc" 1 "$rc"
+is "mieru del: the main sub section is untouchable" "$(printf '%s' "$out" | grep -q 'no such connection' && echo 1 || echo 0)"
+out=$(runsub mieru-del "$id1" 2>/dev/null); rc=$?
+ok_eq "mieru del: row deleted" "ok" "$out"
+out=$(runsub mieru-get 2>/dev/null)
+is "mieru del: deleted row gone, survivor intact" \
+	"$(printf '%s' "$out" | grep -q "\"id\":\"$id2\",\"label\":\"zz2\"" && printf '%s' "$(mrow "$id2" "$out")" | mrpc | grep -qx 10091 && echo 1 || echo 0)"
+runsub mieru-del "$id2" >/dev/null 2>&1
+runsub mieru-del "$id3" >/dev/null 2>&1
+is "mieru del: everything removed -> no instances" "$(runsub mieru-get 2>/dev/null | grep -q '"instances":\[\]' && echo 1 || echo 0)"
+out=$(runsub mieru-del cfg9999 2>/dev/null); rc=$?
+ok_eq "mieru del: unknown id rejected rc" 1 "$rc"
+unset STUB_UCI_RW
+rm -f "$SB/work/uci-rw.txt" "$SB/work/uci-rw.txt.n"
 
 echo
 if [ "$fails" -eq 0 ]; then

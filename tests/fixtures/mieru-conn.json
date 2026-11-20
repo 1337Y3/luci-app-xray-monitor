@@ -11,6 +11,7 @@
 	"socks5_port": 1080,
 	"tproxy_port": 12345,
 	"rpc_port": 10090,
+	"lan": 1,
 	"logging": "WARNING",
 	"enabled": 1
 }

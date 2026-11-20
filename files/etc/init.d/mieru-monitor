@@ -16,12 +16,25 @@ START=99
 STOP=01
 extra_commands="generate"
 
+# The generated configs carry the connections' plaintext credentials - they
+# are created privately (umask applies to every > redirect below; the .new ->
+# mv rename preserves the mode), unlike the 0644 default a umask 022 box
+# would give them. /etc/config/xray-monitor itself is chmod 0600 by the
+# package postinst for the same reason (uci commit preserves file modes).
+umask 077
+
 SHARE=/usr/share/xray-monitor
 RUN=/var/etc/xray-monitor/mieru
 MIERU=/usr/bin/mieru
-REDSOCKS=/usr/bin/redsocks
+# the feed packages redsocks into /usr/sbin; cover a PATH install too
+REDSOCKS=/usr/sbin/redsocks
+[ -x "$REDSOCKS" ] || REDSOCKS=/usr/bin/redsocks
+[ -x "$REDSOCKS" ] || REDSOCKS=$(command -v redsocks 2>/dev/null)
 
-mieru_ids() { uci show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=mieru$/\1/p'; }
+# Stable section ids (uci show -X prints cfgXXXXXX for anonymous sections;
+# plain `uci show` would yield @mieru[N], which shifts when rows are deleted
+# and does not survive the id charset checks of the xray-sub helpers).
+mieru_ids() { uci -X show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=mieru$/\1/p'; }
 
 # (Re)build /var/etc/xray-monitor/mieru: <id>.json for every enabled+valid
 # section, redsocks-<id>.conf where a transparent port is set; files of
@@ -45,7 +58,12 @@ generate() {
 		mv "$RUN/$id.json.new" "$RUN/$id.json"
 		keep="$keep$id "
 		# transparent listener: redsocks answers redirected TCP on tproxy_port
-		# and forwards into mieru's loopback socks5 port
+		# and forwards into mieru's loopback socks5 port. local_ip must stay
+		# 0.0.0.0: a REDIRECT rewrites the destination to the INCOMING
+		# interface's primary address (not 127.0.0.1), so a loopback-only
+		# bind would silently drop every redirected connection. The port is
+		# reachable from any network whose firewall INPUT policy allows it -
+		# restrict it there if that matters (the app manages no rules).
 		tp=$(uci -q get "xray-monitor.$id.tproxy_port")
 		sp=$(uci -q get "xray-monitor.$id.socks5_port")
 		if [ -n "$tp" ] && [ "$tp" != "0" ]; then

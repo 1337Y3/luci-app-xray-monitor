@@ -416,6 +416,17 @@ cp "$W/mieru-tests-m2.json" "$W/mieru-tests.json"
 check "mieru tests: slim dump round-trips the cache" "$EXP/mieru-tests-merge.json" "$W/mieru-tests-dump.json"
 "$M" tests "$W/mieru-nosuchfile.json" > "$W/mieru-tests-dump0.json"
 check "mieru tests: missing file -> empty" "$EXP/mieru-tests-dump0.json" "$W/mieru-tests-dump0.json"
+# install-outcome notes: merge form (deterministic ts) + dump, absent -> null
+"$M" note "$W/mieru-note.json" 0 "SHA256 mismatch - refusing" 1700000010 > "$W/mieru-note1.json"
+check "mieru note: failure recorded" "$EXP/mieru-note-fail.json" "$W/mieru-note1.json"
+"$M" note "$W/mieru-note2.json" 1 "installed mieru 3.39.0" 1700000020 > "$W/mieru-note2.out"
+cp "$W/mieru-note2.out" "$W/mieru-note2.json"
+check "mieru note: success recorded (whole-file replace)" "$EXP/mieru-note-ok.json" "$W/mieru-note2.out"
+if [ "$("$M" note "$W/mieru-nosuch-note.json" 2>/dev/null)" = "null" ]; then
+	echo "PASS   mieru note: missing file -> null"
+else
+	echo "FAIL   mieru note: missing file -> null"; fails=$((fails + 1))
+fi
 
 echo
 if [ "$fails" -eq 0 ] && [ "$xrayfails" -eq 0 ]; then

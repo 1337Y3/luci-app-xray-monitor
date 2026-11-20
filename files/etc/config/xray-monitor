@@ -60,6 +60,9 @@ config xray-monitor 'sub'
 #       option multiplexing 'MULTIPLEXING_LOW'
 #       option handshake 'HANDSHAKE_STANDARD'
 #       option socks5_port '1080'      # local SOCKS5 listen port (user-chosen)
+#       option lan '0'                 # 1 = accept SOCKS5 from the LAN too
+#                                      # (default 0: loopback only - redsocks
+#                                      # and ruantiblock talk to 127.0.0.1)
 #       option tproxy_port ''          # transparent port: a redsocks listener
 #                                      # that feeds redirected TCP into mieru
 #                                      # (empty/0 = no transparent listener)

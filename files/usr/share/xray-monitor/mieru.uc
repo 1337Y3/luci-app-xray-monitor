@@ -12,8 +12,11 @@
 //           username, password, mtu, multiplexing, handshake,
 //           socks5_port, tproxy_port, rpc_port, logging, enabled }
 //       Defaults: mtu 1400, MULTIPLEXING_LOW, HANDSHAKE_STANDARD, tproxy_port 0
-//       (no transparent listener), logging ERROR (upstream's OpenWrt note:
-//       keep logs small), enabled 1. rc 1 + a reason on stderr when invalid.
+//       (no transparent listener), lan 0 (socks5 binds loopback only - LAN
+//       clients are an explicit opt-in, the port is otherwise reachable by
+//       anything that can route to it), logging ERROR (upstream's OpenWrt
+//       note: keep logs small), enabled 1. rc 1 + a reason on stderr when
+//       invalid.
 //       The optional keep-args implement "blank = keep" for credentials on
 //       EDIT (the UI never echoes them back - same convention as sub-edit's
 //       url): an empty username/password in the file falls back to the argv
@@ -36,6 +39,12 @@
 //       atomic-write shape as e2e.uc merge). id charset [A-Za-z0-9._-]; the
 //       optional ts makes goldens deterministic, the live caller omits it
 //       and gets time().
+//   mieru.uc note <file>
+//       dump the recorded install outcome as {"ok":bool,"msg":str,"ts":N},
+//       or the literal null when absent/unparsable (safe to splice raw into
+//       the status JSON).
+//   mieru.uc note <file> <0|1> <msg> [ts]
+//       print the outcome record for the caller to redirect+mv into <file>.
 'use strict';
 import { readfile } from 'fs';
 
@@ -121,6 +130,8 @@ function normalize(conn, keep_user, keep_pass) {
 	let logging = uc('' + (conn.logging ?? 'ERROR'));
 	if (!match(logging, /^(DEBUG|INFO|WARNING|ERROR)$/)) fail('invalid logging level');
 
+	let lan = (conn.lan == '1' || conn.lan == 1 || conn.lan == true) ? 1 : 0;
+
 	return {
 		label: label,
 		server_ip: server_ip,
@@ -135,11 +146,16 @@ function normalize(conn, keep_user, keep_pass) {
 		tproxy_port: tproxy_port,
 		rpc_port: rpc_port,
 		logging: logging,
+		lan: lan,
 		enabled: (conn.enabled == '0' || conn.enabled == 0 || conn.enabled == false) ? 0 : 1
 	};
 }
 
 // The mieru client config for one connection (upstream example schema).
+// socks5ListenLAN is per-connection opt-in: loopback-only by default, so the
+// SOCKS5 port is not silently usable by every LAN/guest client that can
+// route to it (redsocks and ruantiblock's redsocks backend talk to
+// 127.0.0.1 either way).
 function client_config(c) {
 	if (c.rpc_port == 0) fail('rpc port not assigned (internal)');
 	let bindings = [];
@@ -166,9 +182,22 @@ function client_config(c) {
 		activeProfile: 'default',
 		rpcPort: c.rpc_port,
 		socks5Port: c.socks5_port,
-		socks5ListenLAN: true,
+		socks5ListenLAN: (c.lan == 1) ? true : false,
 		loggingLevel: c.logging
 	};
+}
+
+// Terminal outcome of a (possibly detached) binary install, for the polled
+// status surface: the worker records why it ended, the UI shows it once the
+// "installing" flag drops.
+function load_note(path) {
+	let raw = readfile(path);
+	if (raw) {
+		let d = json(raw);
+		if (type(d) == 'object' && d.ok != null && type(d.msg) == 'string')
+			return d;
+	}
+	return null;
 }
 
 function load_tests(path) {
@@ -209,8 +238,18 @@ if (ARGV[0] == 'check' && (length(ARGV) == 2 || length(ARGV) == 4)) {
 	let d = load_tests(ARGV[1]);
 	d[ARGV[2]] = { ok: (ARGV[3] == '1') ? true : false, ts: (length(ARGV) == 6) ? num(ARGV[5]) : time(), detail: ARGV[4] };
 	print(sprintf('%J\n', d));
+} else if (ARGV[0] == 'note' && length(ARGV) == 2) {
+	let d = load_note(ARGV[1]);
+	if (d) print(sprintf('%J\n', d)); else print('null\n');
+} else if (ARGV[0] == 'note' && (length(ARGV) == 4 || length(ARGV) == 5)) {
+	print(sprintf('%J\n', {
+		ok: (ARGV[2] == '1') ? true : false,
+		msg: ARGV[3],
+		ts: (length(ARGV) == 5) ? num(ARGV[4]) : time()
+	}));
 } else {
 	warn('usage: mieru.uc check <conn.json> [keep-user keep-pass] | config <conn.json>' +
-	     ' | tests <file> | tests <file> <id> <0|1> <detail> [ts]\n');
+	     ' | tests <file> | tests <file> <id> <0|1> <detail> [ts]' +
+	     ' | note <file> | note <file> <0|1> <msg> [ts]\n');
 	exit(1);
 }

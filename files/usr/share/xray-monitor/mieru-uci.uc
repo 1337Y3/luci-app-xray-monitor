@@ -34,5 +34,6 @@ printf('%J\n', {
 	tproxy_port: s.tproxy_port ?? 0,
 	rpc_port: s.rpc_port ?? 0,
 	logging: s.logging ?? '',
+	lan: s.lan ?? '0',
 	enabled: s.enabled ?? '1'
 });

@@ -1003,17 +1003,39 @@ case "$1" in
 			# A ~25 MB GitHub download must not run inside the ubus call:
 			# detach like update_apply (HUP-immune, NOWAIT dropped so the
 			# install can take the mutation lock properly). Progress is
-			# visible to the poll via mieru_get's installing flag + version.
+			# visible to the poll via mieru_get's installing flag + version,
+			# and the terminal outcome lands in mieru_get's install_result.
+			# A second click while one is running reports it instead of
+			# spawning a redundant worker (xray-sub's run marker is the
+			# source of truth - same pid+cmdline guard idea as e2e_running).
 			mieru_install)
-				input=$(cat)
-				ver=$(printf '%s' "$input" | jsonfilter -e '@.version' 2>/dev/null)
-				mkdir -p "$E2E_STATE"
-				sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; exec /usr/share/xray-monitor/xray-sub mieru-install "$1"' sh "$ver" \
-					>"$E2E_STATE/mieru-install.log" 2>&1 </dev/null &
-				json_init
-				json_add_boolean ok 1
-				json_add_string msg "Download started - the version card updates when it finishes."
-				json_dump
+				mpid=0
+				if [ -s "$E2E_STATE/mieru-install.run" ]; then
+					mpid=$(cat "$E2E_STATE/mieru-install.run" 2>/dev/null)
+					case "$mpid" in ''|*[!0-9]*) mpid=0 ;; esac
+					if [ "$mpid" -ge 1 ] && ! (kill -0 "$mpid" 2>/dev/null \
+						&& tr '\0' ' ' < "/proc/$mpid/cmdline" 2>/dev/null | grep -q "xray-sub.*mieru-install"); then
+						rm -f "$E2E_STATE/mieru-install.run"
+						mpid=0
+					fi
+				fi
+				if [ "$mpid" -ge 1 ]; then
+					json_init
+					json_add_boolean ok 1
+					json_add_boolean running 1
+					json_add_string msg "An install is already running"
+					json_dump
+				else
+					input=$(cat)
+					ver=$(printf '%s' "$input" | jsonfilter -e '@.version' 2>/dev/null)
+					mkdir -p "$E2E_STATE"
+					sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; exec /usr/share/xray-monitor/xray-sub mieru-install "$1"' sh "$ver" \
+						>"$E2E_STATE/mieru-install.log" 2>&1 </dev/null &
+					json_init
+					json_add_boolean ok 1
+					json_add_string msg "Download started - the version card updates when it finishes."
+					json_dump
+				fi
 			;;
 			# Semantic diff of the raw editor's text against the LIVE config, as
 			# paths_diff(live, edited) - the save-side twin of config_diff above:

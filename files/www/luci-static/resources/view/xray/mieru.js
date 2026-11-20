@@ -34,8 +34,9 @@ var PORT_TOK = /^[0-9]+(-[0-9]+)?\/(tcp|udp)$/i;
 
 var root = null;
 var state = { binary: { installed: 0, version: '', arch: '', installing: 0 },
-              instances: [], tests: {} };
-var latest = { installed: '', latest: '', checked: 0 };
+              instances: [], tests: {}, install_result: null };
+var latest = { installed: '', latest: '', update_available: 0, checked: 0 };
+var prevInstalling = 0;
 
 function fmtAgo(e) {
 	e = Number(e) || 0; if (!e) return _('never');
@@ -46,7 +47,20 @@ function fmtAgo(e) {
 	return Math.floor(s / 86400) + 'd ' + _('ago');
 }
 function busy(btn, p) { btn.disabled = true; return p.then(function(v) { btn.disabled = false; return v; }, function(e) { btn.disabled = false; throw e; }); }
-function refresh() { return callGet().then(function(r) { if (r && typeof r == 'object') state = r; redraw(); }); }
+function refresh() {
+	return callGet().then(function(r) {
+		if (r && typeof r == 'object') state = r;
+		// the detached install finished: surface its terminal outcome once
+		var nowInstalling = (state.binary && Number(state.binary.installing)) ? 1 : 0;
+		if (prevInstalling && !nowInstalling && state.install_result && Number(state.install_result.ts))
+			ui.addNotification(null, E('p', [
+				E('strong', {}, state.install_result.ok ? _('mieru install: ') : _('mieru install failed: ')),
+				document.createTextNode(state.install_result.msg || _('no details'))
+			]), state.install_result.ok ? 'info' : 'error');
+		prevInstalling = nowInstalling;
+		redraw();
+	});
+}
 function row(k, v) { return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td left', 'width': '28%' }, E('strong', {}, k)), E('td', { 'class': 'td left' }, v) ]); }
 function notify(res, okMsg) {
 	if (res && res.ok) ui.addNotification(null, E('p', okMsg), 'info');
@@ -94,6 +108,8 @@ function connModal(conn) {
 		return f[key];
 	}
 	var portsV = conn ? (conn.ports || '') : '';
+	var lanChk = E('input', { 'type': 'checkbox', 'checked': (conn && Number(conn.lan)) ? '' : null });
+	f.lan = lanChk;
 	var table = E('table', { 'class': 'table' }, [
 		row(_('Label'), inp('label', 'text', conn ? conn.label : '', 'work', '160px')),
 		row(_('Server IP'), inp('server_ip', 'text', conn ? (conn.server_ip || '') : '', '12.34.56.78')),
@@ -105,6 +121,8 @@ function connModal(conn) {
 		row(_('Multiplexing'), sel('multiplexing', MULTIPLEX, conn ? conn.mux : 'MULTIPLEXING_LOW')),
 		row(_('Handshake'), sel('handshake', HANDSHAKE, conn ? conn.hs : 'HANDSHAKE_STANDARD')),
 		row(_('SOCKS5 listen port'), inp('socks5_port', 'text', conn ? String(conn.socks5_port || '') : '', '1080', '100px')),
+		row(_('SOCKS5 on LAN'), E('label', { 'style': 'display:inline-flex;gap:6px;align-items:center;' }, [ lanChk,
+			E('span', {}, _('accept connections from the LAN (default: loopback only)')) ])),
 		row(_('Transparent port (optional)'), inp('tproxy_port', 'text', conn ? (String(conn.tproxy_port || 0) === '0' ? '' : String(conn.tproxy_port)) : '', '12345 (blank = off)', '100px')),
 		row(_('Logging'), sel('logging', LOGLEVELS, conn ? conn.log : 'ERROR'))
 	]);
@@ -141,6 +159,7 @@ function connModal(conn) {
 			handshake: f.handshake.value,
 			socks5_port: Number(sock),
 			tproxy_port: tp ? Number(tp) : 0,
+			lan: lanChk.checked ? 1 : 0,
 			logging: f.logging.value
 		} };
 	}
@@ -176,7 +195,8 @@ function buildBinaryCard() {
 	var rows = [ row(_('Binary'), verCell) ];
 	if (latest.checked)
 		rows.push(row(_('Latest release'), latest.latest
-			? E('span', {}, (latest.latest || '?') + (latest.update_available ? E('span', { 'style': 'color:#cc7a00;' }, '  — ' + _('update available')) : ''))
+			? E('span', {}, [ latest.latest ].concat(latest.update_available
+				? [ E('span', { 'style': 'color:#cc7a00;' }, '  — ' + _('update available')) ] : []))
 			: E('span', { 'style': 'color:#888;' }, _('unreachable'))));
 	var installBtn = E('button', { 'class': 'cbi-button cbi-button-action' },
 		b.installed ? _('Update binary') : _('Install binary'));
@@ -189,7 +209,9 @@ function buildBinaryCard() {
 	checkBtn.addEventListener('click', function() {
 		busy(checkBtn, callCheck().then(function(r) {
 			if (r && typeof r == 'object') {
-				latest = { installed: r.installed || '', latest: r.latest || '', checked: Math.floor(Date.now() / 1000) };
+				latest = { installed: r.installed || '', latest: r.latest || '',
+					update_available: (r.update_available === true || Number(r.update_available) === 1) ? 1 : 0,
+					checked: Math.floor(Date.now() / 1000) };
 				redraw();
 			}
 		}, rpcFail));

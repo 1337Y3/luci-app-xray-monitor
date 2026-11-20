@@ -236,13 +236,15 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 - Independent [mieru](https://github.com/enfein/mieru) proxy clients, one
   **connection** per row: server (IP or domain), server port bindings
   (`2027/tcp`, `2012-2022/udp`, …), credentials, mtu / multiplexing /
-  handshake, and the ports it listens on — a **SOCKS5 port** you choose
-  (usable directly by any SOCKS5 client in your LAN) and an optional
-  **transparent port**. mieru's client serves one profile per process, so
-  each connection runs as its own procd instance
-  (`/etc/init.d/mieru-monitor`); the per-instance management port is assigned
-  automatically (10090+, never colliding with the stats API or another
-  connection).
+  handshake, and the ports it listens on — a **SOCKS5 port** you choose and
+  an optional **transparent port**. The SOCKS5 port binds **loopback only**
+  by default (redsocks and ruantiblock's redsocks backend talk to
+  `127.0.0.1` anyway); tick **SOCKS5 on LAN** to accept connections from the
+  LAN too. mieru's client serves one profile per process, so each connection
+  runs as its own procd instance (`/etc/init.d/mieru-monitor`); the
+  per-instance management port is assigned automatically (10090+, never
+  colliding with the stats API or another connection). Deleting a row stops
+  its instance immediately.
 - The **binary card** installs/updates `/usr/bin/mieru` from upstream's
   GitHub releases (version resolved via the API, tarball verified against the
   published `.sha256.txt`, atomic rename; downloads honor the same
@@ -268,18 +270,24 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
     point ruantiblock's redsocks backend upstream at
     `127.0.0.1:<SOCKS5 port>` and leave the transparent port empty;
   - by hand, a minimal fw4/nftables rule (dstnat on the lan side, private
-    destinations and the mieru server excluded):
+    destinations excluded so the LAN, the router's own LuCI/SSH/DNS and
+    local printers keep working directly):
     ```sh
     nft add rule inet fw4 dstnat_lan tcp dport 1-65535 ip daddr != { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } redirect to :12345
     ```
-  - or the fw3/iptables equivalent:
+    (also exclude your mieru server's address if the SERVER sits inside a
+    range the rule covers — traffic to it must never loop back through the
+    proxy).
+  - or the fw3/iptables equivalent, with the same local-destination
+    exclusions IN the rule (`! -d` is the iptables negation form — without
+    them every connection to the router itself, LuCI and SSH included,
+    would land in the proxy):
     ```sh
-    iptables -t nat -A PREROUTING -i br-lan -p tcp -j REDIRECT --to-ports 12345
+    iptables -t nat -A PREROUTING -i br-lan -p tcp \
+      ! -d 0.0.0.0/8 ! -d 10.0.0.0/8 ! -d 127.0.0.0/8 ! -d 169.254.0.0/16 \
+      ! -d 172.16.0.0/12 ! -d 192.168.0.0/16 ! -d 224.0.0.0/4 ! -d 240.0.0.0/4 \
+      -j REDIRECT --to-ports 12345
     ```
-    (add `-d ! 192.168.0.0/16` style exclusions the same way; never redirect
-    the mieru server's own address/ports — the loop only bites when the
-    router's own outgoing traffic is redirected, which these lan-side rules
-    don't do).
 
 It reads traffic from Xray's built-in **Stats API** over `127.0.0.1:10085`, and
 detects per-outbound connectivity with an active **TCP probe** of each endpoint
