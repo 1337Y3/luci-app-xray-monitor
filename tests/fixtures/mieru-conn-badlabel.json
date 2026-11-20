@@ -1,0 +1,1 @@
+{ "label": "bad label!", "server_ip": "1.2.3.4", "server_ports": ["2027/tcp"], "username": "u", "password": "p", "socks5_port": 1080, "rpc_port": 10090 }

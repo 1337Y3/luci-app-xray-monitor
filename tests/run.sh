@@ -172,8 +172,21 @@ if "$UC" -e 'import * as u from "uci";' >/dev/null 2>&1; then
 	else
 		echo "FAIL   status: staged-only hysteria detected (first fetch on an old core)"; fails=$((fails + 1))
 	fi
+	# mieru-uci.uc: the UCI -> conn bridge (same conditional-module split as
+	# status.uc). The named fixture section keeps the id stable; the config
+	# dir goes to cursor() explicitly - some libuci builds ignore
+	# UCI_CONFIG_DIR, which would silently read the live /etc/config. The
+	# chained config build proves the bridge output is what mieru.uc eats.
+	if "$SHARE/mieru-uci.uc" workconn "$FIX/uci" > "$W/mieru-uci-conn.json" 2>/dev/null; then
+		check "mieru-uci: section serialized verbatim (strings stay strings)" "$EXP/mieru-uci-conn.json" "$W/mieru-uci-conn.json"
+		"$SHARE/mieru.uc" config "$W/mieru-uci-conn.json" > "$W/mieru-uci-config.json" 2>/dev/null
+		check "mieru-uci: chained mieru.uc config builds the client config" "$EXP/mieru-uci-config.json" "$W/mieru-uci-config.json"
+	else
+		echo "FAIL   mieru-uci: bridge exited non-zero"; fails=$((fails + 1))
+	fi
 else
 	echo "SKIP   status.uc serialization (ucode-mod-uci not installed)"
+	echo "SKIP   mieru-uci.uc bridge (ucode-mod-uci not installed)"
 fi
 
 echo "== routing / balancers (task 7: comments survive rewrites)"
@@ -349,6 +362,60 @@ pe_rc "$W/no-such-e2e.json" 1700000500 && echo "PASS   pickexit: absent e2e.json
 	|| { echo "FAIL   pickexit: absent e2e.json rejected"; fails=$((fails + 1)); }
 pe_rc "$FIX/e2e.json" 1700000100 50 && echo "PASS   pickexit: max-age argument honored" \
 	|| { echo "FAIL   pickexit: max-age argument honored"; fails=$((fails + 1)); }
+
+echo "== mieru (connection normalize / client config / test cache)"
+M="$SHARE/mieru.uc"
+"$M" check "$FIX/mieru-conn.json" > "$W/mieru-check.json" 2>/dev/null
+check "mieru check: full connection normalized (proto uppercased)" "$EXP/mieru-check.json" "$W/mieru-check.json"
+"$M" config "$FIX/mieru-conn.json" > "$W/mieru-config.json" 2>/dev/null
+check "mieru config: profile/server/portBindings + ports" "$EXP/mieru-config.json" "$W/mieru-config.json"
+"$M" check "$FIX/mieru-conn-min.json" > "$W/mieru-check-min.json" 2>/dev/null
+check "mieru check: defaults filled (mtu/mux/hs/log/tproxy/enabled)" "$EXP/mieru-check-min.json" "$W/mieru-check-min.json"
+"$M" config "$FIX/mieru-conn-min.json" > "$W/mieru-config-min.json" 2>/dev/null
+check "mieru config: domain-only server, default profile shape" "$EXP/mieru-config-min.json" "$W/mieru-config-min.json"
+# edit path: blank credentials keep the stored ones; enabled=0 survives
+"$M" check "$FIX/mieru-conn-edit.json" kept-user kept-pass > "$W/mieru-check-edit.json" 2>/dev/null
+check "mieru check: keep-args fill blank credentials (edit semantics)" "$EXP/mieru-check-edit.json" "$W/mieru-check-edit.json"
+# rejections: each bad payload names its reason on stderr and exits non-zero
+mieru_rej() {  # <fixture> <expected-stderr-substring>
+	local out rc
+	out=$("$M" check "$FIX/$1" 2>&1); rc=$?
+	if [ "$rc" -eq 0 ]; then
+		echo "FAIL   mieru check: $1 must be rejected"; fails=$((fails + 1))
+	elif printf '%s' "$out" | grep -q "$2"; then
+		echo "PASS   mieru check: $1 rejected ($2)"
+	else
+		echo "FAIL   mieru check: $1 rejected but reason '$2' not found (got: $out)"; fails=$((fails + 1))
+	fi
+}
+mieru_rej mieru-conn-badlabel.json "invalid label"
+mieru_rej mieru-conn-noports.json "at least one server port"
+mieru_rej mieru-conn-badport.json "invalid port token"
+mieru_rej mieru-conn-badmtu.json "mtu must be 1280-1400"
+mieru_rej mieru-conn-nocreds.json "username and password are required"
+# ...and the same payload is fine WITH keep-args (the edit-with-blank-creds case)
+if "$M" check "$FIX/mieru-conn-nocreds.json" u p >/dev/null 2>&1; then
+	echo "PASS   mieru check: blank creds accepted when keep-args given"
+else
+	echo "FAIL   mieru check: blank creds accepted when keep-args given"; fails=$((fails + 1))
+fi
+# config with no assigned rpc port must refuse (the caller assigns one)
+if "$M" config "$FIX/mieru-conn-norpc.json" >/dev/null 2>&1; then
+	echo "FAIL   mieru config: unassigned rpc port must be rejected"; fails=$((fails + 1))
+else
+	echo "PASS   mieru config: unassigned rpc port rejected"
+fi
+# test cache: merge (deterministic ts) then slim dump; absent file -> { }
+"$M" tests "$W/mieru-tests.json" cfg01 1 "test passed" 1700000000 > "$W/mieru-tests-m1.json"
+check "mieru tests: fresh cache" "$EXP/mieru-tests-merge1.json" "$W/mieru-tests-m1.json"
+cp "$W/mieru-tests-m1.json" "$W/mieru-tests.json"
+"$M" tests "$W/mieru-tests.json" cfg02 0 "connect: connection refused" 1700000005 > "$W/mieru-tests-m2.json"
+check "mieru tests: second verdict merged" "$EXP/mieru-tests-merge.json" "$W/mieru-tests-m2.json"
+cp "$W/mieru-tests-m2.json" "$W/mieru-tests.json"
+"$M" tests "$W/mieru-tests.json" > "$W/mieru-tests-dump.json"
+check "mieru tests: slim dump round-trips the cache" "$EXP/mieru-tests-merge.json" "$W/mieru-tests-dump.json"
+"$M" tests "$W/mieru-nosuchfile.json" > "$W/mieru-tests-dump0.json"
+check "mieru tests: missing file -> empty" "$EXP/mieru-tests-dump0.json" "$W/mieru-tests-dump0.json"
 
 echo
 if [ "$fails" -eq 0 ] && [ "$xrayfails" -eq 0 ]; then

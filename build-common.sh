@@ -14,7 +14,7 @@
 # trap for $WORK is installed here. VER lives here, once.
 
 PKG="luci-app-xray-monitor"
-VER="1.24-1"
+VER="1.25-1"
 ARCH="all"
 
 stage_package() {
@@ -48,5 +48,6 @@ stage_package() {
 	chmod 0755 "$WORK/data/usr/libexec/rpcd/xray-monitor"
 	chmod 0755 "$WORK"/data/usr/share/xray-monitor/*.uc \
 	           "$WORK"/data/usr/share/xray-monitor/xray-sub
+	chmod 0755 "$WORK/data/etc/init.d/mieru-monitor"
 	chmod 0755 "$WORK/control/postinst" "$WORK/control/prerm" "$WORK/control/postrm"
 }

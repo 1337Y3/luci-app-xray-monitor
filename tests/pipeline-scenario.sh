@@ -41,6 +41,11 @@
 # opkg stays local and the SHA256 gate stays strict, and the instance being
 # stopped before opkg install. curl / ubus / tmpxray are stubbed there; uci
 # answers come from a file the cases rewrite.
+# The mieru sections cover the Mieru tab's shell surface: mieru-get over an
+# empty and a configured state (stubbed uci answers), mieru-restart handing
+# over to the (stubbed) init script, and mieru-install resolving the version
+# from a stubbed GitHub API, verifying the tarball against its sidecar and
+# replacing the (stubbed) binary atomically - plus the refusal on a bad SHA.
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -71,7 +76,8 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$SB/bin" "$SB/etc/init.d" "$SB/etc/xray" "$SB/state" "$SB/lock" "$SB/log" \
-	"$SB/work" "$SB/tmp" "$SB/share" "$SB/flags" "$SB/tmp/xray-monitor" "$SB/curltab"
+	"$SB/work" "$SB/tmp" "$SB/share" "$SB/flags" "$SB/tmp/xray-monitor" "$SB/curltab" \
+	"$SB/var/etc/xray-monitor/mieru"
 cp -a "$SHARESRC" "$SB/share/xray-monitor"
 
 # The sandboxed copy: same code, every writable path pointed into the sandbox
@@ -88,6 +94,9 @@ sed \
 	-e "s|^LOCK=.*|LOCK=$SB/lock/xray-monitor|" \
 	-e "s|^TLOCK=.*|TLOCK=$SB/lock/xray-monitor-tmpxray|" \
 	-e "s|^TSTATE_DIR=.*|TSTATE_DIR=$SB/tmp/xray-monitor|" \
+	-e "s|^MIERU=.*|MIERU=$SB/bin/mieru|" \
+	-e "s|^MIERU_RUN=.*|MIERU_RUN=$SB/var/etc/xray-monitor/mieru|" \
+	-e "s|^MIERU_INIT=.*|MIERU_INIT=$SB/etc/init.d/mieru-monitor|" \
 	-e "s|echo \"/etc/xray/config.json\"|echo \"$SB/etc/xray/config.json\"|" \
 	-e "s|/etc/init\.d/xray|$SB/etc/init.d/xray|g" \
 	-e "s|/etc/init\.d/cron|$SB/etc/init.d/cron|g" \
@@ -99,6 +108,7 @@ sed \
 	-e 's|^post_restart_hooks() {$|post_restart_hooks() { echo hook >> "${STUB_HOOK_LOG:-/dev/null}";|' \
 	"$SHARESRC/xray-sub" > "$SB/sub"
 for pat in "SHARE=$SB" "STATE=$SB" "XRAY=$SB" "LOCK=$SB" "TLOCK=$SB" "TSTATE_DIR=$SB" \
+	"MIERU=$SB" "MIERU_RUN=$SB" "MIERU_INIT=$SB" \
 	"$SB/etc/xray/config.json" "$SB/etc/init.d/xray" "$SB/etc/crontabs/root" \
 	"$SB/etc/init.d/cron" "STUB_HOOK_LOG"; do
 	grep -q -- "$pat" "$SB/sub" || { echo "scenario setup failed, rewrite missed: $pat"; exit 1; }
@@ -106,10 +116,11 @@ done
 # safety net: mask the sandbox references (and the /etc, /tmp they cover),
 # then no live writable path may remain in the copy - including the real
 # /var/lock and /tmp/xray-monitor that TLOCK / TSTATE_DIR would otherwise use
-sed -e "s|$SB|<SB>|g" -e 's|<SB>/etc||g' -e 's|<SB>/tmp||g' "$SB/sub" > "$SB/work/sub-check.txt"
+sed -e "s|$SB|<SB>|g" -e 's|<SB>/etc||g' -e 's|<SB>/tmp||g' -e 's|<SB>/var/etc||g' "$SB/sub" > "$SB/work/sub-check.txt"
 if grep -q 'echo "/etc/xray' "$SB/work/sub-check.txt" \
 	|| grep -Eq '/etc/(init\.d|xray|crontabs)' "$SB/work/sub-check.txt" \
-	|| grep -q '/var/lock' "$SB/work/sub-check.txt" \
+	|| grep -Eq '/var/(lock|etc)' "$SB/work/sub-check.txt" \
+	|| grep -q '/usr/bin/mieru' "$SB/work/sub-check.txt" \
 	|| grep -q '/tmp/luci-app' "$SB/work/sub-check.txt" \
 	|| grep -q '/tmp/xray-monitor' "$SB/work/sub-check.txt"; then
 	echo "scenario setup failed: a live writable path is still reachable in the copy"; exit 1
@@ -399,6 +410,9 @@ for a in "$@"; do
 	case "$a" in http://*|https://*) url="$a" ;; esac
 done
 case "$url" in
+	*.sha256.txt)    body="${STUB_CURL_MIERU_SHA:-}" ;;
+	*mieru*.tar.gz)  body="${STUB_CURL_MIERU_TGZ:-}" ;;
+	*api.github.com*) body="${STUB_CURL_GHJSON:-}" ;;
 	*.sha256)  body="${STUB_CURL_SHA256:-}" ;;
 	*.ipk)     body="${STUB_CURL_IPK:-}" ;;
 	*.apk)     body="${STUB_CURL_APK:-}" ;;
@@ -480,9 +494,27 @@ echo "$*" >> "${STUB_INITD_LOG:-/dev/null}"
 exit 0
 EOF
 cp "$SB/etc/init.d/xray" "$SB/etc/init.d/cron"
+cat > "$SB/bin/mieru" <<'EOF'
+#!/bin/sh
+# mieru stub: `version` serves $STUB_MIERU_VERSION, `test` answers from a
+# flag, everything is logged - enough for mieru-get / mieru-test coverage
+# without shipping the real ~25 MB Go binary into the sandbox.
+echo "mieru $*" >> "${STUB_MIERU_LOG:-/dev/null}"
+if [ "$1" = version ]; then
+	printf 'mieru version %s\n' "${STUB_MIERU_VERSION:-3.39.0}"
+	exit 0
+fi
+if [ "$1" = test ]; then
+	[ -f "${STUB_MIERU_TEST_FAIL:-/nonexistent}" ] && { echo "stub: test failed"; exit 1; }
+	echo "It worked! (stub)"
+	exit 0
+fi
+exit 0
+EOF
+cp "$SB/etc/init.d/xray" "$SB/etc/init.d/mieru-monitor"
 chmod 0755 "$SB/bin/xray" "$SB/bin/pgrep" "$SB/bin/uci" "$SB/bin/opkg" "$SB/bin/apk" \
-	"$SB/bin/netstat" "$SB/bin/ubus" "$SB/bin/curl" \
-	"$SB/etc/init.d/xray" "$SB/etc/init.d/cron" "$SB/sub"
+	"$SB/bin/netstat" "$SB/bin/ubus" "$SB/bin/curl" "$SB/bin/mieru" \
+	"$SB/etc/init.d/xray" "$SB/etc/init.d/cron" "$SB/etc/init.d/mieru-monitor" "$SB/sub"
 touch "$SB/lock/xray-monitor"
 
 export TMPDIR="$SB/tmp"
@@ -522,6 +554,13 @@ export STUB_TMPXRAY_FAIL="$SB/flags/tmpxray-fail"
 export STUB_APK_OWNS="$SB/flags/apk-owns"
 export STUB_CURL_FAIL_ALL="$SB/flags/curl-fail-all"
 export STUB_CURL_DIRECT_DOWN="$SB/flags/curl-direct-down"
+# mieru tab: stub binary version/log/test-fail flag + the install payloads
+export STUB_MIERU_VERSION="3.39.0"
+export STUB_MIERU_LOG="$SB/log/mieru.log"
+export STUB_MIERU_TEST_FAIL="$SB/flags/mieru-test-fail"
+export STUB_CURL_GHJSON="$SB/work/gh-latest.json"
+export STUB_CURL_MIERU_TGZ="$SB/work/fake-mieru.tar.gz"
+export STUB_CURL_MIERU_SHA="$SB/work/fake-mieru.tar.gz.sha256.txt"
 mkdir -p "$SB/api"
 : > "$STUB_LOG"; : > "$STUB_HOOK_LOG"; : > "$STUB_INITD_LOG"; : > "$STUB_OPKG_LOG"; : > "$STUB_API_OB"; : > "$STUB_API_LOG"
 : > "$STUB_UBUS_LOG"; : > "$STUB_CURL_LOG"; : > "$STUB_TMPXRAY_LOG"
@@ -541,6 +580,14 @@ printf 'ADBd-scenario-fake-apk-container' > "$STUB_CURL_APK"
 sha=$(sha256sum "$STUB_CURL_IPK" 2>/dev/null | awk '{ print $1 }')
 printf '%s  luci-app-xray-monitor.ipk\n' "$sha" > "$STUB_CURL_SHA256"
 printf 'Package: luci-app-xray-monitor\nVersion: 9.9.9-1\nFilename: luci-app-xray-monitor.ipk\nSHA256sum: %s\n' "$sha" > "$STUB_CURL_PACKAGES"
+# a mieru release the curl stub can serve: the GitHub API reply, a tar.gz
+# carrying a `mieru` binary (one that answers `version`), and its sidecar
+mkdir -p "$SB/work/fake-mieru"
+printf '#!/bin/sh\nif [ "$1" = version ]; then printf "mieru version 9.9.9\\n"; exit 0; fi\nexit 0\n' > "$SB/work/fake-mieru/mieru"
+tar -czf "$STUB_CURL_MIERU_TGZ" -C "$SB/work/fake-mieru" mieru 2>/dev/null
+msha=$(sha256sum "$STUB_CURL_MIERU_TGZ" 2>/dev/null | awk '{ print $1 }')
+printf '%s  mieru_3.39.0_linux_amd64.tar.gz\n' "$msha" > "$STUB_CURL_MIERU_SHA"
+printf '{"tag_name":"v3.39.0"}\n' > "$STUB_CURL_GHJSON"
 
 CFG="$SB/etc/xray/config.json"
 fails=0
@@ -1221,6 +1268,7 @@ else
 	# writable path it names (the self-update log) rewritten too.
 	sed \
 		-e "s|^XRAY=.*|XRAY=$SB/bin/xray|" \
+		-e "s|^MIERU=.*|MIERU=$SB/bin/mieru|" \
 		-e "s|^SHARE=.*|SHARE=$SB/share/xray-monitor|" \
 		-e "s|^SUB=.*|SUB=$SB/sub|" \
 		-e "s|^E2E_STATE=.*|E2E_STATE=$SB/tmp/xray-monitor|" \
@@ -1230,7 +1278,7 @@ else
 		-e "s|echo \"/etc/xray/config.json\"|echo \"$SB/etc/xray/config.json\"|" \
 		"$REPO/files/usr/libexec/rpcd/xray-monitor" > "$SB/rpcd"
 	cp /usr/share/libubox/jshn.sh "$SB/work/jshn.sh"
-	for pat in "XRAY=$SB/bin/xray" "SHARE=$SB/share" "SUB=$SB/sub" "$SB/work/jshn.sh" "$SB/etc/xray/config.json"; do
+	for pat in "XRAY=$SB/bin/xray" "MIERU=$SB/bin/mieru" "SHARE=$SB/share" "SUB=$SB/sub" "$SB/work/jshn.sh" "$SB/etc/xray/config.json"; do
 		grep -q -- "$pat" "$SB/rpcd" || { echo "scenario setup failed, rpcd rewrite missed: $pat"; exit 1; }
 	done
 	# safety net, same masking as for the sub copy: with the sandbox references
@@ -1598,6 +1646,53 @@ is "upd(apk): downloaded file cleaned up" "$([ ! -e "$SB/tmp/luci-app-xray-monit
 printf '%s\n' "xray-monitor.sub=xray-monitor" "xray-monitor.sub.backup_keep='3'" > "$STUB_UCI"
 rm -f "$STUB_TMPXRAY_FAIL" "$STUB_CURL_FAIL_ALL" "$STUB_CURL_DIRECT_DOWN"
 unset STUB_TMPXRAY_OVERRIDE
+
+echo "== mieru tab: status surface, service restart, binary install"
+# mieru-get over an empty configuration: binary card (stub present, version
+# parsed) and no instances
+out=$(runsub mieru-get 2>/dev/null)
+is "mieru: get reports the stub binary installed" "$(printf '%s' "$out" | grep -q '"installed":1,"version":"3.39.0"' && echo 1 || echo 0)"
+is "mieru: get with no sections lists no instances" "$(printf '%s' "$out" | grep -q '"instances":\[\]' && echo 1 || echo 0)"
+# one configured connection (uci stub answers): row fields surface, running
+# stays 0 (no runtime config, no listener - the netstat stub answers nothing)
+cat > "$STUB_UCI" <<EOF
+xray-monitor.sub=xray-monitor
+xray-monitor.sub.backup_keep='3'
+xray-monitor.cfg0001=mieru
+xray-monitor.cfg0001.label='work'
+xray-monitor.cfg0001.server_ip='12.34.56.78'
+xray-monitor.cfg0001.server_ports='2027/TCP 2012-2022/TCP'
+xray-monitor.cfg0001.socks5_port='1080'
+xray-monitor.cfg0001.tproxy_port='12345'
+xray-monitor.cfg0001.rpc_port='10090'
+xray-monitor.cfg0001.enabled='1'
+EOF
+out=$(runsub mieru-get 2>/dev/null)
+is "mieru: get lists the configured connection" "$(printf '%s' "$out" | grep -q '"id":"cfg0001","label":"work"' && echo 1 || echo 0)"
+is "mieru: get surfaces ports + listen ports" "$(printf '%s' "$out" | grep -q '"ports":"2027/TCP 2012-2022/TCP","socks5_port":1080,"tproxy_port":12345' && echo 1 || echo 0)"
+is "mieru: not-running connection reads running 0" "$(printf '%s' "$out" | grep -q '"running":0' && echo 1 || echo 0)"
+# mieru-restart hands over to the init script (and only to it)
+r0=$(restarts)
+out=$(runsub mieru-restart 2>/dev/null); rc=$?
+ok_eq "mieru: restart rc" 0 "$rc"
+ok_eq "mieru: restart invoked the mieru-monitor init script once" "$((r0 + 1))" "$(restarts)"
+# mieru-install: version resolved from the stubbed GitHub API, tarball +
+# sidecar downloaded direct, SHA256 gate passes, binary replaced atomically
+: > "$STUB_CURL_LOG"
+out=$(runsub mieru-install 2>/dev/null); rc=$?
+ok_eq "mieru: install rc" 0 "$rc"
+is "mieru: install reports the version + restart hint" "$(printf '%s' "$out" | grep -q 'installed mieru 3.39.0' && echo 1 || echo 0)"
+ok_eq "mieru: install fetched api + tarball + sidecar (all direct)" 3 "$(grep -c 'socks=0' "$STUB_CURL_LOG")"
+is "mieru: install replaced the binary at \$MIERU" "$("$SB/bin/mieru" version 2>/dev/null | grep -q 'mieru version 9.9.9' && echo 1 || echo 0)"
+# a corrupted sidecar must refuse to install and leave the binary alone
+printf '%s  mieru_3.39.0_linux_amd64.tar.gz\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$STUB_CURL_MIERU_SHA"
+out=$(runsub mieru-install 2>/dev/null); rc=$?
+ok_eq "mieru: install with bad SHA rc" 1 "$rc"
+is "mieru: install with bad SHA refuses with the mismatch reason" "$(printf '%s' "$out" | grep -q '^SHA256 mismatch' && echo 1 || echo 0)"
+is "mieru: bad SHA leaves the installed binary in place" "$("$SB/bin/mieru" version 2>/dev/null | grep -q 'mieru version 9.9.9' && echo 1 || echo 0)"
+# restore the good sidecar + the default uci answers
+printf '%s  mieru_3.39.0_linux_amd64.tar.gz\n' "$msha" > "$STUB_CURL_MIERU_SHA"
+printf '%s\n' "xray-monitor.sub=xray-monitor" "xray-monitor.sub.backup_keep='3'" > "$STUB_UCI"
 
 echo
 if [ "$fails" -eq 0 ]; then

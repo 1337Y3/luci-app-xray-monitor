@@ -85,5 +85,16 @@
 		"depends": {
 			"acl": [ "luci-app-xray-monitor" ]
 		}
+	},
+	"admin/services/xray-monitor/mieru": {
+		"title": "Mieru",
+		"order": 8,
+		"action": {
+			"type": "view",
+			"path": "xray/mieru"
+		},
+		"depends": {
+			"acl": [ "luci-app-xray-monitor" ]
+		}
 	}
 }

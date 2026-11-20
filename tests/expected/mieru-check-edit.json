@@ -1,0 +1,1 @@
+{ "label": "home", "server_ip": "", "server_domain": "m2.example.org", "ports": [ "8964/TCP", "8965-8966/UDP" ], "username": "kept-user", "password": "kept-pass", "mtu": 1400, "multiplexing": "MULTIPLEXING_LOW", "handshake": "HANDSHAKE_STANDARD", "socks5_port": 1081, "tproxy_port": 0, "rpc_port": 10091, "logging": "ERROR", "enabled": 0 }

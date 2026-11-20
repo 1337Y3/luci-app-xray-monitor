@@ -22,7 +22,8 @@ Maintainer: vinli
 Description:  LuCI app to monitor and manage Xray: service status, live per-inbound
   and per-outbound traffic + rates (Stats API), per-outbound connectivity, rolling
   throughput graphs, a Remnawave subscription parser that auto-stages outbound
-  updates, and exit-routing controls. Pages under Services -> Xray Monitor.
+  updates, exit-routing controls, and a mieru proxy client tab (per-connection
+  SOCKS5 + transparent ports). Pages under Services -> Xray Monitor.
 CONTROL_EOF
 
 # Force uid/gid 0 in the archives so the package installs as root no matter where

@@ -43,11 +43,12 @@ Bump `VER` in `build-common.sh`, merge to `main`, push. CI's build job builds ap
 
 `files/` and `CONTROL/` are tarred into the .ipk verbatim by `build-ipk.sh` (which also chmods the executables — new executables must be added there):
 
-- `files/www/luci-static/resources/view/xray/*.js` — LuCI client-side views (Overview, Graphs, Subscriptions, Routing, Balancers, Backups, Config); `../xray-diff.js` is the shared diff renderer. All UI logic is client-side and talks to ubus methods.
+- `files/www/luci-static/resources/view/xray/*.js` — LuCI client-side views (Overview, Graphs, Subscriptions, Routing, Balancers, Backups, Config, Mieru); `../xray-diff.js` is the shared diff renderer. All UI logic is client-side and talks to ubus methods.
 - `files/usr/libexec/rpcd/xray-monitor` — rpcd backend (POSIX sh + jshn): ubus object `xray-monitor`. **Every ubus method must also be listed in `files/usr/share/rpcd/acl.d/luci-app-xray-monitor.json`** (read vs write group; the scenario test checks list/ACL consistency). Tabs/menu live in `files/usr/share/luci/menu.d/`.
 - `files/usr/share/xray-monitor/xray-sub` (~1700 lines, sh) — the workhorse: fetch/apply, subscription CRUD, routing/balancers/config save, `enable-api`, `e2e` exit checks, `tmpxray` (temporary one-exit socks xray for e2e and proxied fetches), backups, self-update, `cron-sync`. Every mutating command serializes on `flock /var/lock/xray-monitor` held on fd 3; tmpxray start/stop use their own mini-lock on fd 4. Children meant to outlive the script (tmpxray instance, watchdog) must close fd 3/4 or they hold the lock hostage.
-- `files/usr/share/xray-monitor/*.uc` — ucode JSON transforms, each a standalone CLI covered by the golden tests. Exceptions: `render.uc` is a shared module imported by apply/routing/balancers (no shebang — the module compiler rejects `#`), and `status.uc` imports uci so it is deliberately not golden-tested.
+- `files/usr/share/xray-monitor/*.uc` — ucode JSON transforms, each a standalone CLI covered by the golden tests. Exceptions: `render.uc` is a shared module imported by apply/routing/balancers (no shebang — the module compiler rejects `#`), and `status.uc` / `mieru-uci.uc` import uci so they are golden-tested only where ucode-mod-uci exists (router; CI skips them — its ucode is built without integration modules).
 - `files/etc/config/xray-monitor` — UCI defaults, options documented inline.
+- `files/etc/init.d/mieru-monitor` — procd service for the Mieru tab: regenerates per-connection runtime configs into `/var/etc/xray-monitor/mieru/` from UCI (UCI is the only source of truth) and runs one `mieru run` instance per enabled connection, plus a redsocks listener when `tproxy_port` is set.
 
 ## Architecture
 
@@ -66,11 +67,16 @@ fetch → `parse.uc` (subscription JSON → outbounds with stable `<prefix>-<bas
 
 Note the argv order difference: `diff.uc` takes `<staged> <config>` (staged first), while `hotswap.uc plan` takes `<installed> <candidate>` (old config first).
 
+### Mieru subsystem (independent of xray's config)
+
+The Mieru tab manages **mieru** proxy clients as a parallel subsystem: one UCI `mieru` section = one connection = one `mieru run` process (upstream's client serves a single profile + socks5 port per process). `xray-sub` owns the CRUD/status/test/install commands (`mieru-get|mieru-add|mieru-edit|mieru-del|mieru-restart|mieru-test|mieru-install|mieru-latest`; the mutating ones take the fd 3 lock like every writer), `mieru.uc` is the pure normalize/client-config transform (golden-tested) and `mieru-uci.uc` the tiny UCI bridge that feeds it. mieru has **no transparent inbound** — a transparent port is a redsocks listener the init script starts next to the instance (soft dependency: absent redsocks is logged, not fatal). The app writes **no firewall rules** (policy since 1.20): whatever redirects traffic (ruantiblock, hand-written nft/iptables) aims at the transparent or SOCKS5 port. `mieru-install` downloads upstream's GitHub release (arch from `uname -m`), verifies the `.sha256.txt` sidecar and installs atomically to `/usr/bin/mieru`; per-instance management ports are auto-assigned in 10090–10199, clear of the stats API (10085). Credentials never echo back: `mieru-get` omits them and blank username/password on edit means "keep" (the sub-edit convention).
+
 ### State locations
 
-- `/etc/config/xray-monitor` (UCI) — settings, `subscription` sections, sticky balancer pins.
+- `/etc/config/xray-monitor` (UCI) — settings, `subscription` sections, `mieru` connections, sticky balancer pins.
 - `/etc/xray-monitor/` — persistent state: tagmap.json, staged.json, overrides.json.
-- `/tmp/xray-monitor/` — volatile: `e2e.json` (+ run markers), tmpxray state.
+- `/tmp/xray-monitor/` — volatile: `e2e.json` (+ run markers), tmpxray state, mieru test cache + install run marker.
+- `/var/etc/xray-monitor/mieru/` — regenerated mieru runtime configs (`<id>.json`, `redsocks-<id>.conf`) — tmpfs, rebuilt from UCI on every service start.
 - Xray Stats API expected at `127.0.0.1:10085` (`API_SERVER` in the rpcd backend); `enable-api.uc` merges it into configs lacking it (postinst runs it unless `auto_enable_api '0'`).
 
 ## Hard constraints
