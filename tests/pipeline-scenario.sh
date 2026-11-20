@@ -333,6 +333,7 @@ while [ $# -gt 0 ]; do
 			# uci set xray-monitor.<sec>.<opt>=<val> (upsert into $RW)
 			[ -f "$RW" ] || exit 1
 			case "$2" in xray-monitor.*.*) ;; *) exit 1 ;; esac
+			[ -f "${STUB_UCI_SET_FAIL:-/nonexistent}" ] && exit 1
 			key=${2%%=*}; val=${2#*=}
 			grep -v "^$(printf '%s' "$key" | sed 's/[.]/\\./g')=" "$RW" > "$RW.tmp"
 			printf "%s='%s'\n" "$key" "$val" >> "$RW.tmp"
@@ -341,6 +342,7 @@ while [ $# -gt 0 ]; do
 		add_list)
 			[ -f "$RW" ] || exit 1
 			case "$2" in xray-monitor.*.*) ;; *) exit 1 ;; esac
+			[ -f "${STUB_UCI_SET_FAIL:-/nonexistent}" ] && exit 1
 			key=${2%%=*}; val=${2#*=}
 			printf "%s='%s'\n" "$key" "$val" >> "$RW"
 			exit 0 ;;
@@ -356,7 +358,14 @@ while [ $# -gt 0 ]; do
 			esac
 			mv "$RW.tmp" "$RW"
 			exit 0 ;;
-		commit) exit 0 ;;
+		commit)
+			# snapshot the RW state: revert below restores exactly this, the
+			# way the real uci reverts uncommitted deltas only
+			[ -f "$RW" ] && cp "$RW" "${RW}.commit" 2>/dev/null
+			exit 0 ;;
+		revert)
+			[ -f "${RW}.commit" ] && cp "${RW}.commit" "$RW" 2>/dev/null
+			exit 0 ;;
 		*) ;;
 	esac
 	shift
@@ -531,6 +540,14 @@ echo "$*" >> "${STUB_INITD_LOG:-/dev/null}"
 exit 0
 EOF
 cp "$SB/etc/init.d/xray" "$SB/etc/init.d/cron"
+cat > "$SB/etc/init.d/mieru-monitor" <<'EOF'
+#!/bin/sh
+# init script stub (mieru): logs like the xray one, but $STUB_INITD_MIERU_FAIL
+# models a restart failure so the delete path has to surface it
+echo "$*" >> "${STUB_INITD_LOG:-/dev/null}"
+[ -f "${STUB_INITD_MIERU_FAIL:-/nonexistent}" ] && exit 1
+exit 0
+EOF
 cat > "$SB/bin/mieru" <<'EOF'
 #!/bin/sh
 # mieru stub: `version` serves $STUB_MIERU_VERSION, `test` answers from a
@@ -548,7 +565,6 @@ if [ "$1" = test ]; then
 fi
 exit 0
 EOF
-cp "$SB/etc/init.d/xray" "$SB/etc/init.d/mieru-monitor"
 chmod 0755 "$SB/bin/xray" "$SB/bin/pgrep" "$SB/bin/uci" "$SB/bin/opkg" "$SB/bin/apk" \
 	"$SB/bin/netstat" "$SB/bin/ubus" "$SB/bin/curl" "$SB/bin/mieru" \
 	"$SB/etc/init.d/xray" "$SB/etc/init.d/cron" "$SB/etc/init.d/mieru-monitor" "$SB/sub"
@@ -595,6 +611,9 @@ export STUB_CURL_DIRECT_DOWN="$SB/flags/curl-direct-down"
 export STUB_MIERU_VERSION="3.39.0"
 export STUB_MIERU_LOG="$SB/log/mieru.log"
 export STUB_MIERU_TEST_FAIL="$SB/flags/mieru-test-fail"
+# uci write-failure and init-restart-failure flags for the CRUD cases
+export STUB_UCI_SET_FAIL="$SB/flags/uci-set-fail"
+export STUB_INITD_MIERU_FAIL="$SB/flags/initd-mieru-fail"
 export STUB_CURL_GHJSON="$SB/work/gh-latest.json"
 export STUB_CURL_MIERU_TGZ="$SB/work/fake-mieru.tar.gz"
 export STUB_CURL_MIERU_SHA="$SB/work/fake-mieru.tar.gz.sha256.txt"
@@ -1493,8 +1512,12 @@ EOF
 	out=$(rpccall out_meta)
 	ok_eq "out_meta: vless exit listed first (config order)" "proxy-fi" "$(jget "$out" '@.outbounds[0].tag')"
 	ok_eq "out_meta: hysteria flat-settings exit listed" "proxy-h2" "$(jget "$out" '@.outbounds[1].tag')"
-	is "out_meta: dns outbound not an exit" "$(printf '%s' "$out" | grep -q dns-out && echo 1 || echo 0)" 0
-	is "out_meta: freedom not an exit" "$(printf '%s' "$out" | grep -q direct && echo 1 || echo 0)" 0
+	# want 0 = the tag must NOT appear. These two asserts shipped inverted in
+	# #7 (`is name computed 0` - the trailing expected value is ignored by
+	# is(), so they passed only when the tag WAS present, i.e. when the
+	# discovery was broken), which left every CI leg since that merge red.
+	ok_eq "out_meta: dns outbound not an exit" 0 "$(printf '%s' "$out" | grep -q dns-out && echo 1 || echo 0)"
+	ok_eq "out_meta: freedom not an exit" 0 "$(printf '%s' "$out" | grep -q direct && echo 1 || echo 0)"
 	reset_cfg
 fi
 echo "== fetch/self-update via xray (F18): exit selection order + honest proxy failures"
@@ -1750,14 +1773,18 @@ echo "== mieru tab: CRUD round through the real handlers (stubbed uci writes)"
 # deleting one row leaves the other row's rpc port alone.
 export STUB_UCI_RW="$SB/work/uci-rw.txt"
 cp "$STUB_UCI" "$STUB_UCI_RW"
+cp "$STUB_UCI" "${STUB_UCI_RW}.commit"
 cat > "$SB/work/mieru-crud1.json" <<'EOJ'
-{ "label": "zz1", "server_ip": "10.99.99.99", "server_ports": ["2027/tcp"], "username": "u", "password": "p", "socks5_port": 1080 }
+{ "label": "zz1", "server_ip": "10.99.99.99", "server_ports": ["2027/tcp"], "username": "u", "password": "p", "socks5_port": 1080, "lan": 1 }
 EOJ
 cat > "$SB/work/mieru-crud2.json" <<'EOJ'
 { "label": "zz2", "server_domain": "zz.example.org", "server_ports": ["2028/tcp"], "username": "u", "password": "p", "socks5_port": 1081 }
 EOJ
 cat > "$SB/work/mieru-crud3.json" <<'EOJ'
 { "label": "zz3", "server_ip": "10.99.99.98", "server_ports": ["2029/tcp"], "username": "u", "password": "p", "socks5_port": 10092 }
+EOJ
+cat > "$SB/work/mieru-crud4.json" <<'EOJ'
+{ "label": "zz4", "server_ip": "10.99.99.97", "server_ports": ["2030/tcp"], "username": "u", "password": "p", "socks5_port": 1083 }
 EOJ
 cat > "$SB/work/mieru-crud1b.json" <<'EOJ'
 { "label": "zz1", "server_ip": "10.99.99.99", "server_ports": ["2027/tcp"], "username": "u", "password": "p", "socks5_port": 1082 }
@@ -1780,6 +1807,9 @@ is "mieru crud: get lists both rows by their stable cfg ids" \
 	"$(printf '%s' "$out" | grep -q "\"id\":\"$id1\",\"label\":\"zz1\"" && printf '%s' "$out" | grep -q "\"id\":\"$id2\",\"label\":\"zz2\"" && echo 1 || echo 0)"
 ok_eq "mieru crud: first rpc port allocated" 10090 "$(printf '%s' "$(mrow "$id1" "$out")" | mrpc)"
 ok_eq "mieru crud: second rpc port allocated" 10091 "$(printf '%s' "$(mrow "$id2" "$out")" | mrpc)"
+# the lan opt-in survives the write path (checked BEFORE the edit below,
+# whose payload does not carry lan and therefore replaces it with 0)
+is "mieru crud: lan opt-in persisted" "$(printf '%s' "$(mrow "$id1" "$out")" | grep -q '\"lan\":1' && echo 1 || echo 0)"
 # the rpc allocator must dodge the NEW connection's own listen port too
 out=$(runsub mieru-add "$SB/work/mieru-crud3.json" 2>/dev/null)
 ok_eq "mieru add: rpc port dodges the connection's own socks5 port" 10093 \
@@ -1802,6 +1832,23 @@ is "mieru test: honest not-running reason" "$(printf '%s' "$out" | grep -q 'not 
 out=$(runsub mieru-test sub 2>/dev/null); rc=$?
 ok_eq "mieru test: non-mieru section id rejected rc" 1 "$rc"
 is "mieru test: non-mieru section id rejected" "$(printf '%s' "$out" | grep -q 'no such connection' && echo 1 || echo 0)"
+# connection behind a later commit, the UI hears the failure
+touch "$STUB_UCI_SET_FAIL"
+out=$(runsub mieru-add "$SB/work/mieru-crud4.json" 2>/dev/null); rc=$?
+rm -f "$STUB_UCI_SET_FAIL"
+ok_eq "mieru add: partial write rc" 1 "$rc"
+is "mieru add: partial write reports the rollback" "$(printf '%s' "$out" | grep -q 'nothing changed' && echo 1 || echo 0)"
+out=$(runsub mieru-get 2>/dev/null)
+is "mieru add: partial write leaves no section behind" "$(printf '%s' "$out" | grep -q 'zz4' && echo 0 || echo 1)"
+# a delete whose service restart FAILS still reports the failure distinctly
+# (the UCI deletion stands; the user must press Restart)
+touch "$STUB_INITD_MIERU_FAIL"
+out=$(runsub mieru-del "$id3" 2>/dev/null); rc=$?
+rm -f "$STUB_INITD_MIERU_FAIL"
+ok_eq "mieru del: failed restart rc" 1 "$rc"
+is "mieru del: failed restart surfaces the distinct reason" "$(printf '%s' "$out" | grep -q 'restart failed - press Restart' && echo 1 || echo 0)"
+out=$(runsub mieru-get 2>/dev/null)
+is "mieru del: UCI deletion stood despite the failed restart" "$(printf '%s' "$out" | grep -q 'zz3' && echo 0 || echo 1)"
 # delete: type guard first, then a real row; the survivor keeps its rpc port
 out=$(runsub mieru-del sub 2>/dev/null); rc=$?
 ok_eq "mieru del: the main sub section is untouchable rc" 1 "$rc"
@@ -1812,12 +1859,11 @@ out=$(runsub mieru-get 2>/dev/null)
 is "mieru del: deleted row gone, survivor intact" \
 	"$(printf '%s' "$out" | grep -q "\"id\":\"$id2\",\"label\":\"zz2\"" && printf '%s' "$(mrow "$id2" "$out")" | mrpc | grep -qx 10091 && echo 1 || echo 0)"
 runsub mieru-del "$id2" >/dev/null 2>&1
-runsub mieru-del "$id3" >/dev/null 2>&1
 is "mieru del: everything removed -> no instances" "$(runsub mieru-get 2>/dev/null | grep -q '"instances":\[\]' && echo 1 || echo 0)"
 out=$(runsub mieru-del cfg9999 2>/dev/null); rc=$?
 ok_eq "mieru del: unknown id rejected rc" 1 "$rc"
 unset STUB_UCI_RW
-rm -f "$SB/work/uci-rw.txt" "$SB/work/uci-rw.txt.n"
+rm -f "$SB/work/uci-rw.txt" "$SB/work/uci-rw.txt.n" "$SB/work/uci-rw.txt.commit"
 
 echo
 if [ "$fails" -eq 0 ]; then

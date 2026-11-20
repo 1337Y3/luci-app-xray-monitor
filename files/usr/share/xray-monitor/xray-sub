@@ -1381,26 +1381,31 @@ mieru_label_taken() {  # <label> <exclude-id>: prints the id holding it
 	return 1
 }
 
-# Write a normalized conn (mieru.uc check output) into a UCI section. The
-# rpc_port / enabled pair is the caller's business (add assigns a fresh rpc
-# port, edit keeps a still-valid one).
+# Write a normalized conn (mieru.uc check output) into a UCI section. Every
+# payload write is checked: one failed set must not leave a half-written
+# connection behind a later successful commit (the initial list delete is
+# deliberately tolerant - a fresh section has nothing to delete, and uci
+# reports "not found" there). The rpc_port / enabled pair is the caller's
+# business (add assigns a fresh rpc port, edit keeps a still-valid one).
 mieru_write_uci() {  # <section-id> <norm-file>
 	local f="$2" v
-	uci set "xray-monitor.$1.label=$(jsonfilter -i "$f" -e '@.label' 2>/dev/null)"
-	uci set "xray-monitor.$1.server_ip=$(jsonfilter -i "$f" -e '@.server_ip' 2>/dev/null)"
-	uci set "xray-monitor.$1.server_domain=$(jsonfilter -i "$f" -e '@.server_domain' 2>/dev/null)"
-	uci -q delete "xray-monitor.$1.server_ports"
+	uci set "xray-monitor.$1.label=$(jsonfilter -i "$f" -e '@.label' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.server_ip=$(jsonfilter -i "$f" -e '@.server_ip' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.server_domain=$(jsonfilter -i "$f" -e '@.server_domain' 2>/dev/null)" || return 1
+	uci -q delete "xray-monitor.$1.server_ports" 2>/dev/null
 	for v in $(jsonfilter -i "$f" -e '@.ports[*]' 2>/dev/null); do
-		uci add_list "xray-monitor.$1.server_ports=$v"
+		uci add_list "xray-monitor.$1.server_ports=$v" || return 1
 	done
-	uci set "xray-monitor.$1.username=$(jsonfilter -i "$f" -e '@.username' 2>/dev/null)"
-	uci set "xray-monitor.$1.password=$(jsonfilter -i "$f" -e '@.password' 2>/dev/null)"
-	uci set "xray-monitor.$1.mtu=$(jsonfilter -i "$f" -e '@.mtu' 2>/dev/null)"
-	uci set "xray-monitor.$1.multiplexing=$(jsonfilter -i "$f" -e '@.multiplexing' 2>/dev/null)"
-	uci set "xray-monitor.$1.handshake=$(jsonfilter -i "$f" -e '@.handshake' 2>/dev/null)"
-	uci set "xray-monitor.$1.socks5_port=$(jsonfilter -i "$f" -e '@.socks5_port' 2>/dev/null)"
-	uci set "xray-monitor.$1.tproxy_port=$(jsonfilter -i "$f" -e '@.tproxy_port' 2>/dev/null)"
-	uci set "xray-monitor.$1.logging=$(jsonfilter -i "$f" -e '@.logging' 2>/dev/null)"
+	uci set "xray-monitor.$1.username=$(jsonfilter -i "$f" -e '@.username' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.password=$(jsonfilter -i "$f" -e '@.password' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.mtu=$(jsonfilter -i "$f" -e '@.mtu' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.multiplexing=$(jsonfilter -i "$f" -e '@.multiplexing' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.handshake=$(jsonfilter -i "$f" -e '@.handshake' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.socks5_port=$(jsonfilter -i "$f" -e '@.socks5_port' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.tproxy_port=$(jsonfilter -i "$f" -e '@.tproxy_port' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.lan=$(jsonfilter -i "$f" -e '@.lan' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.logging=$(jsonfilter -i "$f" -e '@.logging' 2>/dev/null)" || return 1
+	return 0
 }
 
 # Status surface for the Mieru tab (polled every 15 s): the binary card and
@@ -1420,17 +1425,26 @@ do_mieru_get() {
 	vver=$(mieru_version)
 	varch=$(uname -m)
 	ipid=0
+	inst0=0
 	if [ -s "$MIERU_RUN_MARKER" ]; then
 		ipid=$(cat "$MIERU_RUN_MARKER" 2>/dev/null)
 		case "$ipid" in ''|*[!0-9]*) ipid=0 ;; esac
 		if [ "$ipid" -ge 1 ] && kill -0 "$ipid" 2>/dev/null \
 			&& tr '\0' ' ' < "/proc/$ipid/cmdline" 2>/dev/null | grep -q "xray-sub.*mieru-install"; then
-			:
+			inst0=1
 		else
 			rm -f "$MIERU_RUN_MARKER"; ipid=0
 		fi
+	elif [ -e "$MIERU_RUN_MARKER" ]; then
+		# empty reservation: the rpcd layer created it atomically just
+		# before spawning the worker (which pins its pid right after) - in
+		# flight, unless it is old enough that the spawner died mid-window
+		if [ -n "$(find "$MIERU_RUN_MARKER" -mmin +5 2>/dev/null)" ]; then
+			rm -f "$MIERU_RUN_MARKER"
+		else
+			inst0=1
+		fi
 	fi
-	inst0=0; [ "$ipid" -ge 1 ] && inst0=1
 	for id in $(mieru_ids); do
 		en=1
 		[ "$(uci -q get "xray-monitor.$id.enabled")" = "0" ] && en=0
@@ -1489,6 +1503,13 @@ mieru_uci_commit() {
 	return 1
 }
 
+# Roll back staged deltas and print the reason - the shared tail of every
+# failed write path (a failed set, a failed commit).
+mieru_uci_abort() {  # <msg>
+	uci -q revert xray-monitor 2>/dev/null
+	echo "${1:-uci write failed - nothing changed}"
+}
+
 do_mieru_add() {  # <conn-file>
 	local norm tmp label socks tp conf rpc sec
 	command -v ucode >/dev/null 2>&1 || { echo "ucode not installed"; return 1; }
@@ -1504,9 +1525,11 @@ do_mieru_add() {  # <conn-file>
 	# the rpc port must also dodge THIS connection's new listen ports
 	rpc=$(mieru_free_rpc "" "$socks" "$tp") || { rm -f "$tmp"; echo "no free management port (10090-10199 exhausted?)"; return 1; }
 	sec=$(uci add xray-monitor mieru 2>/dev/null) || { rm -f "$tmp"; echo "uci add failed"; return 1; }
-	mieru_write_uci "$sec" "$tmp"
-	uci set "xray-monitor.$sec.rpc_port=$rpc"
-	uci set "xray-monitor.$sec.enabled"='1'
+	if ! mieru_write_uci "$sec" "$tmp" \
+		|| ! uci set "xray-monitor.$sec.rpc_port=$rpc" 2>/dev/null \
+		|| ! uci set "xray-monitor.$sec.enabled"='1' 2>/dev/null; then
+		mieru_uci_abort; rm -f "$tmp"; return 1
+	fi
 	rm -f "$tmp"
 	mieru_uci_commit || return 1
 	echo ok
@@ -1545,8 +1568,10 @@ do_mieru_edit() {  # <id> <conn-file>
 	if [ -z "$rpc" ]; then
 		rpc=$(mieru_free_rpc "$id" "$socks" "$tp") || { rm -f "$tmp"; echo "no free management port"; return 1; }
 	fi
-	mieru_write_uci "$id" "$tmp"
-	uci set "xray-monitor.$id.rpc_port=$rpc"
+	if ! mieru_write_uci "$id" "$tmp" \
+		|| ! uci set "xray-monitor.$id.rpc_port=$rpc" 2>/dev/null; then
+		mieru_uci_abort; rm -f "$tmp"; return 1
+	fi
 	rm -f "$tmp"
 	mieru_uci_commit || return 1
 	echo ok
@@ -1560,9 +1585,14 @@ do_mieru_del() {  # <id>
 	# Reap the instance NOW: without the restart the deleted connection's
 	# process (and its respawn) would keep serving until the next manual
 	# restart. The init script regenerates from the committed UCI, so the
-	# section - and its runtime files - are gone for good.
-	[ -x "$MIERU_INIT" ] && "$MIERU_INIT" restart >/dev/null 2>&1 3>&- 4>&-
+	# section - and its runtime files - are gone for good. A failed restart
+	# is reported as such: the UCI deletion stands, but the user must press
+	# Restart to actually stop the lingering instance.
 	rm -f "$MIERU_RUN/$1.json" "$MIERU_RUN/redsocks-$1.conf"
+	if [ -x "$MIERU_INIT" ] && ! "$MIERU_INIT" restart >/dev/null 2>&1 3>&- 4>&-; then
+		echo "deleted from UCI, but the service restart failed - press Restart to stop the lingering instance"
+		return 1
+	fi
 	echo ok
 }
 
