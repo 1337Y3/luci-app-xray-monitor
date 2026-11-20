@@ -1,0 +1,1 @@
+{ "label": "work", "server_ip": "12.34.56.78", "server_domain": "", "server_ports": [ "2012-2022/tcp", "2027/tcp" ], "username": "ducaiguozei", "password": "xijinping", "mtu": "1300", "multiplexing": "MULTIPLEXING_HIGH", "handshake": "HANDSHAKE_NO_WAIT", "socks5_port": "1080", "tproxy_port": "12345", "rpc_port": "10090", "logging": "WARNING", "lan": "0", "enabled": "1" }

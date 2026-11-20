@@ -2,6 +2,7 @@
 'require view';
 'require rpc';
 'require ui';
+'require xray-errors as XrayErrors';
 'require poll';
 'require xray-diff as XrayDiff';
 
@@ -127,21 +128,21 @@ function doSave(btn) {
 	for (var i = 0; i < working.length; i++) {
 		var b = working[i];
 		if (!/^[A-Za-z0-9_.\-]+$/.test(b.tag))
-			return ui.addNotification(null, E('p', _('Invalid balancer tag: ') + (b.tag || '(empty)')), 'error');
+			return XrayErrors.show(_('Invalid balancer tag: ') + (b.tag || '(empty)'));
 		if (obSet[b.tag])
-			return ui.addNotification(null, E('p', _('Balancer tag must differ from an outbound tag: ') + b.tag), 'error');
-		if (seen[b.tag]) return ui.addNotification(null, E('p', _('Duplicate balancer tag: ') + b.tag), 'error');
+			return XrayErrors.show(_('Balancer tag must differ from an outbound tag: ') + b.tag);
+		if (seen[b.tag]) return XrayErrors.show(_('Duplicate balancer tag: ') + b.tag);
 		seen[b.tag] = 1;
 		if (!b.selector.length)
-			return ui.addNotification(null, E('p', _('Balancer "') + b.tag + _('" needs at least one member')), 'error');
+			return XrayErrors.show(_('Balancer "') + b.tag + _('" needs at least one member'));
 	}
 	if (!confirm(_('Apply balancer changes and restart xray now?'))) return;
 	btn.disabled = true;
 	callSet(working).then(function(res) {
 		btn.disabled = false;
 		if (res && res.ok) { ui.addNotification(null, E('p', _('Balancers applied and xray restarted.')), 'info'); return refresh(); }
-		ui.addNotification(null, E('p', _('Apply failed — config not changed. ') + ((res && res.msg) || '')), 'error');
-	}, function() { btn.disabled = false; ui.addNotification(null, E('p', _('Apply call failed.')), 'error'); });
+		XrayErrors.show(_('Apply failed — config not changed. ') + ((res && res.msg) || ''));
+	}, function(err) { btn.disabled = false; XrayErrors.show(_('Apply call failed.'), err); });
 }
 
 // --- live state + sticky overrides (F15) -------------------------------------
@@ -273,9 +274,9 @@ function doPin(btn, bal, outbound) {
 		btn.disabled = false;
 		delete liveChoice[bal];
 		if (res && res.ok) { ui.addNotification(null, E('p', res.msg || _('Pinned.')), 'info'); return refreshLive(); }
-		ui.addNotification(null, E('p', _('Pin failed. ') + ((res && res.msg) || '')), 'error');
+		XrayErrors.show(_('Pin failed. ') + ((res && res.msg) || ''));
 		refreshLive();
-	}, function() { btn.disabled = false; ui.addNotification(null, E('p', _('Pin call failed.')), 'error'); });
+	}, function(err) { btn.disabled = false; XrayErrors.show(_('Pin call failed.'), err); });
 }
 
 function doUnpin(btn, bal) {
@@ -285,9 +286,9 @@ function doUnpin(btn, bal) {
 		btn.disabled = false;
 		delete liveChoice[bal];
 		if (res && res.ok) { ui.addNotification(null, E('p', res.msg || _('Unpinned.')), 'info'); return refreshLive(); }
-		ui.addNotification(null, E('p', _('Unpin failed. ') + ((res && res.msg) || '')), 'error');
+		XrayErrors.show(_('Unpin failed. ') + ((res && res.msg) || ''));
 		refreshLive();
-	}, function() { btn.disabled = false; ui.addNotification(null, E('p', _('Unpin call failed.')), 'error'); });
+	}, function(err) { btn.disabled = false; XrayErrors.show(_('Unpin call failed.'), err); });
 }
 
 function doApplyAll(btn) {
@@ -296,8 +297,8 @@ function doApplyAll(btn) {
 	callOvApply().then(function(res) {
 		btn.disabled = false;
 		if (res && res.ok) { ui.addNotification(null, E('p', _('Overrides re-applied.')), 'info'); return refreshLive(); }
-		ui.addNotification(null, E('p', _('Re-apply failed. ') + ((res && res.msg) || '')), 'error');
-	}, function() { btn.disabled = false; ui.addNotification(null, E('p', _('Re-apply call failed.')), 'error'); });
+		XrayErrors.show(_('Re-apply failed. ') + ((res && res.msg) || ''));
+	}, function(err) { btn.disabled = false; XrayErrors.show(_('Re-apply call failed.'), err); });
 }
 
 function refreshLive() {

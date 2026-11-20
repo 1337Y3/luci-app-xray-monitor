@@ -44,3 +44,29 @@ config xray-monitor 'sub'
 #   config balancer_override
 #       option balancer '<balancer tag>'
 #       option outbound '<outbound tag>'
+
+# mieru proxy clients, managed from the Mieru tab (no defaults shipped - one
+# section per connection; each runs its own `mieru run` instance via
+# /etc/init.d/mieru-monitor, which regenerates /var/etc/xray-monitor/mieru/
+# from these options on every start):
+#   config mieru
+#       option label 'work'            # display name (unique, A-Z a-z 0-9 . _ -)
+#       option server_ip '12.34.56.78' # mieru server IP (or server_domain)
+#       option server_domain ''        # optional domain name
+#       list   server_ports '2012-2022/tcp'   # <port>[-<port>]/tcp|udp
+#       option username '...'
+#       option password '...'
+#       option mtu '1400'              # 1280-1400, must match the server
+#       option multiplexing 'MULTIPLEXING_LOW'
+#       option handshake 'HANDSHAKE_STANDARD'
+#       option socks5_port '1080'      # local SOCKS5 listen port (user-chosen)
+#       option lan '0'                 # 1 = accept SOCKS5 from the LAN too
+#                                      # (default 0: loopback only - redsocks
+#                                      # and ruantiblock talk to 127.0.0.1)
+#       option tproxy_port ''          # transparent port: a redsocks listener
+#                                      # that feeds redirected TCP into mieru
+#                                      # (empty/0 = no transparent listener)
+#       option rpc_port '10090'        # per-instance management port (assigned
+#                                      # automatically, 10090-10199)
+#       option logging 'ERROR'
+#       option enabled '1'

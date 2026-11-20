@@ -9,6 +9,11 @@ if [ "$1" = "remove" ]; then
 	[ -f "$CRON" ] && sed -i '/xray-monitor\/xray-sub fetch/d' "$CRON" 2>/dev/null
 	/etc/init.d/cron restart 2>/dev/null
 
+	# stop and disable the mieru client service (connections/config stay in
+	# UCI; the mieru binary under /usr/bin is untouched - it is not ours)
+	/etc/init.d/mieru-monitor stop 2>/dev/null
+	/etc/init.d/mieru-monitor disable 2>/dev/null
+
 	# Intentionally do NOT `rm -rf /etc/xray-monitor`: a reinstall done with
 	# `opkg install --force-reinstall` runs this prerm with "remove", so deleting
 	# state here wipes it on what the user meant as an upgrade. Leave the dir for

@@ -3,6 +3,7 @@
 'require rpc';
 'require poll';
 'require ui';
+'require xray-errors as XrayErrors';
 'require xray-diff as XrayDiff';
 
 var callGet    = rpc.declare({ object: 'xray-monitor', method: 'sub_get' });
@@ -33,6 +34,7 @@ var SCHEDS = [
 ];
 
 var root = null;
+var subscriptionRows = Object.create(null), addRow = null, settingsTable = null;
 var state = { subscriptions: [], cron: true, cron_schedule: '0 * * * *', auto_apply: false,
               hot_swap: true, last_fetch: 0, status: 'never', pending: false, last_apply: null,
               fetch_path: '', update_path: '',
@@ -137,13 +139,15 @@ function refresh() { return callGet().then(function(r) { if (r && typeof r == 'o
 function row(k, v) { return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td left', 'width': '28%' }, E('strong', {}, k)), E('td', { 'class': 'td left' }, v) ]); }
 function notify(res, okMsg) {
 	if (res && res.ok) ui.addNotification(null, E('p', okMsg), 'info');
-	else ui.addNotification(null, E('p', [ E('strong', {}, _('Failed: ')), document.createTextNode((res && res.msg) || _('error')) ]), 'error');
-	return refresh();
+	else XrayErrors.show((res && res.msg) || _('error'));
+	return refresh().catch(showRPCError);
 }
-function rpcFail(e) {  // rpc-level failure (timeout, rpcd gone): still explain, then resync
-	ui.addNotification(null, E('p', [ E('strong', {}, _('Failed: ')),
-		document.createTextNode((e && (e.message || e.msg)) || _('error')) ]), 'error');
-	return refresh();
+function showRPCError(e) {
+	XrayErrors.show((e && (e.message || e.msg)) || String(e || _('error')));
+}
+function rpcFail(e) {
+	showRPCError(e);
+	return refresh().catch(showRPCError);
 }
 
 function buildSubsTable() {
@@ -154,6 +158,7 @@ function buildSubsTable() {
 	var rows = [ head ];
 
 	state.subscriptions.forEach(function(s) {
+		if (subscriptionRows[s.id] && subscriptionRows[s.id].dirty()) { rows.push(subscriptionRows[s.id].node); return; }
 		var pfx = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:110px', 'value': s.prefix });
 		var url = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:100%;min-width:240px',
 			'placeholder': s.has_url ? (s.url_masked + '  (blank = keep)') : 'https://panel/sub/<token>' });
@@ -162,33 +167,41 @@ function buildSubsTable() {
 		var del  = E('button', { 'class': 'cbi-button cbi-button-remove' }, _('Delete'));
 		save.addEventListener('click', function() {
 			var np = (pfx.value || '').trim();
-			if (!/^[A-Za-z0-9_-]+$/.test(np)) return ui.addNotification(null, E('p', _('Prefix: letters/digits/-/_ only')), 'warning');
+			if (!/^[A-Za-z0-9_-]+$/.test(np)) return XrayErrors.show(_('Prefix: letters/digits/-/_ only'));
 			var nu = (url.value || '').trim();
-			if (nu && !/^https?:\/\//.test(nu)) return ui.addNotification(null, E('p', _('Enter a valid http(s) URL')), 'warning');
-			busy(save, callEdit(s.id, np, nu, en.checked ? '1' : '0').then(function(r) { return notify(r, _('Subscription saved.')); }));
+			if (nu && !/^https?:\/\//.test(nu)) return XrayErrors.show(_('Enter a valid http(s) URL'));
+			busy(save, callEdit(s.id, np, nu, en.checked ? '1' : '0').then(function(r) { if (r && r.ok) delete subscriptionRows[s.id]; return notify(r, _('Subscription saved.')); }, rpcFail));
 		});
 		del.addEventListener('click', function() {
 			if (!confirm(_('Delete subscription "') + s.prefix + _('"? (does not change config.json until you Apply)'))) return;
-			busy(del, callDel(s.id).then(function(r) { return notify(r, _('Subscription deleted.')); }));
+			busy(del, callDel(s.id).then(function(r) { if (r && r.ok) delete subscriptionRows[s.id]; return notify(r, _('Subscription deleted.')); }, rpcFail));
 		});
-		rows.push(E('tr', { 'class': 'tr' }, [
+		var node = E('tr', { 'class': 'tr' }, [
 			E('td', { 'class': 'td' }, pfx), E('td', { 'class': 'td' }, url),
 			E('td', { 'class': 'td' }, en),
 			E('td', { 'class': 'td', 'style': 'white-space:nowrap' }, [ save, ' ', del ])
-		]));
+		]);
+		var prefix = pfx.value, enabled = en.checked;
+		subscriptionRows[s.id] = { node: node, dirty: function() { return pfx.value !== prefix || url.value !== '' || en.checked !== enabled; } };
+		rows.push(node);
 	});
 
+	Object.keys(subscriptionRows).forEach(function(id) {
+		if (!state.subscriptions.some(function(s) { return s.id === id; })) delete subscriptionRows[id];
+	});
+	// Keep live inputs during status polling, including validation/backend failures.
+	if (addRow) { rows.push(addRow); return E('table', { 'class': 'table' }, rows); }
 	// add row
 	var apfx = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:110px', 'placeholder': 'work' });
 	var aurl = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:100%;min-width:240px', 'placeholder': 'https://panel/sub/<token>' });
 	var addb = E('button', { 'class': 'cbi-button cbi-button-add' }, _('Add'));
 	addb.addEventListener('click', function() {
 		var p = (apfx.value || '').trim(), u = (aurl.value || '').trim();
-		if (!/^[A-Za-z0-9_-]+$/.test(p)) return ui.addNotification(null, E('p', _('Prefix: letters/digits/-/_ only')), 'warning');
-		if (!/^https?:\/\//.test(u)) return ui.addNotification(null, E('p', _('Enter a valid http(s) URL')), 'warning');
-		busy(addb, callAdd(p, u).then(function(r) { if (r && r.ok) { apfx.value = ''; aurl.value = ''; } return notify(r, _('Subscription added.')); }));
+		if (!/^[A-Za-z0-9_-]+$/.test(p)) return XrayErrors.show(_('Prefix: letters/digits/-/_ only'));
+		if (!/^https?:\/\//.test(u)) return XrayErrors.show(_('Enter a valid http(s) URL'));
+		busy(addb, callAdd(p, u).then(function(r) { if (r && r.ok) { apfx.value = ''; aurl.value = ''; } return notify(r, _('Subscription added.')); }, rpcFail));
 	});
-	rows.push(E('tr', { 'class': 'tr', 'style': 'border-top:2px solid rgba(128,128,128,.3)' }, [
+	rows.push(addRow = E('tr', { 'class': 'tr', 'style': 'border-top:2px solid rgba(128,128,128,.3)' }, [
 		E('td', { 'class': 'td' }, apfx), E('td', { 'class': 'td' }, aurl),
 		E('td', { 'class': 'td' }, ''), E('td', { 'class': 'td' }, addb)
 	]));
@@ -230,6 +243,7 @@ function buildUsage() {
 }
 
 function buildSettings() {
+	if (settingsTable && settingsTable.dirty()) return settingsTable.node;
 	var schedInput = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'style': 'width:160px', 'value': state.cron_schedule });
 	var opts = [ E('option', { 'value': '' }, _('Custom…')) ], matched = false;
 	SCHEDS.forEach(function(p) { var sel = (p[0] == state.cron_schedule); if (sel) matched = true; opts.push(E('option', { 'value': p[0], 'selected': sel ? '' : null }, _(p[1]))); });
@@ -242,16 +256,19 @@ function buildSettings() {
 	var saveBtn = E('button', { 'class': 'cbi-button cbi-button-save' }, _('Save settings'));
 	saveBtn.addEventListener('click', function() {
 		var sched = (schedInput.value || '').trim();
-		if (sched.split(/\s+/).filter(Boolean).length !== 5) return ui.addNotification(null, E('p', _('Cron schedule must have 5 fields')), 'warning');
-		busy(saveBtn, callSetCfg(cronChk.checked ? '1' : '0', sched, autoChk.checked ? '1' : '0', '', hsChk.checked ? '1' : '0').then(function(r) { return notify(r, _('Settings saved.')); }));
+		if (sched.split(/\s+/).filter(Boolean).length !== 5) return XrayErrors.show(_('Cron schedule must have 5 fields'));
+		busy(saveBtn, callSetCfg(cronChk.checked ? '1' : '0', sched, autoChk.checked ? '1' : '0', '', hsChk.checked ? '1' : '0').then(function(r) { if (r && r.ok) settingsTable = null; return notify(r, _('Settings saved.')); }, rpcFail));
 	});
-	return E('table', { 'class': 'table' }, [
+	var schedule = schedInput.value, cron = cronChk.checked, auto = autoChk.checked, hotSwap = hsChk.checked;
+	var node = E('table', { 'class': 'table' }, [
 		row(_('Scheduled fetch'), E('label', { 'style': 'display:inline-flex;gap:6px;align-items:center;' }, [ cronChk, E('span', {}, _('Periodically fetch all subscriptions')) ])),
 		row(_('Schedule'), E('div', { 'style': 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;' }, [ preset, schedInput, E('span', { 'style': 'color:#888;font-size:90%;' }, _('(cron expression)')) ])),
 		row(_('Auto-apply updates'), E('label', { 'style': 'display:inline-flex;gap:6px;align-items:center;' }, [ autoChk, E('span', {}, _('On fetch, apply changes automatically')) ])),
 		row(_('Hot-swap apply'), E('label', { 'style': 'display:inline-flex;gap:6px;align-items:center;' }, [ hsChk, E('span', {}, _('Apply outbound changes live via the xray API — restart only when a change is not hot-swappable')) ])),
 		row('', saveBtn)
 	]);
+	settingsTable = { node: node, dirty: function() { return schedInput.value !== schedule || cronChk.checked !== cron || autoChk.checked !== auto || hsChk.checked !== hotSwap; } };
+	return node;
 }
 
 function redraw() {

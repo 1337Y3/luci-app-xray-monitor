@@ -4,6 +4,17 @@
 
 chmod 0755 /usr/libexec/rpcd/xray-monitor 2>/dev/null
 chmod 0755 /usr/share/xray-monitor/*.uc /usr/share/xray-monitor/xray-sub 2>/dev/null
+chmod 0755 /etc/init.d/mieru-monitor 2>/dev/null
+# the config carries credentials (subscription URLs, mieru passwords) - keep
+# it root-only. uci commit preserves file modes, so this sticks across uci
+# writes; re-apply on upgrades to harden preserved configs from older
+# packages that shipped it as 0644.
+chmod 0600 /etc/config/xray-monitor 2>/dev/null
+# enable (and try to start) the mieru client service: harmless with no
+# `mieru` sections configured, and instances only start once the binary is
+# installed from the Mieru tab
+/etc/init.d/mieru-monitor enable 2>/dev/null
+/etc/init.d/mieru-monitor start 2>/dev/null
 /etc/init.d/rpcd restart 2>/dev/null
 rm -f /tmp/luci-indexcache* 2>/dev/null
 rm -rf /tmp/luci-modulecache 2>/dev/null

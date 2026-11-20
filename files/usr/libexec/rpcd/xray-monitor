@@ -4,6 +4,7 @@
 . /usr/share/libubox/jshn.sh
 
 XRAY="/usr/bin/xray"
+MIERU="/usr/bin/mieru"
 API_SERVER="127.0.0.1:10085"
 PKG="luci-app-xray-monitor"
 
@@ -651,6 +652,14 @@ case "$1" in
 		json_add_object "config_diff"; json_add_string "name" ""; json_close_object
 		json_add_object "e2e_start"; json_close_object
 		json_add_object "e2e_status"; json_close_object
+		json_add_object "mieru_get"; json_close_object
+		json_add_object "mieru_check"; json_close_object
+		json_add_object "mieru_add"; json_add_object "conn"; json_close_object; json_close_object
+		json_add_object "mieru_edit"; json_add_string "id" ""; json_add_object "conn"; json_close_object; json_close_object
+		json_add_object "mieru_del"; json_add_string "id" ""; json_close_object
+		json_add_object "mieru_restart"; json_close_object
+		json_add_object "mieru_test"; json_add_string "id" ""; json_close_object
+		json_add_object "mieru_install"; json_add_string "version" ""; json_close_object
 		json_dump
 	;;
 	call)
@@ -940,6 +949,150 @@ case "$1" in
 						|| printf '{"running":%s,"ts":0,"results":{}}' "$running"
 				else
 					printf '{"running":%s,"ts":0,"results":{}}' "$running"
+				fi
+			;;
+			# --- Mieru tab (client connections, xray-sub mieru-*) ----------------
+			mieru_get)   "$SUB" mieru-get ;;
+			mieru_check)
+				installed=$("$MIERU" version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1)
+				latest=$("$SUB" mieru-latest 2>/dev/null)
+				json_init
+				json_add_string installed "${installed:-}"
+				json_add_string latest "${latest:-}"
+				json_add_boolean update_available "$([ -n "$latest" ] && [ "$latest" != "$installed" ] && echo 1 || echo 0)"
+				json_dump
+			;;
+			mieru_add|mieru_edit)
+				input=$(cat)
+				if [ "$2" = mieru_edit ]; then
+					mid=$(printf '%s' "$input" | jsonfilter -e '@.id' 2>/dev/null)
+				else
+					mid=""
+				fi
+				f=$(mktemp)
+				if [ -z "$f" ] || [ ! -f "$f" ]; then
+					json_init; json_add_boolean ok 0; json_add_string msg "cannot create temp file"; json_dump
+				else
+					printf '%s' "$input" | jsonfilter -e '@.conn' > "$f" 2>/dev/null
+					if [ "$2" = mieru_edit ]; then
+						msg=$("$SUB" mieru-edit "$mid" "$f" 2>&1)
+					else
+						msg=$("$SUB" mieru-add "$f" 2>&1)
+					fi
+					rc=$?
+					rm -f "$f"
+					json_init
+					json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"
+					json_add_string msg "$msg"
+					json_dump
+				fi
+			;;
+			mieru_del)
+				input=$(cat)
+				mid=$(printf '%s' "$input" | jsonfilter -e '@.id' 2>/dev/null)
+				msg=$("$SUB" mieru-del "$mid" 2>&1); rc=$?
+				json_init; json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"; json_add_string msg "$msg"; json_dump
+			;;
+			mieru_restart) sub_msg mieru-restart ;;
+			mieru_test)
+				input=$(cat)
+				mid=$(printf '%s' "$input" | jsonfilter -e '@.id' 2>/dev/null)
+				msg=$("$SUB" mieru-test "$mid" 2>&1); rc=$?
+				json_init; json_add_boolean ok "$([ "$rc" -eq 0 ] && echo 1 || echo 0)"; json_add_string msg "$msg"; json_dump
+			;;
+			# A ~25 MB GitHub download must not run inside the ubus call:
+			# detach like update_apply (HUP-immune, NOWAIT dropped so the
+			# install can take the mutation lock properly). Progress is
+			# visible to the poll via mieru_get's installing flag + version,
+			# and the terminal outcome lands in mieru_get's install_result.
+			# Reservation protocol (mirrors the marker block in xray-sub):
+			# every transition happens under an exclusive flock OF the
+			# marker file itself, which is never unlinked - empty = idle,
+			# a live worker pid = in flight. Here: lock, validate (a dead
+			# pid is a SIGKILLed worker and gets reclaimed by simply being
+			# overwritten), spawn, write $! and ONLY THEN unlock - so the
+			# reservation is visible before the lock drops and no window
+			# exists where the worker's own exit could outrun the pid
+			# write. The worker claims/clears the same marker under the
+			# same lock and never unlinks it. BusyBox flock has no -w, so
+			# the wait is a bounded poll of non-blocking tries.
+			mieru_install)
+				mkdir -p "$E2E_STATE"
+				mi_locked=0
+				if ! command -v flock >/dev/null 2>&1; then
+					json_init; json_add_boolean ok 0
+					json_add_string msg "flock(1) not available - cannot serialize writes"
+					json_dump
+				elif ! ( exec 5>>"$E2E_STATE/mieru-install.run" ) 2>/dev/null; then
+					# probed in a subshell: a failed `exec <redir>` would kill
+					# this whole rpcd handler (non-interactive ash)
+					json_init; json_add_boolean ok 0
+					json_add_string msg "cannot open the install marker"
+					json_dump
+				else
+					# bare `exec` redirections persist: no 2>/dev/null (the
+					# probe above ruled the open failure out) or every later
+					# stderr message of this handler would be swallowed
+					exec 5>>"$E2E_STATE/mieru-install.run"
+					mi_try=0
+					while [ "$mi_try" -lt 5 ]; do
+						flock -n 5 2>/dev/null && { mi_locked=1; break; }
+						mi_try=$((mi_try + 1))
+						sleep 1
+					done
+					if [ "$mi_locked" != 1 ]; then
+						exec 5>&-
+						json_init
+						json_add_boolean ok 1
+						json_add_boolean running 1
+						json_add_string msg "An install is already running"
+						json_dump
+					elif kill -0 "$(cat "$E2E_STATE/mieru-install.run" 2>/dev/null)" 2>/dev/null \
+						&& tr '\0' ' ' < "/proc/$(cat "$E2E_STATE/mieru-install.run" 2>/dev/null)/cmdline" 2>/dev/null | grep -q "mieru-install"; then
+						# the recorded pid is a LIVE install worker
+						flock -u 5 2>/dev/null; exec 5>&-
+						json_init
+						json_add_boolean ok 1
+						json_add_boolean running 1
+						json_add_string msg "An install is already running"
+						json_dump
+					else
+						input=$(cat)
+						ver=$(printf '%s' "$input" | jsonfilter -e '@.version' 2>/dev/null)
+						mi_result="$E2E_STATE/mieru-install.result"
+						# Leave a terminal fallback before launch: exec failures and
+						# abrupt exits must also have an outcome once the pid dies.
+						mi_error=""
+						if [ ! -x "$SUB" ]; then
+							mi_error="cannot launch the install worker"
+						elif ! ( "$SHARE/mieru.uc" note "$mi_result" 0 "install worker exited without reporting an outcome" > "$mi_result.new" ) 2>/dev/null \
+							|| ! mv "$mi_result.new" "$mi_result" 2>/dev/null; then
+							mi_error="cannot publish the install outcome - refusing to start"
+						else
+							sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; export MIERU_RESERVED=1; exec /usr/share/xray-monitor/xray-sub mieru-install "$1"' sh "$ver" \
+								>"$E2E_STATE/mieru-install.log" 2>&1 </dev/null &
+							mi_pid=$!
+							if ! ( printf '%s\n' "$mi_pid" > "$E2E_STATE/mieru-install.run" ) 2>/dev/null \
+								|| [ "$(cat "$E2E_STATE/mieru-install.run" 2>/dev/null)" != "$mi_pid" ]; then
+								# The child waits on our lock and requires its reservation.
+								kill "$mi_pid" 2>/dev/null
+								mi_error="cannot publish the install worker pid - refusing to start"
+							elif ! kill -0 "$mi_pid" 2>/dev/null; then
+								mi_error="cannot launch the install worker; see mieru-install.log"
+							fi
+						fi
+						flock -u 5 2>/dev/null
+						exec 5>&-
+						json_init
+						if [ -n "$mi_error" ]; then
+							json_add_boolean ok 0
+							json_add_string msg "$mi_error"
+						else
+							json_add_boolean ok 1
+							json_add_string msg "Download started - the version card updates when it finishes."
+						fi
+						json_dump
+					fi
 				fi
 			;;
 			# Semantic diff of the raw editor's text against the LIVE config, as

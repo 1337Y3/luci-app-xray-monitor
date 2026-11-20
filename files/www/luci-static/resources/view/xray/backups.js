@@ -2,6 +2,7 @@
 'require view';
 'require rpc';
 'require ui';
+'require xray-errors as XrayErrors';
 'require xray-diff as XrayDiff';
 
 var callList    = rpc.declare({ object: 'xray-monitor', method: 'backups_list' });
@@ -51,10 +52,7 @@ function notify(res, okText, failText) {
 	if (res && res.ok)
 		ui.addNotification(null, E('p', {}, okText + ' ' + (res.msg || '')), 'info');
 	else
-		ui.addNotification(null, E('p', {}, [
-			E('strong', {}, failText),
-			document.createTextNode(' ' + ((res && res.msg) || _('unknown error')))
-		]), 'error');
+		XrayErrors.show(failText + '\n' + ((res && res.msg) || _('unknown error')));
 }
 
 function btn(label, cls, fn) {
@@ -95,18 +93,19 @@ function viewBackup(b) {
 				'style': 'max-height:60vh;overflow:auto;margin:0;white-space:pre;font-family:monospace;font-size:12px;'
 			}, (res.config || ''))
 		]);
-	}, function() { setBusy(false); ui.addNotification(null, E('p', {}, _('View call failed.')), 'error'); });
+	}, function(err) { setBusy(false); XrayErrors.show(_('View call failed.'), err); });
 }
 
 function diffBackup(b) {
 	setBusy(true);
 	Promise.all([ callGetCfg(), callGetBak(b.name), callDiff(b.name) ]).then(function(r) {
 		setBusy(false);
+		if (!r[1] || !r[1].ok) { notify(r[1], '', _('Cannot diff backup:')); return; }
 		var cur = (r[0] && r[0].config) || '',
 		    bak = (r[1] && r[1].config) || '',
 		    sem = r[2] || {};
 		if (sem.error) {
-			ui.addNotification(null, E('p', {}, _('Diff failed: ') + sem.error), 'error');
+			XrayErrors.show(_('Diff failed: ') + sem.error);
 			return;
 		}
 		var nodes = [];
@@ -122,7 +121,7 @@ function diffBackup(b) {
 		)]));
 		nodes.push(XrayDiff.renderUnified(cur, bak));
 		showModal(_('Diff with current: %s').format(b.name), nodes);
-	}, function() { setBusy(false); ui.addNotification(null, E('p', {}, _('Diff call failed.')), 'error'); });
+	}, function(err) { setBusy(false); XrayErrors.show(_('Diff call failed.'), err); });
 }
 
 function restoreBackup(b) {
@@ -133,7 +132,7 @@ function restoreBackup(b) {
 		setBusy(false);
 		notify(res, _('Restored and restarted xray.'), _('Restore failed (not applied):'));
 		refresh();
-	}, function() { setBusy(false); ui.addNotification(null, E('p', {}, _('Restore call failed.')), 'error'); });
+	}, function(err) { setBusy(false); XrayErrors.show(_('Restore call failed.'), err); });
 }
 
 function pinBackup(b) {
@@ -142,7 +141,7 @@ function pinBackup(b) {
 		setBusy(false);
 		notify(res, b.pinned ? _('Unpinned.') : _('Pinned.'), _('Pin failed:'));
 		refresh();
-	}, function() { setBusy(false); ui.addNotification(null, E('p', {}, _('Pin call failed.')), 'error'); });
+	}, function(err) { setBusy(false); XrayErrors.show(_('Pin call failed.'), err); });
 }
 
 function deleteBackup(b) {
@@ -153,7 +152,7 @@ function deleteBackup(b) {
 		setBusy(false);
 		notify(res, _('Deleted.'), _('Delete failed:'));
 		refresh();
-	}, function() { setBusy(false); ui.addNotification(null, E('p', {}, _('Delete call failed.')), 'error'); });
+	}, function(err) { setBusy(false); XrayErrors.show(_('Delete call failed.'), err); });
 }
 
 function downloadBackup(b) {
@@ -162,7 +161,7 @@ function downloadBackup(b) {
 		setBusy(false);
 		if (!res || !res.ok) { notify(res, '', _('Cannot download backup:')); return; }
 		download(b.name, res.config || '');
-	}, function() { setBusy(false); ui.addNotification(null, E('p', {}, _('Download call failed.')), 'error'); });
+	}, function(err) { setBusy(false); XrayErrors.show(_('Download call failed.'), err); });
 }
 
 function actionsCell(b) {
@@ -207,7 +206,10 @@ function redraw(list) {
 		}
 
 	var refreshBtn = E('button', { 'class': 'cbi-button cbi-button-neutral' }, _('Refresh'));
-	refreshBtn.addEventListener('click', function(ev) { ev.target.disabled = true; refresh(); });
+	refreshBtn.addEventListener('click', function() {
+		refreshBtn.disabled = true;
+		refresh().then(function() { refreshBtn.disabled = false; });
+	});
 
 	var fresh = E('div', {}, [
 		E('div', { 'style': 'margin:.5em 0;display:flex;justify-content:flex-end;' }, [ refreshBtn ]),
@@ -220,11 +222,11 @@ function redraw(list) {
 }
 
 function refresh() {
-	callList().then(function(res) {
+	return callList().then(function(res) {
 		listData = (res && res.backups) ? res.backups : [];
 		redraw(listData);
-	}, function() {
-		ui.addNotification(null, E('p', {}, _('Failed to list backups.')), 'error');
+	}, function(err) {
+		XrayErrors.show(_('Failed to list backups.'), err);
 	});
 }
 

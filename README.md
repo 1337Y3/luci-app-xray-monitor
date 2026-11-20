@@ -3,6 +3,22 @@
 A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
 **Services → Xray Monitor**:
 
+> **1.25 — Mieru tab.** Independent **mieru** proxy clients ([enfein/mieru](https://github.com/enfein/mieru),
+> v3.x) managed next to xray: add a connection (server, credentials), pick its
+> **SOCKS5 listen port** and an optional **transparent port** for redirected
+> TCP, and the app runs one `mieru run` instance per connection through a procd
+> service. The binary is installed straight from upstream's GitHub releases
+> (arch detected via `uname -m`: amd64 / arm64 / armv7 / riscv64, SHA256-verified,
+> proxied through xray when `fetch_via_update` says so; mips and friends place a
+> self-built binary at `/usr/bin/mieru` manually). mieru itself speaks SOCKS5
+> only — the transparent port is a **redsocks** listener (soft dependency,
+> `opkg install redsocks` / `apk add redsocks`) that feeds redirected TCP into
+> the connection's loopback SOCKS5 port. The app deliberately writes **no
+> firewall rules** (unchanged since 1.20): point ruantiblock's redirect at the
+> transparent port, point its redsocks backend at the SOCKS5 port, or write
+> your own nftables/iptables rules — see the Mieru section below for both
+> wirings and reference rules. TCP only in v1: UDP/DNS is not proxied.
+
 > **1.24 — Hysteria protocol support.** Subscription exits speaking
 > Xray-core's native **hysteria** transport (Hysteria 2 — Remnawave emits it
 > to Xray-JSON clients since panel 2.7.0) are now first-class: fetch /
@@ -215,6 +231,96 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
   to the strategy. Divergences are surfaced (saved pin ≠ running pick, stale
   balancer gone from the config, API down). Pins survive reboots; deleting the
   balancer or the outbound clears them with it.
+
+**Mieru**
+- Independent [mieru](https://github.com/enfein/mieru) proxy clients, one
+  **connection** per row: server (IP or domain), server port bindings
+  (`2027/tcp`, `2012-2022/udp`, …), credentials, mtu / multiplexing /
+  handshake, and the ports it listens on — a **SOCKS5 port** you choose and
+  an optional **transparent port**. The SOCKS5 port binds **loopback only**
+  by default (redsocks and ruantiblock's redsocks backend talk to
+  `127.0.0.1` anyway); tick **SOCKS5 on LAN** to accept connections from the
+  LAN too. mieru's client serves one profile per process, so each connection
+  runs as its own procd instance (`/etc/init.d/mieru-monitor`); the
+  per-instance management port is assigned automatically (10090+, never
+  colliding with the stats API or another connection). Deleting a row stops
+  its instance immediately.
+- The **binary card** installs/updates `/usr/bin/mieru` from upstream's
+  GitHub releases (version resolved via the API, tarball verified against the
+  published `.sha256.txt`, atomic rename; downloads honor the same
+  direct/proxy/auto rule as self-updates). "Check for updates" compares with
+  the latest release. Official builds: `amd64`, `arm64`, `armv7`, `riscv64` —
+  on anything else (mips…) the card tells you to place a self-built binary at
+  `/usr/bin/mieru` and everything else works the same. Budget ~25 MB of
+  flash/RAM per binary and per running instance.
+- **Test** runs `mieru test` through the running instance (the same 204 URL
+  the E2E check uses); the verdict is cached and shown with its age.
+- **Transparent mode is port-based, not firewall-based.** mieru speaks
+  SOCKS5 only, so a transparent port is a small **redsocks** listener the
+  service starts next to mieru: it accepts TCP that some firewall rule
+  REDIRECTed to it (reading the original destination via `SO_ORIGINAL_DST`)
+  and forwards it through that connection's loopback SOCKS5 port. Install it
+  once: `opkg install redsocks` (or `apk add redsocks`); without it the SOCKS5
+  port still works and the init script logs what is missing. **UDP and DNS
+  are not proxied in v1.**
+- **Wiring it up** (the app writes no firewall rules — since 1.20 that is
+  whatever already manages routing on your box):
+  - with **ruantiblock**, either point its redirect port (`t_proxy_port`) at
+    the connection's transparent port, or — without any redsocks of your own —
+    point ruantiblock's redsocks backend upstream at
+    `127.0.0.1:<SOCKS5 port>` and leave the transparent port empty;
+  - by hand, use one of the examples below. Replace `br-lan`, `12345`
+    and `203.0.113.10` with your LAN interface, transparent port and mieru
+    server's IPv4 address. For a hostname, exclude **every resolved server
+    address** and keep those exclusions current. These examples handle IPv4
+    TCP only; IPv6, UDP and DNS need a separate policy.
+
+The transparent listener binds **`0.0.0.0` (all IPv4 interfaces)** because
+REDIRECT sends LAN packets to the router's incoming-interface address.
+A loopback bind would break those packets. The transparent listener accepts
+traffic without authentication: before enabling it, restrict
+INPUT to redirected TCP arriving from the LAN. The app does **not** install
+these restrictions. The examples put that restriction before the usual
+INPUT accept rules, and exclude the router's own addresses, private/local
+networks and the mieru server from redirection.
+
+For **fw4/nftables**, run once after firewall startup:
+
+```sh
+nft -f - <<'EOF'
+add chain inet fw4 mieru_input
+add rule inet fw4 mieru_input iifname "br-lan" ct status dnat accept
+add rule inet fw4 mieru_input drop
+insert rule inet fw4 input tcp dport 12345 jump mieru_input
+add rule inet fw4 dstnat_lan fib daddr type != local ip daddr != { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 203.0.113.10 } tcp dport 1-65535 redirect to :12345
+EOF
+```
+
+For **fw3/iptables**, use a chain with one RETURN rule per exclusion
+(iptables accepts only one destination match per rule):
+
+```sh
+iptables -N MIERU_INPUT
+iptables -A MIERU_INPUT -i br-lan -m conntrack --ctstate DNAT -j ACCEPT
+iptables -A MIERU_INPUT -j DROP
+iptables -I INPUT 1 -p tcp --dport 12345 -j MIERU_INPUT
+iptables -t nat -N MIERU_REDIRECT
+iptables -t nat -A MIERU_REDIRECT -m addrtype --dst-type LOCAL -j RETURN
+for dst in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+  172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 203.0.113.10; do
+  iptables -t nat -A MIERU_REDIRECT -d "$dst" -j RETURN
+done
+iptables -t nat -A MIERU_REDIRECT -p tcp -j REDIRECT --to-ports 12345
+iptables -t nat -A PREROUTING -i br-lan -p tcp -j MIERU_REDIRECT
+```
+
+The INPUT restrictions also apply when ruantiblock supplies the redirect;
+use the restriction block for your firewall even if you do not need the
+manual NAT rule. The rules are temporary and disappear on firewall reload
+or reboot. Put them in your firewall manager's supported custom include
+mechanism for persistence; arrange for them to run once per firewall rebuild
+and before starting the transparent listener. Repeat the port-specific
+rules for each transparent port.
 
 It reads traffic from Xray's built-in **Stats API** over `127.0.0.1:10085`, and
 detects per-outbound connectivity with an active **TCP probe** of each endpoint
@@ -439,6 +545,7 @@ Pure data package (`Architecture: all`), so the SDK isn't required.
 | `/www/luci-static/resources/view/xray/balancers.js` | Balancers page |
 | `/www/luci-static/resources/view/xray/backups.js` | Backups page |
 | `/www/luci-static/resources/view/xray/config.js` | Config editor page |
+| `/www/luci-static/resources/view/xray/mieru.js` | Mieru page |
 | `/www/luci-static/resources/xray-diff.js` | shared diff renderer (line + semantic) |
 | `/usr/share/xray-monitor/{parse,apply,diff,snapshot,status,routing,balancers,enable-api,render,probe}.uc` | ucode JSON transforms (render = shared outbounds renderer, probe = TCP probe backend) |
 | `/usr/share/xray-monitor/hotswap.uc` | live-apply plan + ordered adds (hot-swap) |
@@ -447,6 +554,8 @@ Pure data package (`Architecture: all`), so the SDK isn't required.
 | `/usr/share/xray-monitor/{balance,balance-cli}.uc` | live balancer view + override merge |
 | `/usr/share/xray-monitor/{jsondiff,jsondiff-cli}.uc` | semantic path diff (editor diff, backup diff) |
 | `/usr/share/xray-monitor/tmpxray.uc` | temporary one-exit socks instance builder (e2e, proxied fetch) |
+| `/usr/share/xray-monitor/{mieru,mieru-uci}.uc` | mieru connection normalize/client-config builder + UCI bridge |
 | `/usr/share/xray-monitor/xray-sub` | fetch/stage/apply helper (+ hourly cron) |
-| `/etc/config/xray-monitor` | UCI config (sub URL, user-agent, cron) — conffile |
+| `/etc/init.d/mieru-monitor` | procd service: one `mieru run` (+ redsocks) instance per connection |
+| `/etc/config/xray-monitor` | UCI config including subscription and mieru credentials — root-only (0600) conffile |
 | `/etc/xray-monitor/overrides.json` | optional per-tag outbound overrides (see above) |

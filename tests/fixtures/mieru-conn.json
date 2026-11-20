@@ -1,0 +1,17 @@
+{
+	"label": "work",
+	"server_ip": "12.34.56.78",
+	"server_domain": "mieru.example.org",
+	"server_ports": ["2012-2022/tcp", "2027/tcp", "5353/udp"],
+	"username": "ducaiguozei",
+	"password": "xijinping",
+	"mtu": 1300,
+	"multiplexing": "MULTIPLEXING_HIGH",
+	"handshake": "HANDSHAKE_NO_WAIT",
+	"socks5_port": 1080,
+	"tproxy_port": 12345,
+	"rpc_port": 10090,
+	"lan": 1,
+	"logging": "WARNING",
+	"enabled": 1
+}

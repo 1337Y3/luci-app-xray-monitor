@@ -14,7 +14,7 @@
 # trap for $WORK is installed here. VER lives here, once.
 
 PKG="luci-app-xray-monitor"
-VER="1.24-1"
+VER="1.25-1"
 ARCH="all"
 
 stage_package() {
@@ -45,8 +45,11 @@ stage_package() {
 	# Bake the package version into the UI so a stale cached view can detect
 	# itself against status.app_version.
 	find "$WORK/data/www" -type f -name '*.js' -exec sed -i "s/__XRAY_MONITOR_VER__/${VER}/g" {} \;
+	# Credentials must be private even during image builds (postinst skips those).
+	chmod 0600 "$WORK/data/etc/config/xray-monitor"
 	chmod 0755 "$WORK/data/usr/libexec/rpcd/xray-monitor"
 	chmod 0755 "$WORK"/data/usr/share/xray-monitor/*.uc \
 	           "$WORK"/data/usr/share/xray-monitor/xray-sub
+	chmod 0755 "$WORK/data/etc/init.d/mieru-monitor"
 	chmod 0755 "$WORK/control/postinst" "$WORK/control/prerm" "$WORK/control/postrm"
 }

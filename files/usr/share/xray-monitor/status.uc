@@ -1,7 +1,7 @@
 #!/usr/bin/ucode
 // Compose the sub_get response: subscriptions + global settings (from UCI) +
 // fetch state + the INSTALLED proxy outbounds (from the live config) + pending diff.
-//   status.uc <last_fetch> <status> <pending> <config.json> <diff.json> [state_dir] [xray_hysteria_ok]
+//   status.uc <last_fetch> <status> <pending> <config.json> <diff.json> [state_dir] [xray_hysteria_ok] [config_dir]
 // xray_hysteria_ok: '1'/'0' from the caller's `xray version` check ('' = core
 // version unverifiable) - surfaced as hysteria_xray_ok so the UI can warn when
 // hysteria exits exist on a core older than the protocol (Xray >= 26.1.23).
@@ -14,7 +14,8 @@ let lf = ARGV[0], st = ARGV[1], pending = ARGV[2], cfg_path = ARGV[3], diff_path
 function load(p, dflt) { let s = p ? readfile(p) : null; return s ? json(s) : dflt; }
 function mask(u) { if (!u || !length(u)) return ''; let p = split(u, '/'); return (length(p) >= 3) ? (p[0] + '//' + p[2] + '/****') : '****'; }
 
-let uci = cursor();
+// Explicit fixture directory for tests; normal callers keep the system UCI.
+let uci = (length(ARGV) > 7) ? cursor(ARGV[7]) : cursor();
 let g = function(o) { return uci.get('xray-monitor', 'sub', o); };
 
 let subs = [];

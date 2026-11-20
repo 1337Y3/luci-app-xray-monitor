@@ -9,6 +9,9 @@
 #         | e2e [tag...]   (end-to-end exit check: pull a body through each exit)
 #         | backups-list | backups-get <name> | backups-delete <name>
 #         | backups-pin <name> <0|1> | backups-restore <name>
+#         | mieru-get | mieru-add <f> | mieru-edit <id> <f> | mieru-del <id>
+#         | mieru-restart | mieru-test <id>   (Mieru tab: client connections)
+#         | mieru-install [ver] | mieru-latest   (binary download + version)
 # `apply` reconciles subscription-outbound-only changes live via `xray api
 # rmo`/`ado` (no restart) when hot_swap is on - see the F14 block below.
 SHARE=/usr/share/xray-monitor
@@ -1238,7 +1241,8 @@ via_start() {  # <tag> -> sets VIA_TAG/VIA_PORT; via_err carries the reason
 	out=$(do_tmpxray_start "$1" 2>&1) || { via_err="$out"; return 1; }
 	if [ "$theld" = 1 ]; then
 		flock -u 4 2>/dev/null
-		exec 4>&- 2>/dev/null
+		# A bare exec keeps every redirection: leave the caller's stderr open.
+		exec 4>&-
 		theld=0
 	fi
 	# do_tmpxray_start prints exactly {"pid":N,"ports":{"<tag>":port}} - read
@@ -1275,8 +1279,642 @@ via_ensure() {
 	return 0
 }
 
+# --- mieru client tab ---------------------------------------------------------
+# Independent mieru proxy clients, one UCI `mieru` section per connection
+# (server + credentials + a user-chosen socks5 listen port, plus an optional
+# transparent port for redirected TCP - mieru itself speaks SOCKS5 only).
+# The procd service behind $MIERU_INIT regenerates per-instance
+# configs from UCI and runs `mieru run` (and a redsocks shim when
+# tproxy_port is set); these helpers own the UCI CRUD, the status surface,
+# the connectivity test and the binary download. Nothing here touches
+# config.json or firewall rules: what traffic reaches a transparent port is
+# decided by whatever redirects it (ruantiblock, hand-written nft/iptables).
+MIERU=/usr/bin/mieru
+MIERU_RUN=/var/etc/xray-monitor/mieru
+MIERU_INIT=/etc/init.d/mieru-monitor
+MIERU_TEST="$TSTATE_DIR/mieru-test.json"
+MIERU_RUN_MARKER="$TSTATE_DIR/mieru-install.run"
+MIERU_RES="$TSTATE_DIR/mieru-install.result"
+MTESTLOCK=/var/lock/xray-monitor-mieru
+MIERU_GH_API="https://api.github.com/repos/enfein/mieru/releases/latest"
+MIERU_GH_DL="https://github.com/enfein/mieru/releases/download"
+
+# --- install run marker: one owner, one lock ----------------------------------
+# The marker file is NEVER unlinked - it is empty when no install runs and
+# holds the worker pid while one does. Every transition (reserve by the
+# rpcd layer, claim by the worker, clear on worker exit) happens under an
+# exclusive flock OF THE MARKER FILE ITSELF (fd 5; the file persists, so
+# the lock's inode is stable). That closes the round-2 race where a fast
+# worker's EXIT trap unlinked the marker before the parent wrote $!,
+# leaving a stale pid that blocked every later install with
+# "already running". Dead pids (SIGKILL - no trap runs) are simply
+# reclaimed by the next reservation: the validation below only accepts a
+# LIVE pid whose cmdline names mieru-install.
+# BusyBox flock has no -w: every wait is a bounded poll of non-blocking
+# tries (the same shape take_lock uses).
+mieru_marker_live() {  # <pid>: rc 0 = a live install worker
+	[ "$1" -ge 1 ] 2>/dev/null || return 1
+	kill -0 "$1" 2>/dev/null || return 1
+	tr '\0' ' ' < "/proc/$1/cmdline" 2>/dev/null | grep -q "mieru-install"
+}
+
+# Bounded exclusive lock on the marker via fd 5 (caller must not hold it).
+# rc 0 = locked (fd 5 left OPEN for the caller), 1 = not obtained. The open
+# is PROBED in a subshell first: a failed `exec <redir>` terminates a
+# non-interactive ash outright, and the lock must degrade, not kill.
+mieru_marker_lock() {  # <tries>
+	local i=0
+	command -v flock >/dev/null 2>&1 || return 1
+	( exec 5>>"$MIERU_RUN_MARKER" ) 2>/dev/null || return 1
+	# no `2>/dev/null` here: redirections on a bare `exec` PERSIST in the
+	# shell, and silencing fd2 would swallow every later stderr message
+	# (the probe above already rules out the open failure)
+	exec 5>>"$MIERU_RUN_MARKER"
+	while [ "$i" -lt "${1:-10}" ]; do
+		flock -n 5 2>/dev/null && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	exec 5>&-
+	return 1
+}
+
+mieru_marker_unlock() {
+	flock -u 5 2>/dev/null
+	exec 5>&-
+}
+
+# Claim the marker for THIS worker: under the lock, refuse when a live
+# worker already owns it, else record $$. Our OWN pid is the rpcd layer's
+# reservation for us - it must not read as a competing worker. FAILS
+# CLOSED: without flock, or when the marker lock cannot be taken, the
+# worker does NOT install - the marker is the single-installer guarantee,
+# and an unowned claim would silently void it. The failure reason goes to
+# stderr for the caller to relay.
+mieru_marker_claim() {
+	local mpid
+	if ! command -v flock >/dev/null 2>&1; then
+		echo "flock(1) not available - cannot claim the install marker" >&2
+		return 1
+	fi
+	if ! mieru_marker_lock 10; then
+		echo "cannot lock the install marker - another install may own it" >&2
+		return 1
+	fi
+	mpid=$(cat "$MIERU_RUN_MARKER" 2>/dev/null)
+	if [ "${MIERU_RESERVED:-0}" = 1 ] && [ "$mpid" != "$$" ]; then
+		mieru_marker_unlock
+		echo "install worker reservation was not published - refusing to install" >&2
+		return 1
+	fi
+	if [ "$mpid" != "$$" ] && mieru_marker_live "$mpid"; then
+		mieru_marker_unlock
+		echo "another mieru install is already running" >&2
+		return 1
+	fi
+	if ! ( printf '%s\n' "$$" > "$MIERU_RUN_MARKER" ) 2>/dev/null \
+		|| [ "$(cat "$MIERU_RUN_MARKER" 2>/dev/null)" != "$$" ]; then
+		mieru_marker_unlock
+		echo "cannot publish the install worker pid" >&2
+		return 1
+	fi
+	mieru_marker_unlock
+	return 0
+}
+
+# Clear the marker on worker exit - but ONLY while it still names THIS
+# process: somebody else's reservation (or a reclaim that already replaced
+# our dead pid) must survive us. Cleanup may fail open: a pid we fail to
+# clear is dead by then and the next reservation reclaims it, so a
+# lock problem at exit must not turn into a spurious error.
+mieru_marker_clear() {
+	command -v flock >/dev/null 2>&1 || return 0
+	mieru_marker_lock 10 || return 0
+	[ "$(cat "$MIERU_RUN_MARKER" 2>/dev/null)" = "$$" ] && : > "$MIERU_RUN_MARKER"
+	mieru_marker_unlock
+	return 0
+}
+
+# -X exposes anonymous names too, but those change after deletion/reordering.
+# Pin every existing name in the same transaction before mutating connections,
+# preserving the runtime/config/cache keys already exposed to the UI.
+mieru_ids() { uci -X show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=mieru$/\1/p'; }
+mieru_pin_ids() {
+	local id shown raw ids
+	shown=$(uci show xray-monitor 2>/dev/null) || return 1
+	printf '%s\n' "$shown" | grep -q '^xray-monitor\.@mieru\[[0-9][0-9]*\]=mieru$' || return 0
+	raw=$(uci -X show xray-monitor 2>/dev/null) || return 1
+	ids=$(printf '%s\n' "$raw" | sed -n 's/^xray-monitor\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=mieru$/\1/p')
+	[ -n "$ids" ] || return 1
+	for id in $ids; do
+		# Named rows already survive reload; only anonymous ones need a delta.
+		printf '%s\n' "$shown" | grep -Fqx "xray-monitor.$id=mieru" && continue
+		uci rename "xray-monitor.$id=$id" 2>/dev/null || return 1
+	done
+}
+
+# Installed binary version ("3.39.0"; "" when absent). Only the numeric
+# token is kept: the string is embedded in hand-built JSON by mieru-get.
+mieru_version() {
+	[ -x "$MIERU" ] || return 0
+	"$MIERU" version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1
+}
+
+# A section id refers to one of OUR connections only when it exists AND is
+# typed mieru (`uci get <section>` prints the type) - otherwise a stray "sub"
+# or "cfgX" of another type would let edit/del clobber an unrelated section.
+mieru_section() {  # <id>
+	case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+	[ "$(uci -q get "xray-monitor.$1" 2>/dev/null)" = "mieru" ]
+}
+
+# All listen ports claimed by OTHER mieru sections (socks5/tproxy/rpc), plus
+# the xray stats API on 10085 - a new connection must not collide with any.
+# The list is space-delimited on BOTH sides, so the membership test below
+# cannot miss the last entry.
+mieru_ports_used() {  # <exclude-id> [extra ports...]
+	local id opt v used=""
+	for id in $(mieru_ids); do
+		[ "$id" = "$1" ] && continue
+		for opt in socks5_port tproxy_port rpc_port; do
+			v=$(uci -q get "xray-monitor.$id.$opt")
+			case "$v" in ''|*[!0-9]*) ;; *) used="$used $v" ;; esac
+		done
+	done
+	shift   # drop <exclude-id>; the rest are extra taken ports
+	for v in "$@"; do
+		case "$v" in ''|*[!0-9]*) ;; *) used="$used $v" ;; esac
+	done
+	echo " 10085 $used "
+}
+
+# First free per-instance management (RPC) port from 10090 up - the range
+# mieru's `status`/`test` talk to, above the stats API and below tmpxray's.
+# The caller passes the connection's OWN new listen ports as extras: the rpc
+# port must not land on the socks5/tproxy port about to be configured.
+mieru_free_rpc() {  # <exclude-id> [extra taken ports...]
+	local p used
+	used=$(mieru_ports_used "$@")
+	for p in $(seq 10090 10199); do
+		case "$used" in *" $p "*) ;; *) echo "$p"; return 0 ;; esac
+	done
+	return 1
+}
+
+# Validate a connection's listen ports against the other sections. Prints
+# the reason and returns 1 on any conflict; rc 0 = fine.
+mieru_check_ports() {  # <socks5> <tproxy> <exclude-id>
+	local s="$1" t="$2" used
+	case "$s" in ''|*[!0-9]*) echo "invalid socks5 port"; return 1 ;; esac
+	[ "$s" -ge 1 ] && [ "$s" -le 65535 ] || { echo "socks5 port out of range"; return 1; }
+	case "$t" in ''|0) t="" ;; *[!0-9]*) echo "invalid transparent port"; return 1 ;; esac
+	if [ -n "$t" ]; then
+		[ "$t" -ge 1 ] && [ "$t" -le 65535 ] || { echo "transparent port out of range"; return 1; }
+		[ "$t" = "$s" ] && { echo "transparent port equals the socks5 port"; return 1; }
+	fi
+	used=$(mieru_ports_used "$3")
+	case "$used" in *" $s "*) echo "socks5 port $s already in use by another connection"; return 1 ;; esac
+	if [ -n "$t" ]; then
+		case "$used" in *" $t "*) echo "transparent port $t already in use by another connection"; return 1 ;; esac
+	fi
+	return 0
+}
+
+# Labels are the display identity of a connection - keep them unique.
+mieru_label_taken() {  # <label> <exclude-id>: prints the id holding it
+	local id l
+	for id in $(mieru_ids); do
+		[ "$id" = "$2" ] && continue
+		l=$(uci -q get "xray-monitor.$id.label"); [ -n "$l" ] || l="$id"
+		[ "$l" = "$1" ] && { echo "$id"; return 0; }
+	done
+	return 1
+}
+
+# Write a normalized conn (mieru.uc check output) into a UCI section. Every
+# payload write is checked: one failed set must not leave a half-written
+# connection behind a later successful commit. Delete an existing port list
+# with a checked result; a fresh section has no list to remove.
+# The rpc_port / enabled pair is the caller's
+# business (add assigns a fresh rpc port, edit keeps a still-valid one).
+mieru_write_uci() {  # <section-id> <norm-file>
+	local f="$2" v
+	uci set "xray-monitor.$1.label=$(jsonfilter -i "$f" -e '@.label' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.server_ip=$(jsonfilter -i "$f" -e '@.server_ip' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.server_domain=$(jsonfilter -i "$f" -e '@.server_domain' 2>/dev/null)" || return 1
+	if uci -q get "xray-monitor.$1.server_ports" >/dev/null 2>&1; then
+		uci -q delete "xray-monitor.$1.server_ports" 2>/dev/null || return 1
+	fi
+	for v in $(jsonfilter -i "$f" -e '@.ports[*]' 2>/dev/null); do
+		uci add_list "xray-monitor.$1.server_ports=$v" || return 1
+	done
+	uci set "xray-monitor.$1.username=$(jsonfilter -i "$f" -e '@.username' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.password=$(jsonfilter -i "$f" -e '@.password' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.mtu=$(jsonfilter -i "$f" -e '@.mtu' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.multiplexing=$(jsonfilter -i "$f" -e '@.multiplexing' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.handshake=$(jsonfilter -i "$f" -e '@.handshake' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.socks5_port=$(jsonfilter -i "$f" -e '@.socks5_port' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.tproxy_port=$(jsonfilter -i "$f" -e '@.tproxy_port' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.lan=$(jsonfilter -i "$f" -e '@.lan' 2>/dev/null)" || return 1
+	uci set "xray-monitor.$1.logging=$(jsonfilter -i "$f" -e '@.logging' 2>/dev/null)" || return 1
+	return 0
+}
+
+# Status surface for the Mieru tab (polled every 15 s): the binary card and
+# one row per connection, plus the cached test verdicts. Every row string
+# went through mieru.uc's charset validation at add/edit time, so the
+# hand-built JSON below is safe even against a hand-edited label (garbage
+# falls back to the section id); the test cache is re-emitted by mieru.uc
+# with ucode's own escaping. Running = the instance's management port
+# answers on loopback (the runtime config only exists once the service has
+# generated it) - no mieru subprocess in the poll path.
+do_mieru_get() {
+	local id label server ports sp tp rp en run first=1 inst="" inst0 vinst vver varch vtests v ires
+	local mtu mux hs log lan srv_ip srv_dm
+	command -v ucode >/dev/null 2>&1 || { printf '{"binary":{"installed":0,"version":"","arch":"","installing":0},"instances":[],"tests":{},"install_result":null}\n'; return 0; }
+	vinst=0
+	[ -x "$MIERU" ] && vinst=1
+	vver=$(mieru_version)
+	varch=$(uname -m)
+	# read-only poll of the install marker (no writes here - the reserve/
+	# claim/clear transitions own it, see the marker block above)
+	inst0=0
+	if mieru_marker_live "$(cat "$MIERU_RUN_MARKER" 2>/dev/null)"; then
+		inst0=1
+	fi
+	for id in $(mieru_ids); do
+		en=1
+		[ "$(uci -q get "xray-monitor.$id.enabled")" = "0" ] && en=0
+		label=$(uci -q get "xray-monitor.$id.label")
+		echo "$label" | grep -qE '^[A-Za-z0-9_.-]{1,32}$' || label="$id"
+		srv_ip=$(uci -q get "xray-monitor.$id.server_ip")
+		echo "$srv_ip" | grep -qE '^[A-Za-z0-9.:%-]+$' || srv_ip=""
+		srv_dm=$(uci -q get "xray-monitor.$id.server_domain")
+		echo "$srv_dm" | grep -qE '^[A-Za-z0-9.-]+$' || srv_dm=""
+		server="$srv_ip"; [ -n "$server" ] || server="$srv_dm"
+		ports=""
+		for v in $(uci -q get "xray-monitor.$id.server_ports" 2>/dev/null); do
+			echo "$v" | grep -qiE '^[0-9]+(-[0-9]+)?/(tcp|udp)$' && ports="$ports $v"
+		done
+		ports=${ports# }
+		sp=$(e2e_num "$(uci -q get "xray-monitor.$id.socks5_port")")
+		tp=$(e2e_num "$(uci -q get "xray-monitor.$id.tproxy_port")")
+		rp=$(e2e_num "$(uci -q get "xray-monitor.$id.rpc_port")")
+		# edit-form prefill values (charset-validated enums; junk -> defaults)
+		mtu=$(e2e_num "$(uci -q get "xray-monitor.$id.mtu")"); [ "$mtu" = 0 ] && mtu=1400
+		mux=$(uci -q get "xray-monitor.$id.multiplexing")
+		echo "$mux" | grep -qE '^MULTIPLEXING_(OFF|LOW|MIDDLE|HIGH)$' || mux=MULTIPLEXING_LOW
+		hs=$(uci -q get "xray-monitor.$id.handshake")
+		echo "$hs" | grep -qE '^HANDSHAKE_(STANDARD|NO_WAIT)$' || hs=HANDSHAKE_STANDARD
+		log=$(uci -q get "xray-monitor.$id.logging")
+		echo "$log" | grep -qE '^(DEBUG|INFO|WARNING|ERROR)$' || log=ERROR
+		lan=0; [ "$(uci -q get "xray-monitor.$id.lan")" = "1" ] && lan=1
+		run=0
+		if [ "$vinst" = 1 ] && [ "$rp" -ge 1 ] && [ -f "$MIERU_RUN/$id.json" ]; then
+			# mieru binds the management port on whatever "localhost"
+			# resolves to - IPv4 OR IPv6 loopback depending on the box
+			netstat -tln 2>/dev/null | grep -qE "127\.0\.0\.1:$rp |::1:$rp " && run=1
+		fi
+		[ "$first" = 1 ] || inst="$inst,"
+		first=0
+		inst="$inst{\"id\":\"$id\",\"label\":\"$label\",\"enabled\":$en,\"server\":\"$server\",\"server_ip\":\"$srv_ip\",\"server_domain\":\"$srv_dm\",\"ports\":\"$ports\",\"socks5_port\":$sp,\"tproxy_port\":$tp,\"rpc_port\":$rp,\"mtu\":$mtu,\"mux\":\"$mux\",\"hs\":\"$hs\",\"log\":\"$log\",\"lan\":$lan,\"running\":$run}"
+	done
+	vtests=$("$SHARE/mieru.uc" tests "$MIERU_TEST" 2>/dev/null)
+	[ -n "$vtests" ] || vtests="{}"
+	# terminal outcome of the last (possibly detached) install - ucode both
+	# validates and escapes it; null when absent/unparsable
+	ires=$("$SHARE/mieru.uc" note "$MIERU_RES" 2>/dev/null)
+	[ -n "$ires" ] || ires="null"
+	printf '{"binary":{"installed":%s,"version":"%s","arch":"%s","installing":%s},"instances":[%s],"tests":%s,"install_result":%s}\n' \
+		"$vinst" "${vver:-}" "$varch" "$inst0" "$inst" "$vtests" "$ires"
+}
+
+# Commit the staged mieru changes or roll them back: a read-only/full
+# overlay must not leave half-written state behind while the UI hears "ok"
+# (uci keeps uncommitted deltas in memory and would commit them with the
+# NEXT writer's commit).
+mieru_uci_commit() {
+	if uci commit xray-monitor 2>/dev/null; then
+		return 0
+	fi
+	uci -q revert xray-monitor 2>/dev/null
+	echo "uci commit failed (read-only or full overlay?) - nothing changed"
+	return 1
+}
+
+# Roll back staged deltas and print the reason - the shared tail of every
+# failed write path (a failed set, a failed commit).
+mieru_uci_abort() {  # <msg>
+	uci -q revert xray-monitor 2>/dev/null
+	echo "${1:-uci write failed - nothing changed}"
+}
+
+do_mieru_add() {  # <conn-file>
+	local norm tmp label socks tp conf rpc sec
+	command -v ucode >/dev/null 2>&1 || { echo "ucode not installed"; return 1; }
+	[ -s "$1" ] || { echo "no input"; return 1; }
+	norm=$("$SHARE/mieru.uc" check "$1" 2>&1) || { echo "$norm"; return 1; }
+	tmp=$(mktemp "${TMPDIR:-/tmp}/mieru.XXXXXX") || { echo "mktemp failed"; return 1; }
+	printf '%s\n' "$norm" > "$tmp"
+	label=$(jsonfilter -i "$tmp" -e '@.label' 2>/dev/null)
+	socks=$(jsonfilter -i "$tmp" -e '@.socks5_port' 2>/dev/null)
+	tp=$(jsonfilter -i "$tmp" -e '@.tproxy_port' 2>/dev/null)
+	conf=$(mieru_label_taken "$label" "") && { rm -f "$tmp"; echo "label '$label' is already used"; return 1; }
+	conf=$(mieru_check_ports "$socks" "$tp" "") || { rm -f "$tmp"; echo "$conf"; return 1; }
+	# the rpc port must also dodge THIS connection's new listen ports
+	rpc=$(mieru_free_rpc "" "$socks" "$tp") || { rm -f "$tmp"; echo "no free management port (10090-10199 exhausted?)"; return 1; }
+	mieru_pin_ids || { mieru_uci_abort; rm -f "$tmp"; return 1; }
+	# libuci's anonymous-name generator can collide with a named survivor.
+	# Use a fresh random explicit name, independent of the section's position.
+	sec="mieru${tmp##*.}"
+	if uci -q get "xray-monitor.$sec" >/dev/null 2>&1; then
+		mieru_uci_abort "connection id collision - try again"; rm -f "$tmp"; return 1
+	fi
+	if ! uci set "xray-monitor.$sec=mieru" 2>/dev/null \
+		|| ! mieru_write_uci "$sec" "$tmp" \
+		|| ! uci set "xray-monitor.$sec.rpc_port=$rpc" 2>/dev/null \
+		|| ! uci set "xray-monitor.$sec.enabled"='1' 2>/dev/null; then
+		mieru_uci_abort; rm -f "$tmp"; return 1
+	fi
+	rm -f "$tmp"
+	mieru_uci_commit || return 1
+	echo ok
+}
+
+do_mieru_edit() {  # <id> <conn-file>
+	local id="$1" norm tmp label socks tp conf rpc oldrpc ku kp
+	command -v ucode >/dev/null 2>&1 || { echo "ucode not installed"; return 1; }
+	mieru_section "$id" || { echo "no such connection"; return 1; }
+	[ -s "$2" ] || { echo "no input"; return 1; }
+	# blank credentials = keep the stored ones (the UI never echoes them
+	# back) - the same convention sub-edit uses for the url
+	ku=$(uci -q get "xray-monitor.$id.username")
+	kp=$(uci -q get "xray-monitor.$id.password")
+	norm=$("$SHARE/mieru.uc" check "$2" "$ku" "$kp" 2>&1) || { echo "$norm"; return 1; }
+	tmp=$(mktemp "${TMPDIR:-/tmp}/mieru.XXXXXX") || { echo "mktemp failed"; return 1; }
+	printf '%s\n' "$norm" > "$tmp"
+	label=$(jsonfilter -i "$tmp" -e '@.label' 2>/dev/null)
+	socks=$(jsonfilter -i "$tmp" -e '@.socks5_port' 2>/dev/null)
+	tp=$(jsonfilter -i "$tmp" -e '@.tproxy_port' 2>/dev/null)
+	conf=$(mieru_label_taken "$label" "$id") && { rm -f "$tmp"; echo "label '$label' is already used"; return 1; }
+	# Keep the assigned rpc port only when it is a valid port that dodges the
+	# NEW socks5/tproxy values too; anything else (junk, 0, a collision the
+	# hand-edited UCI produced) is re-allocated fresh.
+	oldrpc=$(uci -q get "xray-monitor.$id.rpc_port")
+	conf=$(mieru_check_ports "$socks" "$tp" "$id") || { rm -f "$tmp"; echo "$conf"; return 1; }
+	rpc=""
+	case "$oldrpc" in
+		''|*[!0-9]*) ;;
+		*)
+			[ "$oldrpc" -ge 1 ] && [ "$oldrpc" -le 65535 ] && case " $(mieru_ports_used "$id" "$socks" "$tp") " in
+				*" $oldrpc "*) ;;
+				*) rpc="$oldrpc" ;;
+			esac
+			;;
+	esac
+	if [ -z "$rpc" ]; then
+		rpc=$(mieru_free_rpc "$id" "$socks" "$tp") || { rm -f "$tmp"; echo "no free management port"; return 1; }
+	fi
+	if ! mieru_pin_ids \
+		|| ! mieru_write_uci "$id" "$tmp" \
+		|| ! uci set "xray-monitor.$id.rpc_port=$rpc" 2>/dev/null; then
+		mieru_uci_abort; rm -f "$tmp"; return 1
+	fi
+	rm -f "$tmp"
+	mieru_uci_commit || return 1
+	echo ok
+}
+
+do_mieru_del() {  # <id>
+	mieru_section "$1" || { echo "no such connection"; return 1; }
+	if ! mieru_pin_ids || ! uci -q delete "xray-monitor.$1"; then
+		mieru_uci_abort "delete failed - nothing changed"; return 1
+	fi
+	mieru_uci_commit || return 1
+	# Reap the instance NOW: without the restart the deleted connection's
+	# process (and its respawn) would keep serving until the next manual
+	# restart. The restart comes FIRST: the service generator rebuilds the
+	# runtime directory from the committed UCI, whose keep-list already
+	# prunes removed sections - and while it FAILS, the still-running
+	# instance keeps its config (respawn and `mieru test` read it), so the
+	# user can simply press Restart again. Only a successful restart (or a
+	# missing init script, where there is nothing driving the lifecycle)
+	# falls through to the belt-and-suspenders rm below.
+	if [ -x "$MIERU_INIT" ]; then
+		if ! "$MIERU_INIT" restart >/dev/null 2>&1 3>&- 4>&-; then
+			echo "deleted from UCI, but the service restart failed - press Restart to stop the lingering instance"
+			return 1
+		fi
+	fi
+	rm -f "$MIERU_RUN/$1.json" "$MIERU_RUN/redsocks-$1.conf"
+	echo ok
+}
+
+# Hand the section set to procd. The init script (and anything it spawns)
+# outlives this command: close the lock fds like every other init.d call,
+# or procd's children would hold the mutation lock hostage.
+do_mieru_restart() {
+	[ -x "$MIERU_INIT" ] || { echo "init script not found at $MIERU_INIT"; return 1; }
+	if "$MIERU_INIT" restart >/dev/null 2>&1 3>&- 4>&-; then
+		echo ok
+	else
+		echo "service restart failed"
+		return 1
+	fi
+}
+
+# One connectivity check through a RUNNING connection (`mieru test` talks to
+# the instance's rpc port; without a running instance there is nothing to
+# test). The verdict lands in the volatile cache the tab polls - the same
+# atomic .new+mv write as the e2e results, with the read-merge-write held
+# under a small fd-4 lock so two concurrent tests cannot drop each other's
+# verdicts (the probes themselves still run in parallel). Without the lock
+# (no flock, open failure, timeout) there is NO cache write at all: the
+# shared .new path must never be written unlocked, and the verdict still
+# reaches the caller through this command's reply.
+do_mieru_test() {  # <id>
+	local id="$1" cfg out rc det ok theld=0
+	mieru_section "$id" || { echo "no such connection"; return 1; }
+	[ -x "$MIERU" ] || { echo "mieru binary is not installed"; return 1; }
+	cfg="$MIERU_RUN/$id.json"
+	[ -f "$cfg" ] || { echo "connection is not running - restart the service first"; return 1; }
+	out=$(MIERU_CONFIG_JSON_FILE="$cfg" "$MIERU" test "$e2e_url_204" 2>&1); rc=$?
+	det=$(printf '%s\n' "$out" | head -n1 | tr -s '\r\n\t ' ' ' | cut -c1-120)
+	ok=0; [ "$rc" -eq 0 ] && ok=1
+	mkdir -p "$TSTATE_DIR"
+	# bounded poll of non-blocking tries - BusyBox flock has no -w. The open
+	# is probed in a subshell first: a failed `exec <redir>` kills a
+	# non-interactive ash outright, and a lock problem must skip the cache
+	# write, not the whole command.
+	if command -v flock >/dev/null 2>&1 && ( exec 4>>"$MTESTLOCK" ) 2>/dev/null; then
+		# bare `exec` redirections persist: no 2>/dev/null here (the probe
+		# above already ruled the open failure out), or every later stderr
+		# message of this command would be swallowed
+		exec 4>>"$MTESTLOCK"
+		ti=0
+		while [ "$ti" -lt 5 ]; do
+			flock -n 4 2>/dev/null && { theld=1; break; }
+			ti=$((ti + 1))
+			sleep 1
+		done
+		[ "$theld" = 1 ] || exec 4>&-
+	fi
+	if [ "$theld" = 1 ]; then
+		if "$SHARE/mieru.uc" tests "$MIERU_TEST" "$id" "$ok" "$det" > "$MIERU_TEST.new" 2>/dev/null; then
+			mv "$MIERU_TEST.new" "$MIERU_TEST"
+		else
+			rm -f "$MIERU_TEST.new"
+		fi
+		flock -u 4 2>/dev/null
+		exec 4>&-
+	fi
+	[ "$ok" = 1 ] && echo "test passed" || { echo "test failed: ${det:-no output}"; return 1; }
+}
+
+# uname -m -> upstream's release arch ("" = no official build: mips and the
+# pre-v7 ARMs - those place a self-built binary at $MIERU by hand).
+mieru_arch() {
+	case "$(uname -m)" in
+		x86_64)        echo amd64 ;;
+		arm64|aarch64) echo arm64 ;;
+		armv7*)        echo armv7 ;;
+		riscv64)       echo riscv64 ;;
+		*)             echo "" ;;
+	esac
+}
+
+# Record the terminal outcome of an install for the polled status surface
+# (the run may be detached - its stdout goes to a log the UI never opens).
+mieru_install_note() {  # <ok 0|1> <msg>
+	local f="$MIERU_RES"
+	( "$SHARE/mieru.uc" note "$f" "$1" "$2" > "$f.new" ) 2>/dev/null && mv "$f.new" "$f"
+}
+
+# Download+install the mieru binary from upstream's GitHub releases, with
+# the same integrity and proxy rules as self-update: the tarball is verified
+# against its published .sha256.txt sidecar (matched BY FILENAME - a sidecar
+# may list several assets) before anything is installed, the install is an
+# atomic rename, and the downloads honor fetch_via_update (direct first
+# unless pinned to proxy; auto retries through tmpxray). The package
+# manager is not involved - it is a single static binary.
+# Memory note: only the ~12 MB COMPRESSED tarball lands in $TMPDIR (tmpfs);
+# the ~25-40 MB binary is streamed out of the archive directly onto the
+# overlay-backed destination, so a small-RAM box never holds both copies in
+# RAM. An ENOSPC on /usr fails the final rename honestly and cleans up.
+do_mieru_install() {  # [version]
+	local arch ver tag dl tmp exp got bin member inst_ok mieru_err artifact
+	command -v curl >/dev/null 2>&1 || { mieru_install_note 0 "curl not installed"; echo "curl not installed"; return 1; }
+	command -v tar >/dev/null 2>&1 || { mieru_install_note 0 "tar not installed"; echo "tar not installed"; return 1; }
+	arch=$(mieru_arch)
+	[ -n "$arch" ] || {
+		mieru_install_note 0 "no official mieru build for $(uname -m) - place a self-built binary at $MIERU manually"
+		echo "no official mieru build for $(uname -m) - place a self-built binary at $MIERU manually"
+		return 1
+	}
+	ver=""
+	if [ -n "$1" ]; then
+		ver="${1#v}"
+		echo "$ver" | grep -qE '^[0-9]+\.[0-9]+(\.[0-9]+)?$' || { mieru_install_note 0 "invalid version (want e.g. 3.39.0)"; echo "invalid version (want e.g. 3.39.0)"; return 1; }
+	fi
+	tmp=$(mktemp -d "${TMPDIR:-/tmp}/mieru-inst.XXXXXX") || { mieru_install_note 0 "mktemp failed"; echo "mktemp failed"; return 1; }
+	mieru_fetch_all() {
+		if [ -z "$ver" ]; then
+			tag=$(via_curl -s --max-time 15 "$MIERU_GH_API" 2>/dev/null | jsonfilter -e '@.tag_name' 2>/dev/null)
+			case "$tag" in
+				v[0-9.]*) ver="${tag#v}" ;;
+				*) mieru_err="cannot resolve the latest mieru release (GitHub API unreachable) - pass an explicit version"; return 1 ;;
+			esac
+		fi
+		dl="$MIERU_GH_DL/v$ver/mieru_${ver}_linux_${arch}.tar.gz"
+		via_curl -fsSL --max-time 180 -o "$tmp/mieru.tar.gz" "$dl" 2>/dev/null \
+			|| { mieru_err="download failed (mieru $ver for $arch)"; return 1; }
+		via_curl -fsSL --max-time 30 -o "$tmp/mieru.sha256.txt" "$dl.sha256.txt" 2>/dev/null \
+			|| { mieru_err="cannot download the SHA256 sidecar"; return 1; }
+		return 0
+	}
+	inst_ok=0; mieru_err=""
+	if [ "$fetch_via_update" != proxy ]; then
+		mieru_fetch_all && inst_ok=1
+	fi
+	if [ "$inst_ok" != 1 ] && [ "$fetch_via_update" != direct ]; then
+		if via_ensure; then
+			mieru_fetch_all && inst_ok=1
+		else
+			mieru_err="proxy path unavailable: $via_err"
+		fi
+	fi
+	if [ "$inst_ok" != 1 ]; then
+		rm -rf "$tmp"
+		mieru_install_note 0 "${mieru_err:-download failed}"
+		echo "${mieru_err:-download failed}"
+		return 1
+	fi
+	via_stop
+	# pick THIS artifact's line out of the sidecar (it may list several);
+	# exactly one match is required - zero or duplicates mean refuse
+	artifact="mieru_${ver}_linux_${arch}.tar.gz"
+	exp=$(awk -v artifact="$artifact" '
+		NF == 2 && ($2 == artifact || $2 == "*" artifact) { count++; hash=$1 }
+		END { if (count == 1) print hash }
+	' "$tmp/mieru.sha256.txt")
+	case "$exp" in
+		'') rm -rf "$tmp"
+		    mieru_install_note 0 "SHA256 sidecar has no unique entry for this artifact - refusing to install"
+		    echo "SHA256 sidecar has no unique entry for this artifact - refusing to install"; return 1 ;;
+		*[!0-9a-f]*) rm -rf "$tmp"
+		    mieru_install_note 0 "malformed SHA256 in the sidecar - refusing to install"
+		    echo "malformed SHA256 in the sidecar - refusing to install"; return 1 ;;
+	esac
+	got=$(sha256sum "$tmp/mieru.tar.gz" 2>/dev/null | awk '{ print $1 }')
+	[ "$got" = "$exp" ] || {
+		rm -rf "$tmp"
+		mieru_install_note 0 "SHA256 mismatch (expected $exp, got $got) - refusing to install"
+		echo "SHA256 mismatch (expected $exp, got $got) - refusing to install"; return 1
+	}
+	# find the member, then stream JUST it out of the archive onto the
+	# destination filesystem (see the memory note above)
+	member=$(tar -tzf "$tmp/mieru.tar.gz" 2>/dev/null | grep -E '(^|/)mieru$' | head -n1)
+	case "$member" in
+		mieru|*/mieru) ;;
+		*) rm -rf "$tmp"
+		   mieru_install_note 0 "no mieru binary inside the tarball"
+		   echo "no mieru binary inside the tarball"; return 1 ;;
+	esac
+	if ! tar -xzOf "$tmp/mieru.tar.gz" "$member" > "$MIERU.new" 2>/dev/null || [ ! -s "$MIERU.new" ]; then
+		rm -f "$MIERU.new"; rm -rf "$tmp"
+		mieru_install_note 0 "extract failed (no space on the destination filesystem?)"
+		echo "extract failed (no space on the destination filesystem?)"; return 1
+	fi
+	chmod 0755 "$MIERU.new" && mv "$MIERU.new" "$MIERU" || {
+		rm -f "$MIERU.new"; rm -rf "$tmp"
+		mieru_install_note 0 "install failed (no space on the destination filesystem?)"
+		echo "install failed (no space on the destination filesystem?)"; return 1
+	}
+	rm -rf "$tmp"
+	mieru_install_note 1 "installed mieru $ver"
+	echo "installed mieru ${ver} at $MIERU (restart the service to run it)"
+	return 0
+}
+
+# Latest published version, for the tab's update check ("" = unreachable).
+# The same transport rule as the installer: proxy mode never tries direct,
+# auto retries a failed direct attempt through tmpxray, direct is direct.
+do_mieru_latest() {
+	local out
+	if [ "$fetch_via_update" != proxy ]; then
+		out=$(via_curl -s --max-time 15 "$MIERU_GH_API" 2>/dev/null | jsonfilter -e '@.tag_name' 2>/dev/null)
+	fi
+	if [ -z "$out" ] && [ "$fetch_via_update" != direct ]; then
+		if via_ensure; then
+			out=$(via_curl -s --max-time 15 "$MIERU_GH_API" 2>/dev/null | jsonfilter -e '@.tag_name' 2>/dev/null)
+			via_stop
+		fi
+	fi
+	printf '%s' "$out" | sed 's/^v//'
+}
+
 case "$1" in
-	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync|backups-delete|backups-pin|backups-restore|overrides-apply)
+	fetch|apply|routing-set|balancers-set|config-save|enable-api|sub-add|sub-del|sub-edit|set-cfg|cron-sync|backups-delete|backups-pin|backups-restore|overrides-apply|mieru-add|mieru-edit|mieru-del|mieru-restart|mieru-install)
 		take_lock || {
 			if [ "$XRAYMON_NOWAIT" = 1 ]; then
 				echo "another xray-monitor operation is running, try again in a moment"
@@ -1752,6 +2390,37 @@ case "$1" in
 		esac
 		;;
 
+	# --- Mieru tab: client connections (see the mieru block above) ------------
+	mieru-get)     do_mieru_get ;;
+	mieru-latest)  do_mieru_latest ;;
+	mieru-add)     do_mieru_add "$2" ;;
+	mieru-edit)    do_mieru_edit "$2" "$3" ;;
+	mieru-del)     do_mieru_del "$2" ;;
+	mieru-restart) do_mieru_restart ;;
+	mieru-test)    do_mieru_test "$2" ;;
+	# The install can be detached by the rpcd layer (a ~25 MB download must
+	# not sit inside the ubus call). Claim the run marker first - a live
+	# worker means somebody else owns the install - then clear it on every
+	# exit path (the EXIT trap; a SIGKILLed worker leaves its pid behind,
+	# which the next reservation reclaims after the liveness check).
+	mieru-install)
+		mkdir -p "$TSTATE_DIR"
+		claim_err=$(mieru_marker_claim 2>&1)
+		if [ "$?" != 0 ]; then
+			# An unowned worker must preserve the active owner's outcome.
+			echo "$claim_err"
+			exit 1
+		fi
+		trap 'mieru_marker_clear; cleanup' EXIT
+		trap 'exit 1' INT TERM HUP
+		if ! mieru_install_note 0 'install worker exited without reporting an outcome'; then
+			echo 'cannot publish the install outcome - refusing to install' >&2
+			exit 1
+		fi
+		do_mieru_install "$2"
+		exit $?
+		;;
+
 	*)
-		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api|overrides-list|overrides-apply|tmpxray start <tag>...|tmpxray stop|e2e [tag...]|backups-list|backups-get <name>|backups-delete <name>|backups-pin <name> <0|1>|backups-restore <name>"; exit 1 ;;
+		echo "usage: xray-sub fetch|apply|status|set-cfg ...|cron-sync|sub-add|sub-del|sub-edit|routing-get|routing-set <f>|balancers-get|balancers-set <f>|config-save <f>|enable-api|overrides-list|overrides-apply|tmpxray start <tag>...|tmpxray stop|e2e [tag...]|backups-list|backups-get <name>|backups-delete <name>|backups-pin <name> <0|1>|backups-restore <name>|mieru-get|mieru-add <f>|mieru-edit <id> <f>|mieru-del <id>|mieru-restart|mieru-test <id>|mieru-install [ver]|mieru-latest"; exit 1 ;;
 esac

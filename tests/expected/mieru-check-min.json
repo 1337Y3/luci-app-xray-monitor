@@ -1,0 +1,1 @@
+{ "label": "home", "server_ip": "", "server_domain": "m.example.org", "ports": [ "8964/TCP" ], "username": "u1", "password": "p1", "mtu": 1400, "multiplexing": "MULTIPLEXING_LOW", "handshake": "HANDSHAKE_STANDARD", "socks5_port": 1081, "tproxy_port": 0, "rpc_port": 10091, "logging": "ERROR", "lan": 0, "enabled": 1 }

@@ -1,0 +1,9 @@
+{
+	"label": "home",
+	"server_domain": "m.example.org",
+	"server_ports": ["8964/TCP"],
+	"username": "u1",
+	"password": "p1",
+	"socks5_port": 1081,
+	"rpc_port": 10091
+}

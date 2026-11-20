@@ -45,10 +45,10 @@ jobs:
         run: sh tests/js-test.sh
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libjson-c-dev
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libjson-c-dev pkg-config
 
       # ucode is only packaged by OpenWrt itself; build it from source with
-      # every integration module (ubus/uci/uloop/ffi/...) disabled so plain
+      # integration modules (ubus/uci/uloop/ffi/...) initially disabled so plain
       # ubuntu runners can run the .uc helpers. Installing to /usr matches
       # the #!/usr/bin/ucode shebangs of the scripts under test. The 23.05
       # leg shallow-fetches the exact pinned commit (no branch assumptions),
@@ -126,6 +126,20 @@ jobs:
           [ -f "$JP_BIN" ] || JP_BIN=/tmp/jsonpath/jsonpath
           sudo install -m 0755 "$JP_BIN" /usr/bin/jsonfilter
           echo '{"a":["b","c"]}' | jsonfilter -e '@.a[0]'
+
+      - name: Build real UCI and ucode UCI module
+        run: |
+          git clone --depth 1 https://github.com/openwrt/uci /tmp/uci
+          cmake -S /tmp/uci -B /tmp/uci/build -DCMAKE_INSTALL_PREFIX=/usr -DBUILD_LUA=OFF
+          cmake --build /tmp/uci/build -j"$(nproc)"
+          sudo cmake --install /tmp/uci/build
+          sudo ldconfig
+          cmake -S /tmp/ucode -B /tmp/ucode/build -DUCI_SUPPORT=ON
+          cmake --build /tmp/ucode/build -j"$(nproc)"
+          sudo cmake --install /tmp/ucode/build
+
+      - name: Mieru scenario with real libuci
+        run: sh tests/mieru-uci-scenario.sh
 
       - name: Golden tests (parse/apply/diff/routing/balancers)
         run: sh tests/run.sh
