@@ -1545,7 +1545,9 @@ do_mieru_get() {
 		lan=0; [ "$(uci -q get "xray-monitor.$id.lan")" = "1" ] && lan=1
 		run=0
 		if [ "$vinst" = 1 ] && [ "$rp" -ge 1 ] && [ -f "$MIERU_RUN/$id.json" ]; then
-			netstat -tln 2>/dev/null | grep -q "127.0.0.1:$rp " && run=1
+			# mieru binds the management port on whatever "localhost"
+			# resolves to - IPv4 OR IPv6 loopback depending on the box
+			netstat -tln 2>/dev/null | grep -qE "127\.0\.0\.1:$rp |::1:$rp " && run=1
 		fi
 		[ "$first" = 1 ] || inst="$inst,"
 		first=0
