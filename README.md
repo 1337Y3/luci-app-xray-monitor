@@ -269,25 +269,58 @@ A LuCI app to **monitor and manage Xray** from the OpenWrt web UI. Tabs under
     the connection's transparent port, or — without any redsocks of your own —
     point ruantiblock's redsocks backend upstream at
     `127.0.0.1:<SOCKS5 port>` and leave the transparent port empty;
-  - by hand, a minimal fw4/nftables rule (dstnat on the lan side, private
-    destinations excluded so the LAN, the router's own LuCI/SSH/DNS and
-    local printers keep working directly):
-    ```sh
-    nft add rule inet fw4 dstnat_lan tcp dport 1-65535 ip daddr != { 0.0.0.0/8, 10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } redirect to :12345
-    ```
-    (also exclude your mieru server's address if the SERVER sits inside a
-    range the rule covers — traffic to it must never loop back through the
-    proxy).
-  - or the fw3/iptables equivalent, with the same local-destination
-    exclusions IN the rule (`! -d` is the iptables negation form — without
-    them every connection to the router itself, LuCI and SSH included,
-    would land in the proxy):
-    ```sh
-    iptables -t nat -A PREROUTING -i br-lan -p tcp \
-      ! -d 0.0.0.0/8 ! -d 10.0.0.0/8 ! -d 127.0.0.0/8 ! -d 169.254.0.0/16 \
-      ! -d 172.16.0.0/12 ! -d 192.168.0.0/16 ! -d 224.0.0.0/4 ! -d 240.0.0.0/4 \
-      -j REDIRECT --to-ports 12345
-    ```
+  - by hand, use one of the examples below. Replace `br-lan`, `12345`
+    and `203.0.113.10` with your LAN interface, transparent port and mieru
+    server's IPv4 address. For a hostname, exclude **every resolved server
+    address** and keep those exclusions current. These examples handle IPv4
+    TCP only; IPv6, UDP and DNS need a separate policy.
+
+The transparent listener binds **`0.0.0.0` (all IPv4 interfaces)** because
+REDIRECT sends LAN packets to the router's incoming-interface address.
+A loopback bind would break those packets. The transparent listener accepts
+traffic without authentication: before enabling it, restrict
+INPUT to redirected TCP arriving from the LAN. The app does **not** install
+these restrictions. The examples put that restriction before the usual
+INPUT accept rules, and exclude the router's own addresses, private/local
+networks and the mieru server from redirection.
+
+For **fw4/nftables**, run once after firewall startup:
+
+```sh
+nft -f - <<'EOF'
+add chain inet fw4 mieru_input
+add rule inet fw4 mieru_input iifname "br-lan" ct status dnat accept
+add rule inet fw4 mieru_input drop
+insert rule inet fw4 input tcp dport 12345 jump mieru_input
+add rule inet fw4 dstnat_lan fib daddr type != local ip daddr != { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 203.0.113.10 } tcp dport 1-65535 redirect to :12345
+EOF
+```
+
+For **fw3/iptables**, use a chain with one RETURN rule per exclusion
+(iptables accepts only one destination match per rule):
+
+```sh
+iptables -N MIERU_INPUT
+iptables -A MIERU_INPUT -i br-lan -m conntrack --ctstate DNAT -j ACCEPT
+iptables -A MIERU_INPUT -j DROP
+iptables -I INPUT 1 -p tcp --dport 12345 -j MIERU_INPUT
+iptables -t nat -N MIERU_REDIRECT
+iptables -t nat -A MIERU_REDIRECT -m addrtype --dst-type LOCAL -j RETURN
+for dst in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+  172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 203.0.113.10; do
+  iptables -t nat -A MIERU_REDIRECT -d "$dst" -j RETURN
+done
+iptables -t nat -A MIERU_REDIRECT -p tcp -j REDIRECT --to-ports 12345
+iptables -t nat -A PREROUTING -i br-lan -p tcp -j MIERU_REDIRECT
+```
+
+The INPUT restrictions also apply when ruantiblock supplies the redirect;
+use the restriction block for your firewall even if you do not need the
+manual NAT rule. The rules are temporary and disappear on firewall reload
+or reboot. Put them in your firewall manager's supported custom include
+mechanism for persistence; arrange for them to run once per firewall rebuild
+and before starting the transparent listener. Repeat the port-specific
+rules for each transparent port.
 
 It reads traffic from Xray's built-in **Stats API** over `127.0.0.1:10085`, and
 detects per-outbound connectivity with an active **TCP probe** of each endpoint
@@ -524,5 +557,5 @@ Pure data package (`Architecture: all`), so the SDK isn't required.
 | `/usr/share/xray-monitor/{mieru,mieru-uci}.uc` | mieru connection normalize/client-config builder + UCI bridge |
 | `/usr/share/xray-monitor/xray-sub` | fetch/stage/apply helper (+ hourly cron) |
 | `/etc/init.d/mieru-monitor` | procd service: one `mieru run` (+ redsocks) instance per connection |
-| `/etc/config/xray-monitor` | UCI config (sub URL, user-agent, cron) — conffile |
+| `/etc/config/xray-monitor` | UCI config including subscription and mieru credentials — root-only (0600) conffile |
 | `/etc/xray-monitor/overrides.json` | optional per-tag outbound overrides (see above) |

@@ -45,6 +45,8 @@ stage_package() {
 	# Bake the package version into the UI so a stale cached view can detect
 	# itself against status.app_version.
 	find "$WORK/data/www" -type f -name '*.js' -exec sed -i "s/__XRAY_MONITOR_VER__/${VER}/g" {} \;
+	# Credentials must be private even during image builds (postinst skips those).
+	chmod 0600 "$WORK/data/etc/config/xray-monitor"
 	chmod 0755 "$WORK/data/usr/libexec/rpcd/xray-monitor"
 	chmod 0755 "$WORK"/data/usr/share/xray-monitor/*.uc \
 	           "$WORK"/data/usr/share/xray-monitor/xray-sub

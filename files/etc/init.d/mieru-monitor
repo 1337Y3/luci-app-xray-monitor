@@ -31,10 +31,9 @@ REDSOCKS=/usr/sbin/redsocks
 [ -x "$REDSOCKS" ] || REDSOCKS=/usr/bin/redsocks
 [ -x "$REDSOCKS" ] || REDSOCKS=$(command -v redsocks 2>/dev/null)
 
-# Stable section ids (uci show -X prints cfgXXXXXX for anonymous sections;
-# plain `uci show` would yield @mieru[N], which shifts when rows are deleted
-# and does not survive the id charset checks of the xray-sub helpers).
-mieru_ids() { uci -X show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=mieru$/\1/p'; }
+# xray-sub pins anonymous names before any connection mutation, preserving
+# these runtime keys when another row is deleted. Keep boot generation read-only.
+mieru_ids() { uci -X show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=mieru$/\1/p'; }
 
 # (Re)build /var/etc/xray-monitor/mieru: <id>.json for every enabled+valid
 # section, redsocks-<id>.conf where a transparent port is set; files of

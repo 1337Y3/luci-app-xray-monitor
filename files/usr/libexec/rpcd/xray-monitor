@@ -1059,17 +1059,38 @@ case "$1" in
 					else
 						input=$(cat)
 						ver=$(printf '%s' "$input" | jsonfilter -e '@.version' 2>/dev/null)
-						# a `&` spawn failure cannot be observed portably in sh;
-						# the worker reports its own terminal outcome through
-						# mieru-install.result either way
-						sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; exec /usr/share/xray-monitor/xray-sub mieru-install "$1"' sh "$ver" \
-							>"$E2E_STATE/mieru-install.log" 2>&1 </dev/null &
-						printf '%s\n' "$!" > "$E2E_STATE/mieru-install.run"
+						mi_result="$E2E_STATE/mieru-install.result"
+						# Leave a terminal fallback before launch: exec failures and
+						# abrupt exits must also have an outcome once the pid dies.
+						mi_error=""
+						if [ ! -x "$SUB" ]; then
+							mi_error="cannot launch the install worker"
+						elif ! ( "$SHARE/mieru.uc" note "$mi_result" 0 "install worker exited without reporting an outcome" > "$mi_result.new" ) 2>/dev/null \
+							|| ! mv "$mi_result.new" "$mi_result" 2>/dev/null; then
+							mi_error="cannot publish the install outcome - refusing to start"
+						else
+							sh -c 'trap "" HUP; unset XRAYMON_NOWAIT; export MIERU_RESERVED=1; exec /usr/share/xray-monitor/xray-sub mieru-install "$1"' sh "$ver" \
+								>"$E2E_STATE/mieru-install.log" 2>&1 </dev/null &
+							mi_pid=$!
+							if ! ( printf '%s\n' "$mi_pid" > "$E2E_STATE/mieru-install.run" ) 2>/dev/null \
+								|| [ "$(cat "$E2E_STATE/mieru-install.run" 2>/dev/null)" != "$mi_pid" ]; then
+								# The child waits on our lock and requires its reservation.
+								kill "$mi_pid" 2>/dev/null
+								mi_error="cannot publish the install worker pid - refusing to start"
+							elif ! kill -0 "$mi_pid" 2>/dev/null; then
+								mi_error="cannot launch the install worker; see mieru-install.log"
+							fi
+						fi
 						flock -u 5 2>/dev/null
 						exec 5>&-
 						json_init
-						json_add_boolean ok 1
-						json_add_string msg "Download started - the version card updates when it finishes."
+						if [ -n "$mi_error" ]; then
+							json_add_boolean ok 0
+							json_add_string msg "$mi_error"
+						else
+							json_add_boolean ok 1
+							json_add_string msg "Download started - the version card updates when it finishes."
+						fi
 						json_dump
 					fi
 				fi

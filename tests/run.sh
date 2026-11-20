@@ -150,15 +150,14 @@ check "snapshot: hysteria exit captured" "$EXP/snapshot-hy2.json" "$W/snapshot-h
 "$SHARE/hotswap.uc" plan "$FIX/config-hy2.json" "$FIX/hs-cand-hy2.json" proxy > "$W/hs-hy2.json"
 check "hotswap: hysteria body change -> live remove+add" "$EXP/hs-plan-hy2.json" "$W/hs-hy2.json"
 
-# status.uc imports uci, so CI (plain ucode build, no ucode-mod-uci) skips it;
-# anywhere the module exists (e.g. the router) UCI_CONFIG_DIR pins the fixture
-# and the whole sub_get serialization becomes deterministic.
-echo "== status.uc serialization (sub_get surface; UCI fixture via UCI_CONFIG_DIR)"
+# Pass the fixture directory explicitly: libuci may ignore UCI_CONFIG_DIR.
+# Without ucode-mod-uci these integration checks are skipped.
+echo "== status.uc serialization (sub_get surface; explicit UCI fixture directory)"
 if "$UC" -e 'import * as u from "uci";' >/dev/null 2>&1; then
-	UCI_CONFIG_DIR="$FIX/uci" "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config-status.json" "$FIX/staged-clean.json" "" 1 > "$W/status.json" \
+	"$SHARE/status.uc" 1700000000 ok 1 "$FIX/config-status.json" "$FIX/staged-clean.json" "" 1 "$FIX/uci" > "$W/status.json" \
 		|| { echo "FAIL   status.uc exited non-zero"; fails=$((fails + 1)); }
 	check "status: servers rows (hysteria endpoint, tls SNI fallback, dns excluded) + hysteria_xray_ok=true" "$EXP/status.json" "$W/status.json"
-	if UCI_CONFIG_DIR="$FIX/uci" "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config-status.json" "$FIX/staged-clean.json" "" 0 2>/dev/null \
+	if "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config-status.json" "$FIX/staged-clean.json" "" 0 "$FIX/uci" 2>/dev/null \
 		| grep -q '"hysteria_xray_ok": false'; then
 		echo "PASS   status: old xray flagged (hysteria_xray_ok=false)"
 	else
@@ -166,7 +165,7 @@ if "$UC" -e 'import * as u from "uci";' >/dev/null 2>&1; then
 	fi
 	# staged-only hysteria: cfg without hysteria + staged.json with one - the
 	# warning surface must fire before the first Apply, not after
-	if UCI_CONFIG_DIR="$FIX/uci" "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config.json" "$FIX/staged-clean.json" "$FIX/state-hy" 0 2>/dev/null \
+	if "$SHARE/status.uc" 1700000000 ok 1 "$FIX/config.json" "$FIX/staged-clean.json" "$FIX/state-hy" 0 "$FIX/uci" 2>/dev/null \
 		| grep -q '"hysteria_present": true'; then
 		echo "PASS   status: staged-only hysteria detected (first fetch on an old core)"
 	else

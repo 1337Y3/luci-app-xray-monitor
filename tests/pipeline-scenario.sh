@@ -53,6 +53,8 @@ REPO=$(cd "$HERE/.." && pwd)
 FIX="$REPO/tests/fixtures"
 SHARESRC="$REPO/files/usr/share/xray-monitor"
 
+sh "$HERE/install-marker.sh" || exit 1
+
 command -v ucode >/dev/null 2>&1 || { echo "ucode not found in PATH"; exit 1; }
 ucode -e 'import { readfile } from "fs";' >/dev/null 2>&1 \
 	|| { echo "ucode-mod-fs not installed"; exit 1; }
@@ -288,15 +290,24 @@ cat > "$SB/bin/uci" <<'EOF'
 # subscriptions and fetch_via* options), then $STUB_UCI_STATE
 # (balancer_override sections for the F15 override cases). A get prints EVERY
 # matching line of the winning source (real uci prints each list entry).
-# Unknown flags (-X among them) are skipped like -q.
+# -X exposes anonymous raw IDs; ordinary show exposes @mieru[N].
 RW=${STUB_UCI_RW:-/nonexistent}
 src() { [ -f "$RW" ] && { echo "$RW"; return; }; [ -f "${STUB_UCI_STATE:-/nonexistent}" ] && { echo "${STUB_UCI_STATE}"; return; }; [ -n "${STUB_UCI:-}" ] && echo "$STUB_UCI"; }
+raw=0
 while [ $# -gt 0 ]; do
 	case "$1" in
-		-q|-X) ;;
+		-q) ;;
+		-X) raw=1 ;;
 		show)
+			[ -f "${STUB_UCI_SHOW_FAIL:-/nonexistent}" ] && exit 1
 			s=$(src)
-			[ -n "$s" ] && cat "$s" 2>/dev/null
+			if [ -n "$s" ]; then
+				if [ "$raw" = 0 ] && [ -n "${STUB_UCI_ANONYMOUS_ID:-}" ]; then
+					sed "s/^xray-monitor\.${STUB_UCI_ANONYMOUS_ID}=mieru$/xray-monitor.@mieru[0]=mieru/" "$s"
+				else
+					cat "$s" 2>/dev/null
+				fi
+			fi
 			exit 0 ;;
 		get)
 			[ -n "$2" ] || exit 1
@@ -329,14 +340,25 @@ while [ $# -gt 0 ]; do
 			printf 'xray-monitor.cfg%s=%s\n' "$n" "$3" >> "$RW"
 			echo "cfg$n"
 			exit 0 ;;
-		set)
-			# uci set xray-monitor.<sec>.<opt>=<val> (upsert into $RW)
+		rename)
+			# Pin an existing anonymous name without changing its lookup key.
 			[ -f "$RW" ] || exit 1
-			case "$2" in xray-monitor.*.*) ;; *) exit 1 ;; esac
+			[ -f "${STUB_UCI_RENAME_FAIL:-/nonexistent}" ] && exit 1
+			key=${2%%=*}; val=${2#*=}
+			[ "${key#xray-monitor.}" = "$val" ] || exit 1
+			grep -q "^${key}=mieru$" "$RW" || exit 1
+			exit 0 ;;
+		set)
+			# uci set section or option (upsert into $RW)
+			[ -f "$RW" ] || exit 1
+			case "$2" in xray-monitor.*=*) ;; *) exit 1 ;; esac
 			[ -f "${STUB_UCI_SET_FAIL:-/nonexistent}" ] && exit 1
 			key=${2%%=*}; val=${2#*=}
 			grep -v "^$(printf '%s' "$key" | sed 's/[.]/\\./g')=" "$RW" > "$RW.tmp"
-			printf "%s='%s'\n" "$key" "$val" >> "$RW.tmp"
+			case "$key" in
+				xray-monitor.*.*) printf "%s='%s'\n" "$key" "$val" >> "$RW.tmp" ;;
+				*) printf "%s=%s\n" "$key" "$val" >> "$RW.tmp" ;;
+			esac
 			mv "$RW.tmp" "$RW"
 			exit 0 ;;
 		add_list)
@@ -348,6 +370,9 @@ while [ $# -gt 0 ]; do
 			exit 0 ;;
 		delete)
 			[ -f "$RW" ] || exit 1
+			[ -f "${STUB_UCI_DELETE_FAIL:-/nonexistent}" ] && exit 1
+			# Real UCI fails deletion of a nonexistent option/section.
+			grep -F -q "$2=" "$RW" || exit 1
 			pat=$(printf '%s' "$2" | sed 's/[.]/\\./g')
 			case "$2" in
 				xray-monitor.*.*)
@@ -1811,21 +1836,63 @@ out=$(runsub mieru-install 2>/dev/null); rc=$?
 ok_eq "mieru: install with bad SHA rc" 1 "$rc"
 is "mieru: install with bad SHA refuses with the mismatch reason" "$(printf '%s' "$out" | grep -q '^SHA256 mismatch' && echo 1 || echo 0)"
 is "mieru: bad SHA leaves the installed binary in place" "$("$SB/bin/mieru" version 2>/dev/null | grep -q 'mieru version 9.9.9' && echo 1 || echo 0)"
+# Filename matching is literal and covers the complete checksum record.
+for bad_name in "prefixmieru_3.39.0_linux_${mieru_stub_arch}.tar.gz" \
+	"mieru_3x39x0_linux_${mieru_stub_arch}.tar.gz" \
+	"mieru_3.39.0_linux_${mieru_stub_arch}.tar.gz extra"; do
+	printf '%s  %s\n' "$msha" "$bad_name" > "$STUB_CURL_MIERU_SHA"
+	out=$(runsub mieru-install 2>/dev/null); rc=$?
+	ok_eq "mieru: rejects inexact artifact name $bad_name" 1 "$rc"
+	is "mieru: inexact name gives unique-entry reason" "$(printf '%s' "$out" | grep -q 'no unique entry' && echo 1 || echo 0)"
+done
+printf '%s  *mieru_3.39.0_linux_%s.tar.gz\n' "$msha" "$mieru_stub_arch" > "$STUB_CURL_MIERU_SHA"
+out=$(runsub mieru-install 2>/dev/null); rc=$?
+ok_eq "mieru: accepts exact binary-mode checksum filename" 0 "$rc"
+printf '%s  mieru_3.39.0_linux_%s.tar.gz\n' "$msha" "$mieru_stub_arch" >> "$STUB_CURL_MIERU_SHA"
+out=$(runsub mieru-install 2>/dev/null); rc=$?
+ok_eq "mieru: duplicate exact checksum records refused" 1 "$rc"
 # restore the good sidecar + the default uci answers
 printf '%s  mieru_3.39.0_linux_%s.tar.gz\n' "$msha" "$mieru_stub_arch" > "$STUB_CURL_MIERU_SHA"
 printf '%s\n' "xray-monitor.sub=xray-monitor" "xray-monitor.sub.backup_keep='3'" > "$STUB_UCI"
 
+echo "== mieru install: partial extraction preserves the executable"
+REAL_MIERU_TAR=$(command -v tar)
+export REAL_MIERU_TAR
+cat > "$SB/bin/tar" <<'EOF'
+#!/bin/sh
+if [ "$1" = -xzOf ]; then printf 'partial executable'; exit 1; fi
+exec "$REAL_MIERU_TAR" "$@"
+EOF
+chmod +x "$SB/bin/tar"
+mieru_before=$(sha256sum "$SB/bin/mieru" | awk '{print $1}')
+out=$(runsub mieru-install 2>/dev/null); rc=$?
+ok_eq "mieru: partial extraction fails" 1 "$rc"
+ok_eq "mieru: partial extraction preserves installed bytes" "$mieru_before" "$(sha256sum "$SB/bin/mieru" | awk '{print $1}')"
+is "mieru: installed executable remains runnable" "$("$SB/bin/mieru" version | grep -q 'mieru version 9.9.9' && echo 1 || echo 0)"
+is "mieru: partial extraction removes staging file" "$([ ! -e "$SB/bin/mieru.new" ] && echo 1 || echo 0)"
+is "mieru: partial extraction records meaningful failure" "$(grep -q '"ok": false.*extract failed' "$SB/tmp/xray-monitor/mieru-install.result" && echo 1 || echo 0)"
+rm "$SB/bin/tar"
+
 echo "== mieru tab: the install claim fails closed"
+# Reporting must be possible before an owned worker downloads or replaces files.
+mkdir "$SB/tmp/xray-monitor/mieru-install.result.new"
+: > "$STUB_CURL_LOG"
+out=$(runsub mieru-install 2>&1); rc=$?
+ok_eq "install outcome: unpublishable result refuses rc" 1 "$rc"
+is "install outcome: names publication failure" "$(printf '%s' "$out" | grep -q 'cannot publish the install outcome' && echo 1 || echo 0)"
+ok_eq "install outcome: no download before reporting is ready" 0 "$(wc -l < "$STUB_CURL_LOG" | tr -d ' ')"
+rmdir "$SB/tmp/xray-monitor/mieru-install.result.new"
 # A claim that cannot OWN the marker must refuse (never run unowned): a
 # lock held longer than the claim's bounded wait, and a box without flock.
 # The holder uses flock's FILE PROG form; the claim polls ~10 s, so the
 # holder outlives it. No blind sleeps - the holder is waited out by pid.
+claim_before=$(cat "$SB/tmp/xray-monitor/mieru-install.result")
 flock "$SB/tmp/xray-monitor/mieru-install.run" sleep 25 &
 mhold=$!
 out=$(runsub mieru-install 2>/dev/null); rc=$?
 ok_eq "install claim: busy marker lock refused rc" 1 "$rc"
 is "install claim: busy marker lock names the reason" "$(printf '%s' "$out" | grep -q 'cannot lock the install marker' && echo 1 || echo 0)"
-is "install claim: refusal recorded its outcome" "$(grep -q '"ok": false.*cannot lock the install marker' "$SB/tmp/xray-monitor/mieru-install.result" 2>/dev/null && echo 1 || echo 0)"
+ok_eq "install claim: unowned worker preserves the existing outcome" "$claim_before" "$(cat "$SB/tmp/xray-monitor/mieru-install.result")"
 wait "$mhold"
 out=$(runsub mieru-install 2>/dev/null); rc=$?
 ok_eq "install claim: proceeds again once the lock is free" 0 "$rc"
@@ -1842,10 +1909,9 @@ fi
 
 echo "== mieru tab: CRUD round through the real handlers (stubbed uci writes)"
 # The Add -> Test -> Edit -> Delete round the live UI performs: uci
-# add/set/delete/commit mutate only $STUB_UCI_RW (seeded from the default
-# answers), so this exercises the id round-trip (add's cfg id is exactly
-# what get/edit/test/del consume - the plain-`uci show` @mieru[N] name is
-# never seen anywhere), the port bookkeeping, the type guards, and that
+# set/rename/delete/commit mutate only $STUB_UCI_RW (seeded from the default
+# answers), so this exercises the stable named id round-trip, port
+# bookkeeping, type and path guards, and that
 # deleting one row leaves the other row's rpc port alone.
 export STUB_UCI_RW="$SB/work/uci-rw.txt"
 cp "$STUB_UCI" "$STUB_UCI_RW"
@@ -1876,10 +1942,11 @@ out=$(runsub mieru-add "$SB/work/mieru-crud1.json" 2>/dev/null); rc=$?
 ok_eq "mieru add: first connection accepted" "ok" "$out"
 out=$(runsub mieru-add "$SB/work/mieru-crud2.json" 2>/dev/null); rc=$?
 ok_eq "mieru add: second connection accepted" "ok" "$out"
-# the stub's deterministic ids are what every other handler must consume
-id1=cfg9001; id2=cfg9002; id3=cfg9003
+# Newly created rows have explicit random IDs, independent of UCI position.
+mid() { sed -n "s/^xray-monitor\.\([A-Za-z0-9_]*\)\.label='$1'$/\1/p" "$STUB_UCI_RW"; }
+id1=$(mid zz1); id2=$(mid zz2)
 out=$(runsub mieru-get 2>/dev/null)
-is "mieru crud: get lists both rows by their stable cfg ids" \
+is "mieru crud: get lists both rows by their stable named ids" \
 	"$(printf '%s' "$out" | grep -q "\"id\":\"$id1\",\"label\":\"zz1\"" && printf '%s' "$out" | grep -q "\"id\":\"$id2\",\"label\":\"zz2\"" && echo 1 || echo 0)"
 ok_eq "mieru crud: first rpc port allocated" 10090 "$(printf '%s' "$(mrow "$id1" "$out")" | mrpc)"
 ok_eq "mieru crud: second rpc port allocated" 10091 "$(printf '%s' "$(mrow "$id2" "$out")" | mrpc)"
@@ -1888,6 +1955,7 @@ ok_eq "mieru crud: second rpc port allocated" 10091 "$(printf '%s' "$(mrow "$id2
 is "mieru crud: lan opt-in persisted" "$(printf '%s' "$(mrow "$id1" "$out")" | grep -q '\"lan\":1' && echo 1 || echo 0)"
 # the rpc allocator must dodge the NEW connection's own listen port too
 out=$(runsub mieru-add "$SB/work/mieru-crud3.json" 2>/dev/null)
+id3=$(mid zz3)
 ok_eq "mieru add: rpc port dodges the connection's own socks5 port" 10093 \
 	"$(printf '%s' "$(mrow "$id3" "$(runsub mieru-get 2>/dev/null)")" | mrpc)"
 # edit: full replace, blank creds = keep, the still-valid rpc port is kept
@@ -1902,6 +1970,58 @@ ok_eq "mieru edit: collision rejected rc" 1 "$rc"
 is "mieru edit: collision names the port" "$(printf '%s' "$out" | grep -q 'socks5 port 10091 already in use' && echo 1 || echo 0)"
 # test: honest "not running" without a service-generated runtime config,
 # and the section-TYPE guard keeps unrelated sections out
+# A connection may reclaim its own RPC listener for SOCKS5 or transparency:
+# move the management port instead of refusing the valid edit.
+sed 's/"socks5_port": 1082/"socks5_port": 10090/' "$SB/work/mieru-crud1b.json" > "$SB/work/mieru-reclaim.json"
+out=$(runsub mieru-edit "$id1" "$SB/work/mieru-reclaim.json" 2>/dev/null); rc=$?
+ok_eq "mieru edit: own rpc can become socks5" 0 "$rc"
+ok_eq "mieru edit: management moved out of new socks5" 10094 "$(mrow "$id1" "$(runsub mieru-get 2>/dev/null)" | mrpc)"
+sed 's/"socks5_port": 1082/"socks5_port": 1082, "tproxy_port": 10094/' "$SB/work/mieru-crud1b.json" > "$SB/work/mieru-reclaim.json"
+out=$(runsub mieru-edit "$id1" "$SB/work/mieru-reclaim.json" 2>/dev/null); rc=$?
+ok_eq "mieru edit: own rpc can become transparent" 0 "$rc"
+ok_eq "mieru edit: management moved out of new transparent port" 10090 "$(mrow "$id1" "$(runsub mieru-get 2>/dev/null)" | mrpc)"
+runsub mieru-edit "$id1" "$SB/work/mieru-crud1b.json" >/dev/null 2>&1
+
+# Failed deletion of the OLD port list must roll back the entire edit.
+cp "$STUB_UCI_RW" "$SB/work/mieru-before-failure"
+export STUB_UCI_DELETE_FAIL="$SB/flags/uci-delete-fail"
+touch "$STUB_UCI_DELETE_FAIL"
+out=$(runsub mieru-edit "$id1" "$SB/work/mieru-crud1.json" 2>/dev/null); rc=$?
+rm -f "$STUB_UCI_DELETE_FAIL"
+ok_eq "mieru edit: existing port-list delete failure rejected" 1 "$rc"
+is "mieru edit: failed delete restores all fields" "$(cmp -s "$STUB_UCI_RW" "$SB/work/mieru-before-failure" && echo 1 || echo 0)"
+
+# Migration failure must not allow deletion or leave partially staged names.
+export STUB_UCI_RENAME_FAIL="$SB/flags/uci-rename-fail"
+touch "$STUB_UCI_RENAME_FAIL"
+out=$(runsub mieru-edit "$id1" "$SB/work/mieru-crud1b.json" 2>/dev/null); rc=$?
+ok_eq "mieru edit: already named rows need no migration" 0 "$rc"
+export STUB_UCI_ANONYMOUS_ID="$id1"
+out=$(runsub mieru-del "$id1" 2>/dev/null); rc=$?
+rm -f "$STUB_UCI_RENAME_FAIL"
+unset STUB_UCI_ANONYMOUS_ID
+ok_eq "mieru del: identity migration failure rejected" 1 "$rc"
+is "mieru del: migration failure preserves every row" "$(cmp -s "$STUB_UCI_RW" "$SB/work/mieru-before-failure" && echo 1 || echo 0)"
+
+export STUB_UCI_SHOW_FAIL="$SB/flags/uci-show-fail"
+touch "$STUB_UCI_SHOW_FAIL"
+out=$(runsub mieru-edit "$id1" "$SB/work/mieru-crud1.json" 2>/dev/null); rc=$?
+rm -f "$STUB_UCI_SHOW_FAIL"
+ok_eq "mieru edit: failed UCI enumeration rejected" 1 "$rc"
+is "mieru edit: failed enumeration changes nothing" "$(cmp -s "$STUB_UCI_RW" "$SB/work/mieru-before-failure" && echo 1 || echo 0)"
+
+# Dotted UCI paths can otherwise alias an option whose value is 'mieru'.
+printf "xray-monitor.sub.alias='mieru'\n" >> "$STUB_UCI_RW"
+cp "$STUB_UCI_RW" "${STUB_UCI_RW}.commit"
+cp "$STUB_UCI_RW" "$SB/work/mieru-before-alias"
+for alias in sub.alias '@mieru[0]' 'sub..alias' '../sub'; do
+	for action in edit del test; do
+		out=$(runsub "mieru-$action" "$alias" "$SB/work/mieru-crud1.json" 2>/dev/null); rc=$?
+		ok_eq "mieru $action: rejects alias $alias" 1 "$rc"
+	done
+done
+is "mieru: rejected aliases changed nothing" "$(cmp -s "$STUB_UCI_RW" "$SB/work/mieru-before-alias" && echo 1 || echo 0)"
+
 out=$(runsub mieru-test "$id1" 2>/dev/null); rc=$?
 ok_eq "mieru test: not-running rc" 1 "$rc"
 is "mieru test: honest not-running reason" "$(printf '%s' "$out" | grep -q 'not running - restart' && echo 1 || echo 0)"

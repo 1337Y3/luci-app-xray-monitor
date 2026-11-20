@@ -37,6 +37,9 @@ var state = { binary: { installed: 0, version: '', arch: '', installing: 0 },
               instances: [], tests: {}, install_result: null };
 var latest = { installed: '', latest: '', update_available: 0, checked: 0 };
 var prevInstalling = 0;
+var installPending = false;
+var installEpoch = 0, installRequestPending = false;
+var refreshSequence = 0, refreshedSequence = 0;
 
 function fmtAgo(e) {
 	e = Number(e) || 0; if (!e) return _('never');
@@ -48,15 +51,20 @@ function fmtAgo(e) {
 }
 function busy(btn, p) { btn.disabled = true; return p.then(function(v) { btn.disabled = false; return v; }, function(e) { btn.disabled = false; throw e; }); }
 function refresh() {
+	var epoch = installEpoch, sequence = ++refreshSequence;
 	return callGet().then(function(r) {
+		if (epoch !== installEpoch || installRequestPending || sequence < refreshedSequence) return;
+		refreshedSequence = sequence;
 		if (r && typeof r == 'object') state = r;
 		// the detached install finished: surface its terminal outcome once
 		var nowInstalling = (state.binary && Number(state.binary.installing)) ? 1 : 0;
-		if (prevInstalling && !nowInstalling && state.install_result && Number(state.install_result.ts))
+		if ((prevInstalling || installPending) && !nowInstalling && state.install_result && Number(state.install_result.ts)) {
+			installPending = false;
 			ui.addNotification(null, E('p', [
 				E('strong', {}, state.install_result.ok ? _('mieru install: ') : _('mieru install failed: ')),
 				document.createTextNode(state.install_result.msg || _('no details'))
 			]), state.install_result.ok ? 'info' : 'error');
+		}
 		prevInstalling = nowInstalling;
 		redraw();
 	});
@@ -176,7 +184,7 @@ function connModal(conn) {
 	cancelBtn.addEventListener('click', ui.hideModal);
 	ui.showModal((editing ? _('Edit mieru connection') : _('Add mieru connection')), [
 		E('p', { 'style': 'color:#888;font-size:90%;' },
-			_('Each connection runs its own mieru client with its own SOCKS5 port. The transparent port (if set) accepts REDIRECTed TCP via a bundled redsocks listener - point ruantiblock or your own nftables/iptables rules at it.')),
+			_('Each connection runs its own mieru client with its own SOCKS5 port. The transparent port uses separately installed redsocks, which binds all interfaces. Apply the README LAN-only INPUT rules before enabling it, then direct REDIRECTed TCP (ruantiblock or your own rules) to this port.')),
 		table,
 		E('div', { 'class': 'right', 'style': 'margin-top:1em;' }, [ cancelBtn, ' ', saveBtn ])
 	]);
@@ -201,9 +209,21 @@ function buildBinaryCard() {
 	var installBtn = E('button', { 'class': 'cbi-button cbi-button-action' },
 		b.installed ? _('Update binary') : _('Install binary'));
 	installBtn.addEventListener('click', function() {
+		var request = ++installEpoch;
+		installRequestPending = true;
 		busy(installBtn, callInstall('').then(function(res) {
-			return notify(res, _('Download started - the version card updates when it finishes.'));
-		}, rpcFail));
+			if (request !== installEpoch) return;
+			installRequestPending = false;
+			++installEpoch;
+			installPending = !!(res && res.ok);
+			return notify(res, res && res.running ? _('An install is already running')
+				: _('Download started - the version card updates when it finishes.'));
+		}, function(e) {
+			if (request !== installEpoch) return;
+			installRequestPending = false;
+			++installEpoch;
+			return rpcFail(e);
+		}));
 	});
 	var checkBtn = E('button', { 'class': 'cbi-button cbi-button-neutral' }, _('Check for updates'));
 	checkBtn.addEventListener('click', function() {

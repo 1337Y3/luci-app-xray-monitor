@@ -1361,12 +1361,22 @@ mieru_marker_claim() {
 		return 1
 	fi
 	mpid=$(cat "$MIERU_RUN_MARKER" 2>/dev/null)
+	if [ "${MIERU_RESERVED:-0}" = 1 ] && [ "$mpid" != "$$" ]; then
+		mieru_marker_unlock
+		echo "install worker reservation was not published - refusing to install" >&2
+		return 1
+	fi
 	if [ "$mpid" != "$$" ] && mieru_marker_live "$mpid"; then
 		mieru_marker_unlock
 		echo "another mieru install is already running" >&2
 		return 1
 	fi
-	printf '%s\n' "$$" > "$MIERU_RUN_MARKER"
+	if ! ( printf '%s\n' "$$" > "$MIERU_RUN_MARKER" ) 2>/dev/null \
+		|| [ "$(cat "$MIERU_RUN_MARKER" 2>/dev/null)" != "$$" ]; then
+		mieru_marker_unlock
+		echo "cannot publish the install worker pid" >&2
+		return 1
+	fi
 	mieru_marker_unlock
 	return 0
 }
@@ -1384,10 +1394,23 @@ mieru_marker_clear() {
 	return 0
 }
 
-# Stable section ids: -X makes uci print the cfgXXXXXX name of an anonymous
-# section instead of @mieru[N] (which shifts when rows are deleted and does
-# not pass the id charset checks below).
-mieru_ids() { uci -X show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([^.]*\)=mieru$/\1/p'; }
+# -X exposes anonymous names too, but those change after deletion/reordering.
+# Pin every existing name in the same transaction before mutating connections,
+# preserving the runtime/config/cache keys already exposed to the UI.
+mieru_ids() { uci -X show xray-monitor 2>/dev/null | sed -n 's/^xray-monitor\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=mieru$/\1/p'; }
+mieru_pin_ids() {
+	local id shown raw ids
+	shown=$(uci show xray-monitor 2>/dev/null) || return 1
+	printf '%s\n' "$shown" | grep -q '^xray-monitor\.@mieru\[[0-9][0-9]*\]=mieru$' || return 0
+	raw=$(uci -X show xray-monitor 2>/dev/null) || return 1
+	ids=$(printf '%s\n' "$raw" | sed -n 's/^xray-monitor\.\([A-Za-z0-9_][A-Za-z0-9_]*\)=mieru$/\1/p')
+	[ -n "$ids" ] || return 1
+	for id in $ids; do
+		# Named rows already survive reload; only anonymous ones need a delta.
+		printf '%s\n' "$shown" | grep -Fqx "xray-monitor.$id=mieru" && continue
+		uci rename "xray-monitor.$id=$id" 2>/dev/null || return 1
+	done
+}
 
 # Installed binary version ("3.39.0"; "" when absent). Only the numeric
 # token is kept: the string is embedded in hand-built JSON by mieru-get.
@@ -1400,6 +1423,7 @@ mieru_version() {
 # typed mieru (`uci get <section>` prints the type) - otherwise a stray "sub"
 # or "cfgX" of another type would let edit/del clobber an unrelated section.
 mieru_section() {  # <id>
+	case "$1" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
 	[ "$(uci -q get "xray-monitor.$1" 2>/dev/null)" = "mieru" ]
 }
 
@@ -1437,9 +1461,8 @@ mieru_free_rpc() {  # <exclude-id> [extra taken ports...]
 }
 
 # Validate a connection's listen ports against the other sections. Prints
-# the reason and returns 1 on any conflict; rc 0 = fine. The extra port
-# counts as taken as well (edit keeps it when still valid).
-mieru_check_ports() {  # <socks5> <tproxy> <exclude-id> [extra-taken-port]
+# the reason and returns 1 on any conflict; rc 0 = fine.
+mieru_check_ports() {  # <socks5> <tproxy> <exclude-id>
 	local s="$1" t="$2" used
 	case "$s" in ''|*[!0-9]*) echo "invalid socks5 port"; return 1 ;; esac
 	[ "$s" -ge 1 ] && [ "$s" -le 65535 ] || { echo "socks5 port out of range"; return 1; }
@@ -1448,7 +1471,7 @@ mieru_check_ports() {  # <socks5> <tproxy> <exclude-id> [extra-taken-port]
 		[ "$t" -ge 1 ] && [ "$t" -le 65535 ] || { echo "transparent port out of range"; return 1; }
 		[ "$t" = "$s" ] && { echo "transparent port equals the socks5 port"; return 1; }
 	fi
-	used=$(mieru_ports_used "$3" "$4")
+	used=$(mieru_ports_used "$3")
 	case "$used" in *" $s "*) echo "socks5 port $s already in use by another connection"; return 1 ;; esac
 	if [ -n "$t" ]; then
 		case "$used" in *" $t "*) echo "transparent port $t already in use by another connection"; return 1 ;; esac
@@ -1469,16 +1492,18 @@ mieru_label_taken() {  # <label> <exclude-id>: prints the id holding it
 
 # Write a normalized conn (mieru.uc check output) into a UCI section. Every
 # payload write is checked: one failed set must not leave a half-written
-# connection behind a later successful commit (the initial list delete is
-# deliberately tolerant - a fresh section has nothing to delete, and uci
-# reports "not found" there). The rpc_port / enabled pair is the caller's
+# connection behind a later successful commit. Delete an existing port list
+# with a checked result; a fresh section has no list to remove.
+# The rpc_port / enabled pair is the caller's
 # business (add assigns a fresh rpc port, edit keeps a still-valid one).
 mieru_write_uci() {  # <section-id> <norm-file>
 	local f="$2" v
 	uci set "xray-monitor.$1.label=$(jsonfilter -i "$f" -e '@.label' 2>/dev/null)" || return 1
 	uci set "xray-monitor.$1.server_ip=$(jsonfilter -i "$f" -e '@.server_ip' 2>/dev/null)" || return 1
 	uci set "xray-monitor.$1.server_domain=$(jsonfilter -i "$f" -e '@.server_domain' 2>/dev/null)" || return 1
-	uci -q delete "xray-monitor.$1.server_ports" 2>/dev/null
+	if uci -q get "xray-monitor.$1.server_ports" >/dev/null 2>&1; then
+		uci -q delete "xray-monitor.$1.server_ports" 2>/dev/null || return 1
+	fi
 	for v in $(jsonfilter -i "$f" -e '@.ports[*]' 2>/dev/null); do
 		uci add_list "xray-monitor.$1.server_ports=$v" || return 1
 	done
@@ -1597,8 +1622,15 @@ do_mieru_add() {  # <conn-file>
 	conf=$(mieru_check_ports "$socks" "$tp" "") || { rm -f "$tmp"; echo "$conf"; return 1; }
 	# the rpc port must also dodge THIS connection's new listen ports
 	rpc=$(mieru_free_rpc "" "$socks" "$tp") || { rm -f "$tmp"; echo "no free management port (10090-10199 exhausted?)"; return 1; }
-	sec=$(uci add xray-monitor mieru 2>/dev/null) || { rm -f "$tmp"; echo "uci add failed"; return 1; }
-	if ! mieru_write_uci "$sec" "$tmp" \
+	mieru_pin_ids || { mieru_uci_abort; rm -f "$tmp"; return 1; }
+	# libuci's anonymous-name generator can collide with a named survivor.
+	# Use a fresh random explicit name, independent of the section's position.
+	sec="mieru${tmp##*.}"
+	if uci -q get "xray-monitor.$sec" >/dev/null 2>&1; then
+		mieru_uci_abort "connection id collision - try again"; rm -f "$tmp"; return 1
+	fi
+	if ! uci set "xray-monitor.$sec=mieru" 2>/dev/null \
+		|| ! mieru_write_uci "$sec" "$tmp" \
 		|| ! uci set "xray-monitor.$sec.rpc_port=$rpc" 2>/dev/null \
 		|| ! uci set "xray-monitor.$sec.enabled"='1' 2>/dev/null; then
 		mieru_uci_abort; rm -f "$tmp"; return 1
@@ -1628,10 +1660,11 @@ do_mieru_edit() {  # <id> <conn-file>
 	# NEW socks5/tproxy values too; anything else (junk, 0, a collision the
 	# hand-edited UCI produced) is re-allocated fresh.
 	oldrpc=$(uci -q get "xray-monitor.$id.rpc_port")
-	conf=$(mieru_check_ports "$socks" "$tp" "$id" "$oldrpc") || { rm -f "$tmp"; echo "$conf"; return 1; }
+	conf=$(mieru_check_ports "$socks" "$tp" "$id") || { rm -f "$tmp"; echo "$conf"; return 1; }
 	rpc=""
 	case "$oldrpc" in
-		[0-9]*)
+		''|*[!0-9]*) ;;
+		*)
 			[ "$oldrpc" -ge 1 ] && [ "$oldrpc" -le 65535 ] && case " $(mieru_ports_used "$id" "$socks" "$tp") " in
 				*" $oldrpc "*) ;;
 				*) rpc="$oldrpc" ;;
@@ -1641,7 +1674,8 @@ do_mieru_edit() {  # <id> <conn-file>
 	if [ -z "$rpc" ]; then
 		rpc=$(mieru_free_rpc "$id" "$socks" "$tp") || { rm -f "$tmp"; echo "no free management port"; return 1; }
 	fi
-	if ! mieru_write_uci "$id" "$tmp" \
+	if ! mieru_pin_ids \
+		|| ! mieru_write_uci "$id" "$tmp" \
 		|| ! uci set "xray-monitor.$id.rpc_port=$rpc" 2>/dev/null; then
 		mieru_uci_abort; rm -f "$tmp"; return 1
 	fi
@@ -1651,9 +1685,10 @@ do_mieru_edit() {  # <id> <conn-file>
 }
 
 do_mieru_del() {  # <id>
-	case "$1" in ''|*[!A-Za-z0-9._-]*|.|..) echo "invalid id"; return 1 ;; esac
 	mieru_section "$1" || { echo "no such connection"; return 1; }
-	uci -q delete "xray-monitor.$1" || { echo "delete failed"; return 1; }
+	if ! mieru_pin_ids || ! uci -q delete "xray-monitor.$1"; then
+		mieru_uci_abort "delete failed - nothing changed"; return 1
+	fi
 	mieru_uci_commit || return 1
 	# Reap the instance NOW: without the restart the deleted connection's
 	# process (and its respawn) would keep serving until the next manual
@@ -1698,7 +1733,6 @@ do_mieru_restart() {
 # reaches the caller through this command's reply.
 do_mieru_test() {  # <id>
 	local id="$1" cfg out rc det ok theld=0
-	case "$id" in ''|*[!A-Za-z0-9._-]*|.|..) echo "invalid id"; return 1 ;; esac
 	mieru_section "$id" || { echo "no such connection"; return 1; }
 	[ -x "$MIERU" ] || { echo "mieru binary is not installed"; return 1; }
 	cfg="$MIERU_RUN/$id.json"
@@ -1752,8 +1786,7 @@ mieru_arch() {
 # (the run may be detached - its stdout goes to a log the UI never opens).
 mieru_install_note() {  # <ok 0|1> <msg>
 	local f="$MIERU_RES"
-	"$SHARE/mieru.uc" note "$f" "$1" "$2" > "$f.new" 2>/dev/null && mv "$f.new" "$f"
-	return 0
+	( "$SHARE/mieru.uc" note "$f" "$1" "$2" > "$f.new" ) 2>/dev/null && mv "$f.new" "$f"
 }
 
 # Download+install the mieru binary from upstream's GitHub releases, with
@@ -1768,7 +1801,7 @@ mieru_install_note() {  # <ok 0|1> <msg>
 # overlay-backed destination, so a small-RAM box never holds both copies in
 # RAM. An ENOSPC on /usr fails the final rename honestly and cleans up.
 do_mieru_install() {  # [version]
-	local arch ver tag dl tmp exp got bin member inst_ok mieru_err nline
+	local arch ver tag dl tmp exp got bin member inst_ok mieru_err artifact
 	command -v curl >/dev/null 2>&1 || { mieru_install_note 0 "curl not installed"; echo "curl not installed"; return 1; }
 	command -v tar >/dev/null 2>&1 || { mieru_install_note 0 "tar not installed"; echo "tar not installed"; return 1; }
 	arch=$(mieru_arch)
@@ -1818,9 +1851,11 @@ do_mieru_install() {  # [version]
 	via_stop
 	# pick THIS artifact's line out of the sidecar (it may list several);
 	# exactly one match is required - zero or duplicates mean refuse
-	nline=$(grep -cE "mieru_${ver}_linux_${arch}\.tar\.gz\$" "$tmp/mieru.sha256.txt" 2>/dev/null)
-	exp=""
-	[ "$nline" = 1 ] && exp=$(grep -E "mieru_${ver}_linux_${arch}\.tar\.gz\$" "$tmp/mieru.sha256.txt" | awk '{ print $1 }')
+	artifact="mieru_${ver}_linux_${arch}.tar.gz"
+	exp=$(awk -v artifact="$artifact" '
+		NF == 2 && ($2 == artifact || $2 == "*" artifact) { count++; hash=$1 }
+		END { if (count == 1) print hash }
+	' "$tmp/mieru.sha256.txt")
 	case "$exp" in
 		'') rm -rf "$tmp"
 		    mieru_install_note 0 "SHA256 sidecar has no unique entry for this artifact - refusing to install"
@@ -2371,12 +2406,16 @@ case "$1" in
 		mkdir -p "$TSTATE_DIR"
 		claim_err=$(mieru_marker_claim 2>&1)
 		if [ "$?" != 0 ]; then
-			mieru_install_note 0 "$claim_err"
+			# An unowned worker must preserve the active owner's outcome.
 			echo "$claim_err"
 			exit 1
 		fi
 		trap 'mieru_marker_clear; cleanup' EXIT
 		trap 'exit 1' INT TERM HUP
+		if ! mieru_install_note 0 'install worker exited without reporting an outcome'; then
+			echo 'cannot publish the install outcome - refusing to install' >&2
+			exit 1
+		fi
 		do_mieru_install "$2"
 		exit $?
 		;;
