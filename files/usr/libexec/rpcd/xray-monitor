@@ -1030,7 +1030,10 @@ case "$1" in
 					json_add_string msg "cannot open the install marker"
 					json_dump
 				else
-					exec 5>>"$E2E_STATE/mieru-install.run" 2>/dev/null
+					# bare `exec` redirections persist: no 2>/dev/null (the
+					# probe above ruled the open failure out) or every later
+					# stderr message of this handler would be swallowed
+					exec 5>>"$E2E_STATE/mieru-install.run"
 					mi_try=0
 					while [ "$mi_try" -lt 5 ]; do
 						flock -n 5 2>/dev/null && { mi_locked=1; break; }
@@ -1038,7 +1041,7 @@ case "$1" in
 						sleep 1
 					done
 					if [ "$mi_locked" != 1 ]; then
-						exec 5>&- 2>/dev/null
+						exec 5>&-
 						json_init
 						json_add_boolean ok 1
 						json_add_boolean running 1
@@ -1047,7 +1050,7 @@ case "$1" in
 					elif kill -0 "$(cat "$E2E_STATE/mieru-install.run" 2>/dev/null)" 2>/dev/null \
 						&& tr '\0' ' ' < "/proc/$(cat "$E2E_STATE/mieru-install.run" 2>/dev/null)/cmdline" 2>/dev/null | grep -q "mieru-install"; then
 						# the recorded pid is a LIVE install worker
-						flock -u 5 2>/dev/null; exec 5>&- 2>/dev/null
+						flock -u 5 2>/dev/null; exec 5>&-
 						json_init
 						json_add_boolean ok 1
 						json_add_boolean running 1
@@ -1063,7 +1066,7 @@ case "$1" in
 							>"$E2E_STATE/mieru-install.log" 2>&1 </dev/null &
 						printf '%s\n' "$!" > "$E2E_STATE/mieru-install.run"
 						flock -u 5 2>/dev/null
-						exec 5>&- 2>/dev/null
+						exec 5>&-
 						json_init
 						json_add_boolean ok 1
 						json_add_string msg "Download started - the version card updates when it finishes."

@@ -1325,33 +1325,45 @@ mieru_marker_lock() {  # <tries>
 	local i=0
 	command -v flock >/dev/null 2>&1 || return 1
 	( exec 5>>"$MIERU_RUN_MARKER" ) 2>/dev/null || return 1
-	exec 5>>"$MIERU_RUN_MARKER" 2>/dev/null
+	# no `2>/dev/null` here: redirections on a bare `exec` PERSIST in the
+	# shell, and silencing fd2 would swallow every later stderr message
+	# (the probe above already rules out the open failure)
+	exec 5>>"$MIERU_RUN_MARKER"
 	while [ "$i" -lt "${1:-10}" ]; do
 		flock -n 5 2>/dev/null && return 0
 		i=$((i + 1))
 		sleep 1
 	done
-	exec 5>&- 2>/dev/null
+	exec 5>&-
 	return 1
 }
 
 mieru_marker_unlock() {
 	flock -u 5 2>/dev/null
-	exec 5>&- 2>/dev/null
+	exec 5>&-
 }
 
 # Claim the marker for THIS worker: under the lock, refuse when a live
 # worker already owns it, else record $$. Our OWN pid is the rpcd layer's
-# reservation for us - it must not read as a competing worker. Without
-# flock there is no protection; proceed (the mutation lock still
-# serializes the installs themselves).
+# reservation for us - it must not read as a competing worker. FAILS
+# CLOSED: without flock, or when the marker lock cannot be taken, the
+# worker does NOT install - the marker is the single-installer guarantee,
+# and an unowned claim would silently void it. The failure reason goes to
+# stderr for the caller to relay.
 mieru_marker_claim() {
 	local mpid
-	command -v flock >/dev/null 2>&1 || return 0
-	mieru_marker_lock 10 || return 0
+	if ! command -v flock >/dev/null 2>&1; then
+		echo "flock(1) not available - cannot claim the install marker" >&2
+		return 1
+	fi
+	if ! mieru_marker_lock 10; then
+		echo "cannot lock the install marker - another install may own it" >&2
+		return 1
+	fi
 	mpid=$(cat "$MIERU_RUN_MARKER" 2>/dev/null)
 	if [ "$mpid" != "$$" ] && mieru_marker_live "$mpid"; then
 		mieru_marker_unlock
+		echo "another mieru install is already running" >&2
 		return 1
 	fi
 	printf '%s\n' "$$" > "$MIERU_RUN_MARKER"
@@ -1361,7 +1373,9 @@ mieru_marker_claim() {
 
 # Clear the marker on worker exit - but ONLY while it still names THIS
 # process: somebody else's reservation (or a reclaim that already replaced
-# our dead pid) must survive us.
+# our dead pid) must survive us. Cleanup may fail open: a pid we fail to
+# clear is dead by then and the next reservation reclaims it, so a
+# lock problem at exit must not turn into a spurious error.
 mieru_marker_clear() {
 	command -v flock >/dev/null 2>&1 || return 0
 	mieru_marker_lock 10 || return 0
@@ -1696,14 +1710,17 @@ do_mieru_test() {  # <id>
 	# non-interactive ash outright, and a lock problem must skip the cache
 	# write, not the whole command.
 	if command -v flock >/dev/null 2>&1 && ( exec 4>>"$MTESTLOCK" ) 2>/dev/null; then
-		exec 4>>"$MTESTLOCK" 2>/dev/null
+		# bare `exec` redirections persist: no 2>/dev/null here (the probe
+		# above already ruled the open failure out), or every later stderr
+		# message of this command would be swallowed
+		exec 4>>"$MTESTLOCK"
 		ti=0
 		while [ "$ti" -lt 5 ]; do
 			flock -n 4 2>/dev/null && { theld=1; break; }
 			ti=$((ti + 1))
 			sleep 1
 		done
-		[ "$theld" = 1 ] || exec 4>&- 2>/dev/null
+		[ "$theld" = 1 ] || exec 4>&-
 	fi
 	if [ "$theld" = 1 ]; then
 		if "$SHARE/mieru.uc" tests "$MIERU_TEST" "$id" "$ok" "$det" > "$MIERU_TEST.new" 2>/dev/null; then
@@ -2350,9 +2367,10 @@ case "$1" in
 	# which the next reservation reclaims after the liveness check).
 	mieru-install)
 		mkdir -p "$TSTATE_DIR"
-		if ! mieru_marker_claim; then
-			mieru_install_note 0 "another mieru install is already running"
-			echo "another mieru install is already running"
+		claim_err=$(mieru_marker_claim 2>&1)
+		if [ "$?" != 0 ]; then
+			mieru_install_note 0 "$claim_err"
+			echo "$claim_err"
 			exit 1
 		fi
 		trap 'mieru_marker_clear; cleanup' EXIT

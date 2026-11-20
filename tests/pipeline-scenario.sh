@@ -1815,6 +1815,31 @@ is "mieru: bad SHA leaves the installed binary in place" "$("$SB/bin/mieru" vers
 printf '%s  mieru_3.39.0_linux_%s.tar.gz\n' "$msha" "$mieru_stub_arch" > "$STUB_CURL_MIERU_SHA"
 printf '%s\n' "xray-monitor.sub=xray-monitor" "xray-monitor.sub.backup_keep='3'" > "$STUB_UCI"
 
+echo "== mieru tab: the install claim fails closed"
+# A claim that cannot OWN the marker must refuse (never run unowned): a
+# lock held longer than the claim's bounded wait, and a box without flock.
+# The holder uses flock's FILE PROG form; the claim polls ~10 s, so the
+# holder outlives it. No blind sleeps - the holder is waited out by pid.
+flock "$SB/tmp/xray-monitor/mieru-install.run" sleep 25 &
+mhold=$!
+out=$(runsub mieru-install 2>/dev/null); rc=$?
+ok_eq "install claim: busy marker lock refused rc" 1 "$rc"
+is "install claim: busy marker lock names the reason" "$(printf '%s' "$out" | grep -q 'cannot lock the install marker' && echo 1 || echo 0)"
+is "install claim: refusal recorded its outcome" "$(grep -q '"ok": false.*cannot lock the install marker' "$SB/tmp/xray-monitor/mieru-install.result" 2>/dev/null && echo 1 || echo 0)"
+wait "$mhold"
+out=$(runsub mieru-install 2>/dev/null); rc=$?
+ok_eq "install claim: proceeds again once the lock is free" 0 "$rc"
+# no flock on the box: the mutation lock refuses the command outright
+# (take_lock's honest failure goes to stderr) - only testable where no
+# flock stub shadows the real one
+if [ ! -e "$SB/bin/flock" ]; then
+	out=$(PATH="$SB/bin" /bin/sh "$SB/sub" mieru-install 2>&1); rc=$?
+	ok_eq "install claim: no-flock box fails closed rc" 1 "$rc"
+	is "install claim: no-flock box names the reason" "$(printf '%s' "$out" | grep -q 'flock(1) not available' && echo 1 || echo 0)"
+else
+	echo "NOTE   flock(1) stubbed - no-flock claim case skipped"
+fi
+
 echo "== mieru tab: CRUD round through the real handlers (stubbed uci writes)"
 # The Add -> Test -> Edit -> Delete round the live UI performs: uci
 # add/set/delete/commit mutate only $STUB_UCI_RW (seeded from the default
