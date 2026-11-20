@@ -2,6 +2,7 @@
 'require view';
 'require rpc';
 'require ui';
+'require xray-errors as XrayErrors';
 'require xray-diff as XrayDiff';
 
 var callGet = rpc.declare({ object: 'xray-monitor', method: 'routing_get' });
@@ -106,13 +107,13 @@ function doSave(btn) {
 	for (var i = 0; i < working.length; i++) {
 		var r = working[i];
 		if (!/^[A-Za-z0-9_.\-]+$/.test(r.tag))
-			return ui.addNotification(null, E('p', _('Invalid tag: ') + (r.tag || '(empty)')), 'error');
-		if (seenTag[r.tag]) return ui.addNotification(null, E('p', _('Duplicate tag: ') + r.tag), 'error');
+			return XrayErrors.show(_('Invalid tag: ') + (r.tag || '(empty)'));
+		if (seenTag[r.tag]) return XrayErrors.show(_('Duplicate tag: ') + r.tag);
 		seenTag[r.tag] = 1;
 		var p = parseInt(r.port, 10);
 		if (!(p >= 1 && p <= 65535))
-			return ui.addNotification(null, E('p', _('Invalid port for ') + r.tag), 'error');
-		if (seenPort[p]) return ui.addNotification(null, E('p', _('Duplicate port: ') + p), 'error');
+			return XrayErrors.show(_('Invalid port for ') + r.tag);
+		if (seenPort[p]) return XrayErrors.show(_('Duplicate port: ') + p);
 		seenPort[p] = 1;
 	}
 	if (!confirm(_('Apply routing changes and restart xray now?'))) return;
@@ -124,8 +125,8 @@ function doSave(btn) {
 			ui.addNotification(null, E('p', _('Routing applied and xray restarted.')), 'info');
 			return refresh();
 		}
-		ui.addNotification(null, E('p', _('Apply failed — config not changed. ') + ((res && res.msg) || '')), 'error');
-	}, function() { btn.disabled = false; ui.addNotification(null, E('p', _('Apply call failed.')), 'error'); });
+		XrayErrors.show(_('Apply failed — config not changed. ') + ((res && res.msg) || ''));
+	}, function(err) { btn.disabled = false; XrayErrors.show(_('Apply call failed.'), err); });
 }
 
 function refresh() {

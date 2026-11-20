@@ -54,6 +54,7 @@ FIX="$REPO/tests/fixtures"
 SHARESRC="$REPO/files/usr/share/xray-monitor"
 
 sh "$HERE/install-marker.sh" || exit 1
+sh "$HERE/via-stderr.sh" || exit 1
 
 command -v ucode >/dev/null 2>&1 || { echo "ucode not found in PATH"; exit 1; }
 ucode -e 'import { readfile } from "fs";' >/dev/null 2>&1 \

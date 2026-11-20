@@ -5,4 +5,6 @@ set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 command -v node >/dev/null 2>&1 || { echo "node is required for tests/js-test.sh" >&2; exit 1; }
 node "$HERE/js/check.js" "$HERE/.."
-exec node "$HERE/js/mieru-install.js" "$HERE/.."
+node "$HERE/js/mieru-install.js" "$HERE/.."
+node "$HERE/js/view-errors.js" "$HERE/.."
+exec node "$HERE/js/errors.js" "$HERE/.."

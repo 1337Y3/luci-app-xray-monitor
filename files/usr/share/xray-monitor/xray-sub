@@ -1241,7 +1241,8 @@ via_start() {  # <tag> -> sets VIA_TAG/VIA_PORT; via_err carries the reason
 	out=$(do_tmpxray_start "$1" 2>&1) || { via_err="$out"; return 1; }
 	if [ "$theld" = 1 ]; then
 		flock -u 4 2>/dev/null
-		exec 4>&- 2>/dev/null
+		# A bare exec keeps every redirection: leave the caller's stderr open.
+		exec 4>&-
 		theld=0
 	fi
 	# do_tmpxray_start prints exactly {"pid":N,"ports":{"<tag>":port}} - read

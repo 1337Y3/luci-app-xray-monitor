@@ -15,10 +15,10 @@ function fixture() {
 		elements.push(el);
 		return el;
 	}
-	const api = new Function('rpc', 'view', 'poll', 'ui', 'XrayDiff', 'E', '_', 'document',
+	const api = new Function('rpc', 'view', 'poll', 'ui', 'XrayDiff', 'XrayErrors', 'E', '_', 'document',
 		source.replace('return view.extend({', 'return { refresh: refresh, card: buildBinaryCard, view: view.extend({').replace(/\}\);\s*$/, '}) };'));
 	return { api: api({ declare: ({ method }) => () => Promise.resolve(method === 'mieru_get' ? (getReplies.length ? getReplies.shift() : status) : response) },
-		{ extend: o => o }, {}, { addNotification: (...args) => notices.push(args) }, {}, E, s => s,
+		{ extend: o => o }, {}, { addNotification: (...args) => notices.push(args) }, {}, { show: message => notices.push([null, message, 'error']) }, E, s => s,
 		{ createTextNode: s => s }), notices, elements,
 		queueGet: p => getReplies.push(p),
 		setStatus: v => { status = v; }, setResponse: v => { response = v; } };

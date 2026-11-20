@@ -3,6 +3,7 @@
 'require rpc';
 'require poll';
 'require ui';
+'require xray-errors as XrayErrors';
 'require xray-diff as XrayDiff';
 
 var callGet     = rpc.declare({ object: 'xray-monitor', method: 'mieru_get' });
@@ -60,10 +61,9 @@ function refresh() {
 		var nowInstalling = (state.binary && Number(state.binary.installing)) ? 1 : 0;
 		if ((prevInstalling || installPending) && !nowInstalling && state.install_result && Number(state.install_result.ts)) {
 			installPending = false;
-			ui.addNotification(null, E('p', [
-				E('strong', {}, state.install_result.ok ? _('mieru install: ') : _('mieru install failed: ')),
-				document.createTextNode(state.install_result.msg || _('no details'))
-			]), state.install_result.ok ? 'info' : 'error');
+			if (state.install_result.ok)
+				ui.addNotification(null, E('p', {}, document.createTextNode(_('mieru install: ') + (state.install_result.msg || _('no details')))), 'info');
+			else XrayErrors.show(_('mieru install failed: ') + (state.install_result.msg || _('no details')));
 		}
 		prevInstalling = nowInstalling;
 		redraw();
@@ -72,13 +72,15 @@ function refresh() {
 function row(k, v) { return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td left', 'width': '28%' }, E('strong', {}, k)), E('td', { 'class': 'td left' }, v) ]); }
 function notify(res, okMsg) {
 	if (res && res.ok) ui.addNotification(null, E('p', okMsg), 'info');
-	else ui.addNotification(null, E('p', [ E('strong', {}, _('Failed: ')), document.createTextNode((res && res.msg) || _('error')) ]), 'error');
-	return refresh();
+	else XrayErrors.show((res && res.msg) || _('error'));
+	return refresh().catch(showRPCError);
+}
+function showRPCError(e) {
+	XrayErrors.show((e && (e.message || e.msg)) || String(e || _('error')));
 }
 function rpcFail(e) {
-	ui.addNotification(null, E('p', [ E('strong', {}, _('Failed: ')),
-		document.createTextNode((e && (e.message || e.msg)) || _('error')) ]), 'error');
-	return refresh();
+	showRPCError(e);
+	return refresh().catch(showRPCError);
 }
 
 function stateBadge(inst) {
@@ -174,11 +176,11 @@ function connModal(conn) {
 	var saveBtn = E('button', { 'class': 'cbi-button cbi-button-positive important' }, editing ? _('Save') : _('Add'));
 	saveBtn.addEventListener('click', function() {
 		var r = collect();
-		if (r.err) return ui.addNotification(null, E('p', r.err), 'warning');
+		if (r.err) return XrayErrors.show(r.err);
 		busy(saveBtn, (editing ? callEdit(conn.id, r.conn) : callAdd(r.conn)).then(function(res) {
-			ui.hideModal();
+			if (res && res.ok) ui.hideModal();
 			return notify(res, editing ? _('Connection saved. Restart the service to apply.') : _('Connection added. Restart the service to apply.'));
-		}));
+		}, rpcFail));
 	});
 	var cancelBtn = E('button', { 'class': 'btn' }, _('Cancel'));
 	cancelBtn.addEventListener('click', ui.hideModal);
@@ -265,7 +267,7 @@ function buildConnTable() {
 		});
 		del.addEventListener('click', function() {
 			if (!confirm(_('Delete mieru connection "') + c.label + _('"? Restart the service afterwards.'))) return;
-			busy(del, callDel(c.id).then(function(res) { return notify(res, _('Connection deleted.')); }));
+			busy(del, callDel(c.id).then(function(res) { return notify(res, _('Connection deleted.')); }, rpcFail));
 		});
 		rows.push(E('tr', { 'class': 'tr' }, [
 			E('td', { 'class': 'td' }, E('strong', {}, c.label)),

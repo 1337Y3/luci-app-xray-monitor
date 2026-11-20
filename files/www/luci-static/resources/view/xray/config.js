@@ -2,6 +2,7 @@
 'require view';
 'require rpc';
 'require ui';
+'require xray-errors as XrayErrors';
 'require xray-diff as XrayDiff';
 
 var callGet      = rpc.declare({ object: 'xray-monitor', method: 'config_get' });
@@ -121,7 +122,7 @@ function managedChangedPaths(paths, editorText, diskText) {
 }
 
 function modalLine(cls, strong, text) {
-	return E('p', { 'style': 'color:' + cls + ';margin:.8em 0 0;' },
+	return E('p', { 'style': 'color:' + cls + ';margin:.8em 0 0;white-space:pre-wrap;' },
 		text ? [ E('strong', {}, strong), document.createTextNode(' ' + text) ] : [ E('strong', {}, strong) ]);
 }
 
@@ -141,8 +142,8 @@ function refreshFromDisk(silent) {
 		ta.value = (res && res.config) ? res.config : '';
 		loadedHash = (res && res.hash) || '';
 		if (!silent) ui.addNotification(null, E('p', _('Reloaded from disk.')), 'info');
-	}, function() {
-		if (!silent) ui.addNotification(null, E('p', _('Reload call failed.')), 'error');
+	}, function(err) {
+		if (!silent) XrayErrors.show(_('Reload call failed.'), err);
 	});
 }
 
@@ -210,10 +211,10 @@ function showPreview(testRes, diffRes, getRes) {
 					errLine.appendChild(modalLine('#cc3300', _('Save failed (not applied):'), (res && res.msg) || _('unknown error')));
 				}
 			}
-		}, function() {
+		}, function(err) {
 			keepBtn.disabled = false;
 			applyBtn.disabled = false;
-			errLine.appendChild(modalLine('#cc3300', _('Save call failed.'), ''));
+			errLine.appendChild(modalLine('#cc3300', _('Save call failed.'), (err && err.message) || String(err)));
 		});
 	});
 
@@ -250,8 +251,8 @@ return view.extend({
 				if (res && res.ok)
 					ui.addNotification(null, E('p', _('xray -test: ') + (res.msg || 'OK')), 'info');
 				else
-					ui.addNotification(null, E('p', [ E('strong', {}, _('xray -test failed: ')), document.createTextNode((res && res.msg) || _('unknown error')) ]), 'error');
-			}, function() { setBusy(btns, false); ui.addNotification(null, E('p', _('Test call failed.')), 'error'); });
+					XrayErrors.show(_('xray -test failed: ') + ((res && res.msg) || _('unknown error')));
+			}, function(err) { setBusy(btns, false); XrayErrors.show(_('Test call failed.'), err); });
 		});
 
 		// Saving always goes through the preview modal: the diff is computed on
@@ -284,14 +285,11 @@ return view.extend({
 				// vanish without a trace, leaving a button that "does nothing"
 				try { showPreview(r[0], r[1], r[2]); }
 				catch (e) {
-					ui.addNotification(null, E('p', [
-						E('strong', {}, _('Preview failed: ')),
-						document.createTextNode((e && e.message) ? e.message : String(e))
-					]), 'error');
+					XrayErrors.show(_('Preview failed:'), e);
 				}
-			}, function() {
+			}, function(err) {
 				setBusy(btns, false);
-				ui.addNotification(null, E('p', _('Preview call failed.')), 'error');
+				XrayErrors.show(_('Preview call failed.'), err);
 			});
 		});
 

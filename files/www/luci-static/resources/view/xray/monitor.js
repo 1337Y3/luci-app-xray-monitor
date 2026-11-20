@@ -3,6 +3,7 @@
 'require rpc';
 'require poll';
 'require ui';
+'require xray-errors as XrayErrors';
 'require xray-diff as XrayDiff';
 
 var callStatus    = rpc.declare({ object: 'xray-monitor', method: 'status' });
@@ -146,10 +147,10 @@ function pingToggle(tag) {
 			return refreshMeta();   /* confirm cheaply; never triggers a probe */
 		}).then(function() {
 			cb.disabled = false;
-		}, function() {
+		}, function(err) {
 			cb.disabled = false;
 			cb.checked = enabled;  /* revert on failure */
-			ui.addNotification(null, E('p', _('Could not change ping check for ') + tag + '.'), 'error');
+			XrayErrors.show(_('Could not change ping check for ') + tag + '.', err);
 		});
 	});
 	return E('label', { 'style': 'display:flex;align-items:center;gap:6px;cursor:pointer;' }, [
@@ -245,9 +246,9 @@ function apiBanner() {
 		callEnableApi().then(function(res) {
 			btn.disabled = false;
 			if (res && res.ok) ui.addNotification(null, E('p', _('API services enabled: ') + (res.msg || '')), 'info');
-			else ui.addNotification(null, E('p', _('Could not enable API services: ') + ((res && res.msg) || _('unknown error'))), 'error');
+			else XrayErrors.show(_('Could not enable API services: ') + ((res && res.msg) || _('unknown error')));
 			return refreshStats();
-		}, function() { btn.disabled = false; ui.addNotification(null, E('p', _('Enable call failed.')), 'error'); });
+		}, function(err) { btn.disabled = false; XrayErrors.show(_('Enable call failed.'), err); });
 	});
 	var msg = missing.length
 		? _('Xray is running but its config is missing API services: ') + missing.join(', ') +
@@ -433,9 +434,12 @@ return view.extend({
 				var btn = ev.target;
 				btn.disabled = true;
 				callReset()
-					.then(function() { prev = null; return refreshStats(); })
+					.then(function(res) {
+						if (!res || !res.ok) throw new Error((res && res.msg) || _('Could not reset counters.'));
+						prev = null; return refreshStats();
+					})
 					.then(function() { btn.disabled = false; },
-					      function() { btn.disabled = false; });
+					      function(err) { btn.disabled = false; XrayErrors.show(_('Reset counters failed.'), err); });
 			}
 		}, _('Reset counters'));
 
@@ -447,8 +451,8 @@ return view.extend({
 				if (res && res.ok)
 					ui.addNotification(null, E('p', _('xray -test: ') + (res.msg || 'OK')), 'info');
 				else
-					ui.addNotification(null, E('p', [ E('strong', {}, _('xray -test failed: ')), document.createTextNode((res && res.msg) || _('unknown error')) ]), 'error');
-			}, function() { validateBtn.disabled = false; ui.addNotification(null, E('p', _('Validate call failed.')), 'error'); });
+					XrayErrors.show(_('xray -test failed: ') + ((res && res.msg) || _('unknown error')));
+			}, function(err) { validateBtn.disabled = false; XrayErrors.show(_('Validate call failed.'), err); });
 		});
 
 		var updBtn = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Check for updates'));
@@ -457,7 +461,7 @@ return view.extend({
 			callUpdChk().then(function(res) {
 				updBtn.disabled = false;
 				if (!res || !res.latest) {
-					ui.addNotification(null, E('p', _('Could not reach the update feed (installed: ') + ((res && res.installed) || '?') + ').'), 'warning');
+					XrayErrors.show(_('Could not reach the update feed (installed: ') + ((res && res.installed) || '?') + ').' + ((res && res.msg) ? '\n' + res.msg : ''));
 					return;
 				}
 				if (!res.update_available) {
@@ -466,18 +470,19 @@ return view.extend({
 				}
 				if (!confirm(_('Update available: ') + res.installed + ' → ' + res.latest + _('.\nDownload and install now? xray will restart.'))) return;
 				callUpdApply().then(function(r) {
+					if (!r || !r.ok) { XrayErrors.show(_('Update failed: ') + ((r && r.msg) || _('unknown error'))); return; }
 					ui.addNotification(null, E('p', (r && r.msg) || _('Update started.')), 'info');
 					// recheck after the detached update + rpcd restart settle
 					window.setTimeout(function() { location.reload(); }, 15000);
-				}, function() { ui.addNotification(null, E('p', _('Update call failed.')), 'error'); });
-			}, function() { updBtn.disabled = false; ui.addNotification(null, E('p', _('Update check failed.')), 'error'); });
+				}, function(err) { XrayErrors.show(_('Update call failed.'), err); });
+			}, function(err) { updBtn.disabled = false; XrayErrors.show(_('Update check failed.'), err); });
 		});
 
 		var pingNowBtn = E('button', { 'class': 'cbi-button cbi-button-action' }, _('Refresh ping now'));
 		pingNowBtn.addEventListener('click', function() {
 			pingNowBtn.disabled = true;
 			refreshHealth().then(function() { pingNowBtn.disabled = false; },
-			                     function() { pingNowBtn.disabled = false; });
+			                     function(err) { pingNowBtn.disabled = false; XrayErrors.show(_('Ping refresh failed.'), err); });
 		});
 
 		/* Kick the end-to-end check (detached server-side) and follow its
@@ -490,14 +495,14 @@ return view.extend({
 			callE2eStart().then(function(res) {
 				if (!res || !res.ok) {
 					e2eBtn.disabled = false;
-					ui.addNotification(null, E('p', _('Could not start the E2E check: ') + ((res && res.msg) || _('unknown error'))), 'error');
+					XrayErrors.show(_('Could not start the E2E check: ') + ((res && res.msg) || _('unknown error')));
 					return;
 				}
 				startE2ePoll();
 				return refreshE2e();
-			}, function() {
+			}, function(err) {
 				e2eBtn.disabled = false;
-				ui.addNotification(null, E('p', _('E2E check call failed.')), 'error');
+				XrayErrors.show(_('E2E check call failed.'), err);
 			});
 		});
 
